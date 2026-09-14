@@ -1,0 +1,49 @@
+# Dependencies
+node_modules/
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnp.*
+.venv/
+venv/
+
+# Build output
+lib/
+*.tsbuildinfo
+.eslintcache
+build/
+dist/
+*.egg-info/
+jupyter_aiterminal/labextension/
+jupyter_aiterminal/_version.py
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Test and coverage reports
+coverage/
+htmlcov/
+.coverage
+coverage.xml
+junit.xml
+.pytest_cache/
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# Jupyter runtime
+.ipynb_checkpoints/
+
+# Local env and secrets
+.env
+.env.*
+!.env.example
+
+# OS and editors
+.DS_Store
+*.swp
+*~

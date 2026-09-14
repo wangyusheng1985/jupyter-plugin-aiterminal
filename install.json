@@ -1,0 +1,5 @@
+{
+  "packageManager": "python",
+  "packageName": "jupyter-aiterminal",
+  "uninstallInstructions": "Use pip to uninstall jupyter-aiterminal"
+}

@@ -1,0 +1,160 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # Reused by release.yml so a tagged release runs the full suite first.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Never cancel a release run part-way through; PRs can be superseded freely.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  frontend:
+    name: Lint, typecheck, Jest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # jupyter labextension build requires node >=20.
+          node-version: '24'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # `jlpm` is a console script shipped by the jupyterlab Python package,
+      # and it drives the Yarn 3.5.0 bundled inside that package. There is no
+      # vendored yarn release in this repo, so jupyterlab must be installed.
+      - name: Install JupyterLab (provides jlpm)
+        run: python -m pip install "jupyterlab>=4.5,<5"
+
+      # There is no offline mirror (.yarn/cache is gitignored), so a cold
+      # cache still needs the network; this only avoids re-downloading zips.
+      - name: Cache Yarn cache
+        uses: actions/cache@v4
+        with:
+          path: .yarn/cache
+          key: yarn-${{ runner.os }}-${{ hashFiles('yarn.lock') }}
+          restore-keys: yarn-${{ runner.os }}-
+
+      # Yarn 3 syntax. `--frozen-lockfile` is Yarn 1 and would fail here.
+      - name: Install JS dependencies
+        run: jlpm install --immutable
+
+      - name: Lint
+        run: jlpm lint
+
+      - name: Typecheck
+        run: jlpm typecheck
+
+      # Writes junit.xml to the working directory via the jest-junit reporter
+      # that @jupyterlab/testutils configures, so run from the repo root.
+      - name: Test
+        run: jlpm test
+
+      - name: Upload Jest report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jest-report
+          path: junit.xml
+          if-no-files-found: ignore
+
+  python:
+    name: Pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Deliberately not installing the project: pyproject sets
+      # pythonpath = ["."], and an editable install would trigger a
+      # development labextension build that pollutes later jobs.
+      - name: Install test dependencies
+        run: python -m pip install "jupyter_core>=5" "pytest>=8"
+
+      - name: Run Python tests
+        run: python -m pytest -q
+
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    needs: [frontend, python]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build toolchain
+        run: python -m pip install "jupyterlab>=4.5,<5" build twine
+
+      - name: Cache Yarn cache
+        uses: actions/cache@v4
+        with:
+          path: .yarn/cache
+          key: yarn-${{ runner.os }}-${{ hashFiles('yarn.lock') }}
+          restore-keys: yarn-${{ runner.os }}-
+
+      - name: Install JS dependencies
+        run: jlpm install --immutable
+
+      # Critical: pyproject sets
+      #   skip-if-exists = ["jupyter_aiterminal/labextension/static/style.js"]
+      # so a labextension left in the tree makes the prod JS build silently
+      # skip, shipping a stale or development bundle with no error. The
+      # directory is gitignored, so it must be absent before building.
+      - name: Remove any stale labextension
+        run: rm -rf jupyter_aiterminal/labextension jupyter_aiterminal/_version.py
+
+      # Builds the sdist (which runs jlpm build:prod and embeds the
+      # labextension as an sdist artifact), then builds the wheel from that
+      # sdist — the embedded labextension is what lets the wheel pass skip
+      # the npm build.
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Check distribution metadata
+        run: python -m twine check dist/*
+
+      # Guards against the empty-shell wheel: a wheel whose labextension
+      # directory is missing or incomplete still installs cleanly.
+      - name: Smoke test the built wheel
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/python -m pip install --upgrade pip >/dev/null
+          /tmp/smoke/bin/python -m pip install dist/*.whl
+          ext=/tmp/smoke/share/jupyter/labextensions/jupyter-aiterminal
+          echo "Installed extension contents:"
+          find "$ext" -type f | sort
+          test -f "$ext/package.json"
+          test -f "$ext/install.json"
+          test -f "$ext/static/style.js"
+          compgen -G "$ext/static/remoteEntry.*.js" >/dev/null
+          echo "Wheel smoke test passed."
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error

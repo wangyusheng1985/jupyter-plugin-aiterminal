@@ -1,0 +1,72 @@
+# Publishes to PyPI via Trusted Publishing (OIDC) when a v* tag is pushed.
+#
+# The PyPI pending publisher is registered against:
+#   Repository:       wangyusheng1985/jupyter-plugin-aiterminal
+#   Workflow name:    release.yml   (this filename — do not rename)
+#   Environment name: pypi          (must match the job's `environment:`)
+#
+# No API token is stored anywhere; authentication is the OIDC id-token.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Never cancel a release run: a half-finished publish cannot be resumed.
+  cancel-in-progress: false
+
+jobs:
+  # Runs the entire CI workflow (lint, typecheck, tests, wheel build) and
+  # reuses the `dist` artifact it uploads.
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish to PyPI
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Required for Trusted Publishing.
+      id-token: write
+      # Required by the action's default artifact attestations.
+      attestations: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The version comes from package.json via hatch-nodejs-version, so a
+      # mismatched tag would only surface as an opaque HTTP 400 from PyPI.
+      - name: Verify the tag matches the package version
+        run: |
+          set -euo pipefail
+          version="$(python -c "import json; print(json.load(open('package.json'))['version'])")"
+          tag="${GITHUB_REF_NAME#v}"
+          echo "tag=${GITHUB_REF_NAME} -> ${tag}, package.json version=${version}"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match package.json version ${version}. Bump package.json and re-tag."
+            exit 1
+          fi
+
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: List distributions
+        run: ls -l dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

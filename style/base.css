@@ -1,0 +1,301 @@
+.jp-AgentWorkspace {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  background: #f4f6f8;
+  color: #17283a;
+  font-family: Geneva, Tahoma, sans-serif;
+}
+
+.jp-AgentWorkspace-toolbar.jp-Toolbar {
+  padding: var(--jp-notebook-toolbar-padding, 0 5px 0 2px);
+}
+
+.jp-AgentWorkspace-notebook {
+  flex: 1 1 auto;
+  order: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--jp-notebook-padding, 10px);
+  background: var(--jp-layout-color0, #ffffff);
+}
+
+.jp-AgentWorkspace-empty {
+  color: var(--jp-content-font-color2, #5b6570);
+  font-size: var(--jp-ui-font-size1, 13px);
+}
+
+.jp-AgentWorkspace-block {
+  margin-bottom: 8px;
+  padding: var(--jp-code-padding, 5px);
+  border: var(--jp-border-width, 1px) solid var(--jp-border-color2, #e0e0e0);
+  background: var(--jp-layout-color1, #ffffff);
+  font-family: var(--jp-code-font-family, Menlo, Consolas, monospace);
+  font-size: var(--jp-code-font-size, 13px);
+  line-height: var(--jp-code-line-height, 1.3077);
+  white-space: pre-wrap;
+}
+
+.jp-AgentWorkspace-block.is-text {
+  font-family: var(--jp-content-font-family, sans-serif);
+  font-size: var(--jp-content-font-size, 14px);
+  line-height: var(--jp-content-line-height, 1.5);
+  white-space: normal;
+  border: none;
+  padding: 0;
+}
+
+.jp-AgentWorkspace-block.is-text :is(h1, h2, h3, h4, h5, h6) {
+  margin: 0.4em 0 0.3em;
+}
+
+.jp-AgentWorkspace-block.is-text p,
+.jp-AgentWorkspace-block.is-text ul,
+.jp-AgentWorkspace-block.is-text ol,
+.jp-AgentWorkspace-block.is-text pre {
+  margin: 0.4em 0;
+}
+
+.jp-AgentWorkspace-block.is-text code {
+  font-family: var(--jp-code-font-family, Menlo, Consolas, monospace);
+}
+
+.jp-AgentWorkspace-block.is-tool,
+.jp-AgentWorkspace-block.is-install {
+  background: var(--jp-layout-color2, #eeeeee);
+}
+
+.jp-AgentWorkspace-block.is-denied,
+.jp-AgentWorkspace-block.is-error {
+  background: var(--jp-error-color3, #fff3f3);
+  border-color: var(--jp-error-color1, #d32f2f);
+}
+
+.jp-AgentWorkspace-toolName {
+  margin-bottom: 6px;
+  font-weight: 600;
+}
+
+.jp-AgentWorkspace-toolInput {
+  margin: 0 0 8px;
+  color: var(--jp-ui-font-color2, #5b6570);
+  font: inherit;
+  white-space: pre-wrap;
+}
+
+.jp-AgentWorkspace-toolOutput {
+  margin: 0;
+  font: inherit;
+  white-space: pre-wrap;
+}
+
+.jp-AgentWorkspace-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 8px;
+  padding: var(--jp-cell-padding, 5px) 0;
+  /* Same as JupyterLab notebooks: do not let the browser scroll-anchor
+     to the input when a tall output is clicked or restyled. */
+  overflow-anchor: none;
+}
+
+.jp-AgentWorkspace-row {
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  min-width: 0;
+  overflow-anchor: none;
+}
+
+.jp-AgentWorkspace-collapser {
+  flex: 0 0 var(--jp-cell-collapser-width, 8px);
+  min-height: var(--jp-cell-collapser-min-height, 20px);
+  background: transparent;
+  cursor: pointer;
+  user-select: none;
+}
+
+.jp-AgentWorkspace-cell.is-active .jp-AgentWorkspace-collapser {
+  background: var(--jp-brand-color1, #1976d2);
+}
+
+.jp-AgentWorkspace-cell.is-collapsed
+  .jp-AgentWorkspace-row.is-input
+  .jp-AgentWorkspace-collapser {
+  background: var(--jp-brand-color2, #64b5f6);
+}
+
+.jp-AgentWorkspace-row.is-output .jp-Placeholder {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.jp-AgentWorkspace-prompt {
+  flex: 0 0 var(--jp-cell-prompt-width, 64px);
+  box-sizing: border-box;
+  padding-right: 4px;
+  color: var(--jp-cell-inprompt-font-color, #307fc1);
+  font-family: var(
+    --jp-cell-prompt-font-family,
+    var(--jp-code-font-family, Menlo, Consolas, monospace)
+  );
+  font-size: var(--jp-code-font-size, 13px);
+  letter-spacing: var(--jp-cell-prompt-letter-spacing, 0);
+  line-height: var(--jp-code-line-height, 1.3077);
+  text-align: right;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.jp-AgentWorkspace-prompt.is-output {
+  color: var(--jp-cell-outprompt-font-color, #bf5b3d);
+}
+
+.jp-AgentWorkspace-cell:not(.is-active) .jp-AgentWorkspace-prompt {
+  color: var(--jp-cell-prompt-not-active-font-color, #616161);
+  opacity: var(--jp-cell-prompt-not-active-opacity, 0.5);
+}
+
+.jp-AgentWorkspace-kind {
+  display: block;
+  margin-top: 2px;
+  color: var(--jp-ui-font-color2, #616161);
+  font-family: var(--jp-ui-font-family, sans-serif);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.jp-AgentWorkspace-prompt.is-input {
+  cursor: pointer;
+}
+
+.jp-AgentWorkspace-cellInput {
+  flex: 1 1 auto;
+  min-width: 0;
+  box-sizing: border-box;
+  border: var(--jp-border-width, 1px) solid
+    var(--jp-cell-editor-border-color, #e0e0e0);
+  background: var(--jp-cell-editor-background, #f5f5f5);
+  padding: var(--jp-code-padding, 5px);
+  color: var(--jp-content-font-color0, #111);
+  font-family: var(--jp-code-font-family, Menlo, Consolas, monospace);
+  font-size: var(--jp-code-font-size, 13px);
+  line-height: var(--jp-code-line-height, 1.3077);
+  resize: vertical;
+}
+
+.jp-AgentWorkspace-cell.is-active.is-edit .jp-AgentWorkspace-cellInput {
+  background: var(--jp-cell-editor-active-background, #ffffff);
+  border-color: var(
+    --jp-cell-editor-active-border-color,
+    var(--jp-brand-color1, #1976d2)
+  );
+  box-shadow: var(--jp-cell-editor-box-shadow, inset 0 0 2px #64b5f6);
+}
+
+.jp-AgentWorkspace-cellOutput {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  padding: var(--jp-code-padding, 5px);
+  background: var(--jp-layout-color0, #ffffff);
+  font-family: var(--jp-code-font-family, Menlo, Consolas, monospace);
+  font-size: var(--jp-code-font-size, 13px);
+  line-height: var(--jp-code-line-height, 1.3077);
+  white-space: pre-wrap;
+}
+
+.jp-AgentWorkspace-cellOutput pre {
+  margin: 0;
+  font: inherit;
+  white-space: pre-wrap;
+}
+
+.jp-AgentWorkspace-status {
+  order: 3;
+  min-height: 22px;
+  padding: 4px 10px;
+  color: #17283a;
+  background: linear-gradient(#c9ced3, #aeb5bc);
+  border-top: 1px solid #f1f3f5;
+  font-size: 11px;
+  text-shadow: 0 1px #fff;
+}
+
+.jp-AgentWorkspace-footer.jp-Notebook-footer {
+  flex: 0 0 auto;
+  display: block;
+  box-sizing: border-box;
+  height: 27px;
+  margin: 8px 0 4px
+    calc(
+      var(--jp-cell-prompt-width, 64px) + var(--jp-cell-collapser-width, 8px)
+    );
+  width: calc(
+    100% -
+      (var(--jp-cell-prompt-width, 64px) + var(--jp-cell-collapser-width, 8px))
+  );
+  border: var(--jp-border-width, 1px) solid
+    var(--jp-cell-editor-border-color, #e0e0e0);
+  color: var(--jp-ui-font-color3, #9e9e9e);
+  background: none;
+  cursor: pointer;
+  font: inherit;
+}
+
+.jp-AgentWorkspace-footer.jp-Notebook-footer:focus {
+  border-color: var(
+    --jp-cell-editor-active-border-color,
+    var(--jp-brand-color1, #1976d2)
+  );
+  outline: none;
+}
+
+@media (hover: hover) {
+  .jp-AgentWorkspace-footer.jp-Notebook-footer {
+    opacity: 0;
+  }
+
+  .jp-AgentWorkspace-footer.jp-Notebook-footer:focus,
+  .jp-AgentWorkspace-footer.jp-Notebook-footer:hover {
+    opacity: 1;
+  }
+}
+
+.jp-AgentWorkspace-copyButton {
+  position: fixed;
+  z-index: 10001;
+  display: flex;
+  box-sizing: border-box;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  margin: 0;
+  border: var(--jp-border-width, 1px) solid var(--jp-border-color1, #bdbdbd);
+  border-radius: var(--jp-border-radius, 2px);
+  background: var(--jp-layout-color1, #ffffff);
+  box-shadow: var(--jp-elevation-z2, 0 1px 2px rgba(0, 0, 0, 0.2));
+  cursor: pointer;
+  user-select: none;
+  transform: none;
+}
+
+.jp-AgentWorkspace-copyButton[hidden] {
+  display: none;
+}
+
+.jp-AgentWorkspace-copyButton:hover {
+  background: var(--jp-layout-color2, #eeeeee);
+}
+
+.jp-AgentWorkspace-copyButton svg {
+  width: 16px;
+  height: 16px;
+}

@@ -1,0 +1,26 @@
+{
+  "title": "AI Terminal",
+  "description": "Relay settings for AI Terminal (Agent Workspace).",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "baseUrl": {
+      "type": "string",
+      "title": "Base URL",
+      "description": "Anthropic-compatible API base URL, for example https://api.anthropic.com or a local relay.",
+      "default": ""
+    },
+    "model": {
+      "type": "string",
+      "title": "Model",
+      "description": "Model id sent to the Claude Agent SDK.",
+      "default": ""
+    },
+    "token": {
+      "type": "string",
+      "title": "API Token",
+      "description": "API token or key. Stored in JupyterLab user settings on the server and shown in Settings UI.",
+      "default": ""
+    }
+  }
+}
