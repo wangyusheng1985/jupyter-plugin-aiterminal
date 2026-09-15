@@ -62,7 +62,15 @@ export class AgentWorkspaceWidgetFactory extends ABCWidgetFactory<
   protected createNewWidget(
     context: DocumentRegistry.IContext<DocumentRegistry.ICodeModel>
   ): DocumentWidget<AgentWorkspaceContent> {
-    const content = new AgentWorkspaceContent(this.rendermime);
+    const separator = Math.max(
+      context.path.lastIndexOf('/'),
+      context.path.lastIndexOf('\\')
+    );
+    const cwd = separator >= 0 ? context.path.slice(0, separator) : '';
+    const content = new AgentWorkspaceContent(
+      this.rendermime,
+      cwd || undefined
+    );
     const widget = new DocumentWidget({ content, context });
     content.cellTypeSwitcher = installAgentToolbar(widget.toolbar, content);
     content.attachContext(context);

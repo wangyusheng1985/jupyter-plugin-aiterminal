@@ -11,11 +11,14 @@ import {
 } from './protocol';
 
 export function agentSocketUrl(
-  settings: ServerConnection.ISettings = ServerConnection.makeSettings()
+  settings: ServerConnection.ISettings = ServerConnection.makeSettings(),
+  cwd?: string
 ): string {
   let url = URLExt.join(settings.wsUrl, AGENT_WS_PATH);
+  if (cwd) url += `?cwd=${encodeURIComponent(cwd)}`;
   if (settings.appendToken && settings.token) {
-    url += URLExt.objectToQueryString({ token: settings.token });
+    const token = URLExt.objectToQueryString({ token: settings.token });
+    url += `${url.includes('?') ? '&' : ''}${token.replace(/^\?/, '')}`;
   }
   return url;
 }
@@ -42,7 +45,8 @@ export class AgentSession {
   }> = [];
 
   constructor(
-    private readonly settings: ServerConnection.ISettings = ServerConnection.makeSettings()
+    private readonly settings: ServerConnection.ISettings = ServerConnection.makeSettings(),
+    private readonly cwd?: string
   ) {}
 
   subscribe(listener: () => void): () => void {
@@ -52,7 +56,9 @@ export class AgentSession {
 
   connect(): void {
     if (this.socket) return;
-    const socket = new this.settings.WebSocket(agentSocketUrl(this.settings));
+    const socket = new this.settings.WebSocket(
+      agentSocketUrl(this.settings, this.cwd)
+    );
     this.socket = socket;
     socket.onopen = () => {
       this.connected = true;

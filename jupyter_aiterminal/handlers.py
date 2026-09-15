@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 from jupyter_core.utils import ensure_async
 from jupyter_server.auth.decorator import ws_authenticated
@@ -38,8 +39,20 @@ class AgentWebSocketHandler(JupyterHandler, websocket.WebSocketHandler):
         pass
 
     def open(self, *args, **kwargs):
-        self.session = AgentSession(self.cwd, self.emit)
-        self.shell = PersistentShell(self.cwd)
+        requested = self.get_query_argument("cwd", default="")
+        cwd = _resolve_workspace_cwd(self.cwd, requested)
+        if cwd is None:
+            IOLoop.current().spawn_callback(
+                self.emit,
+                {
+                    "type": "error",
+                    "code": "denied",
+                    "message": "Workspace path is outside the Jupyter server root.",
+                },
+            )
+            return
+        self.session = AgentSession(cwd, self.emit)
+        self.shell = PersistentShell(cwd)
         IOLoop.current().spawn_callback(self.session.start)
         IOLoop.current().spawn_callback(self._start_shell)
 
@@ -151,3 +164,16 @@ def setup_handlers(web_app, cwd: str) -> None:
             )
         ],
     )
+
+
+def _resolve_workspace_cwd(root: str, requested: str) -> str | None:
+    """Resolve a client-relative workspace directory without escaping root."""
+    root_path = os.path.realpath(root)
+    candidate = os.path.realpath(os.path.join(root_path, requested or "."))
+    try:
+        inside_root = os.path.commonpath((root_path, candidate)) == root_path
+    except ValueError:
+        inside_root = False
+    if not inside_root or not os.path.isdir(candidate):
+        return None
+    return candidate

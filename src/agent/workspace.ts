@@ -26,7 +26,7 @@ interface CellHandlers {
 
 export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   readonly notebook = new WorkspaceNotebook();
-  readonly session = new AgentSession();
+  readonly session: AgentSession;
   private closing = false;
   private runningCellId: string | null = null;
   private advanceAfterRun = false;
@@ -41,8 +41,12 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   private readonly copyButton: SelectionCopyButton;
   cellTypeSwitcher: CellTypeSwitcher | null = null;
 
-  constructor(private readonly rendermime: IRenderMimeRegistry | null = null) {
+  constructor(
+    private readonly rendermime: IRenderMimeRegistry | null = null,
+    cwd?: string
+  ) {
     super();
+    this.session = new AgentSession(undefined, cwd);
     this.addClass(AGENT_PANEL_CLASS);
     this.notebookView = new NotebookView(this.notebook, {
       onSource: source => {
