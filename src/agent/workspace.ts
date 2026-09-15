@@ -680,21 +680,7 @@ class CellView {
     const key = outputKey(cell);
     if (key === this.lastOutputKey) return;
     this.lastOutputKey = key;
-    this.outputBody.replaceChildren();
-    if (cell.kind === 'ai') {
-      if (!cell.blocks.length && cell.status === 'running') {
-        this.outputBody.append(pendingNode());
-      }
-      cell.blocks.forEach(block =>
-        this.outputBody!.append(renderBlock(block, this.handlers.rendermime))
-      );
-    } else if (cell.output) {
-      const pre = document.createElement('pre');
-      pre.textContent = cell.output;
-      this.outputBody.append(pre);
-    } else if (cell.status === 'running') {
-      this.outputBody.append(pendingNode());
-    }
+    renderCellOutput(this.outputBody, cell, this.handlers.rendermime);
   }
 
   private bindCollapser(node: HTMLElement): void {
@@ -766,11 +752,31 @@ class StatusBar extends Widget {
   }
 }
 
-function pendingNode(): HTMLElement {
-  const pending = document.createElement('div');
-  pending.className = 'jp-AgentWorkspace-empty';
-  pending.textContent = 'Running…';
-  return pending;
+export function runningIndicatorNode(): HTMLElement {
+  const indicator = document.createElement('span');
+  indicator.className = 'jp-AgentWorkspace-runningIndicator';
+  indicator.textContent = '...';
+  indicator.setAttribute('aria-hidden', 'true');
+  indicator.setAttribute('role', 'presentation');
+  return indicator;
+}
+
+export function renderCellOutput(
+  body: HTMLElement,
+  cell: WorkspaceCell,
+  rendermime: IRenderMimeRegistry | null = null
+): void {
+  body.replaceChildren();
+  if (cell.kind === 'ai') {
+    cell.blocks.forEach(block => body.append(renderBlock(block, rendermime)));
+  } else if (cell.output) {
+    const pre = document.createElement('pre');
+    pre.textContent = cell.output;
+    body.append(pre);
+  }
+  if (cell.status === 'running') {
+    body.append(runningIndicatorNode());
+  }
 }
 
 function setPrompt(
@@ -886,6 +892,9 @@ export function renderBlock(
       node.textContent = `denied: ${block.command}\n${block.reason}`;
       break;
     case 'error':
+      if (block.code === 'config') {
+        node.classList.add('is-config');
+      }
       node.textContent = block.message;
       break;
   }

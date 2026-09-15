@@ -14,7 +14,7 @@ def test_start_reports_missing_settings(tmp_path, monkeypatch):
         "jupyter_aiterminal.agent.load_agent_settings",
         lambda: (_ for _ in ()).throw(
             __import__("jupyter_aiterminal.settings", fromlist=["AgentConfigError"]).AgentConfigError(
-                "AI Terminal settings are missing. Open Settings → AI Terminal."
+                "AI Terminal settings are missing. Open Settings → AI Terminal and set Base URL, Model, and API Token."
             )
         ),
     )
@@ -27,6 +27,9 @@ def test_start_reports_missing_settings(tmp_path, monkeypatch):
     assert events[0]["type"] == "error"
     assert events[0]["code"] == "config"
     assert "Settings" in events[0]["message"]
+    assert "Base URL" in events[0]["message"]
+    assert "Model" in events[0]["message"]
+    assert "API Token" in events[0]["message"]
 
 
 def test_pre_tool_use_denies_apt():

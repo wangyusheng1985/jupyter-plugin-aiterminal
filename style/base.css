@@ -72,6 +72,11 @@
   border-color: var(--jp-error-color1, #d32f2f);
 }
 
+.jp-AgentWorkspace-block.is-error.is-config {
+  border-left-width: 3px;
+  font-weight: 600;
+}
+
 .jp-AgentWorkspace-toolName {
   margin-bottom: 6px;
   font-weight: 600;
@@ -214,6 +219,36 @@
   margin: 0;
   font: inherit;
   white-space: pre-wrap;
+}
+
+.jp-AgentWorkspace-runningIndicator {
+  display: inline-block;
+  color: inherit;
+  user-select: none;
+  letter-spacing: 0.08em;
+  animation: jp-AgentWorkspace-runningEllipsis 1.2s steps(4, end) infinite;
+}
+
+@keyframes jp-AgentWorkspace-runningEllipsis {
+  0%,
+  20% {
+    opacity: 0.25;
+  }
+
+  50%,
+  70% {
+    opacity: 1;
+  }
+
+  100% {
+    opacity: 0.25;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .jp-AgentWorkspace-runningIndicator {
+    animation: none;
+  }
 }
 
 .jp-AgentWorkspace-status {

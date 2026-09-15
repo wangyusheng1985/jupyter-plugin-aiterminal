@@ -127,7 +127,12 @@ export type ChatBlock =
       detail: string;
     }
   | { kind: 'denied'; id: string; command: string; reason: string }
-  | { kind: 'error'; id: string; message: string };
+  | {
+      kind: 'error';
+      id: string;
+      message: string;
+      code?: AgentErrorEvent['code'];
+    };
 
 export function applyServerEvent(
   blocks: ChatBlock[],
@@ -185,7 +190,12 @@ export function applyServerEvent(
     case 'error':
       return [
         ...blocks,
-        { kind: 'error', id: nextId('error'), message: event.message }
+        {
+          kind: 'error',
+          id: nextId('error'),
+          message: event.message,
+          code: event.code
+        }
       ];
     case 'result':
       return event.isError && event.text

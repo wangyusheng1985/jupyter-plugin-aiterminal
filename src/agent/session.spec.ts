@@ -51,6 +51,44 @@ function sessionWithSocket(): {
 }
 
 describe('AgentSession', () => {
+  it('keeps config feedback out of Command execution and resets it for a later AI run', async () => {
+    const { session, socket } = sessionWithSocket();
+    socket.open();
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: 'error',
+        code: 'config',
+        message:
+          'AI Terminal settings are missing. Open Settings → AI Terminal and set Base URL, Model, and API Token.'
+      })
+    });
+    expect(session.blocks[0]).toMatchObject({
+      kind: 'error',
+      code: 'config'
+    });
+
+    const command = session.exec('pwd');
+    expect(socket.sent[socket.sent.length - 1]).toBe(
+      JSON.stringify({ type: 'exec', text: 'pwd' })
+    );
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: 'exec_done',
+        output: '/root\n',
+        returncode: 0,
+        cwd: '/root'
+      })
+    });
+    await expect(command).resolves.toMatchObject({ output: '/root\n' });
+
+    session.sendUser('try again');
+    expect(session.error).toBeNull();
+    expect(session.blocks).toEqual([]);
+    expect(socket.sent[socket.sent.length - 1]).toBe(
+      JSON.stringify({ type: 'user', text: 'try again' })
+    );
+  });
+
   it('connects on first exec if start was skipped', async () => {
     const created: FakeWebSocket[] = [];
     const session = new AgentSession({

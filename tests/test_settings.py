@@ -22,15 +22,45 @@ def test_parse_settings_strips_jsonc():
 
 
 def test_missing_file_is_a_config_error(tmp_path: Path):
-    with pytest.raises(AgentConfigError, match="Settings"):
+    with pytest.raises(AgentConfigError, match="Settings") as exc_info:
         load_agent_settings(tmp_path / "plugin.jupyterlab-settings")
+    message = str(exc_info.value)
+    assert "Base URL" in message
+    assert "Model" in message
+    assert "API Token" in message
+
+
+def test_invalid_json_points_to_all_required_settings(tmp_path: Path):
+    path = tmp_path / "plugin.jupyterlab-settings"
+    path.write_text("{not-json}\n")
+    with pytest.raises(AgentConfigError, match="Settings") as exc_info:
+        load_agent_settings(path)
+    message = str(exc_info.value)
+    assert "Base URL" in message
+    assert "Model" in message
+    assert "API Token" in message
+
+
+def test_non_object_settings_point_to_all_required_fields():
+    with pytest.raises(AgentConfigError, match="JSON object") as exc_info:
+        parse_settings("[]")
+    message = str(exc_info.value)
+    assert "Settings → AI Terminal" in message
+    assert "Base URL" in message
+    assert "Model" in message
+    assert "API Token" in message
 
 
 def test_missing_key_is_a_config_error(tmp_path: Path):
     path = tmp_path / "plugin.jupyterlab-settings"
     path.write_text('{"baseUrl": "https://api.anthropic.com", "model": "", "token": "x"}\n')
-    with pytest.raises(AgentConfigError, match="model"):
+    with pytest.raises(AgentConfigError, match="model") as exc_info:
         load_agent_settings(path)
+    message = str(exc_info.value)
+    assert "Settings" in message
+    assert "Base URL" in message
+    assert "Model" in message
+    assert "API Token" in message
 
 
 def test_official_api_is_allowed(tmp_path: Path):

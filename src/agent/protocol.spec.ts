@@ -39,7 +39,8 @@ describe('applyServerEvent', () => {
     expect(blocks[1]).toEqual({
       kind: 'error',
       id: expect.stringContaining('error'),
-      message: 'AI Terminal settings are missing'
+      message: 'AI Terminal settings are missing',
+      code: 'config'
     });
   });
 
