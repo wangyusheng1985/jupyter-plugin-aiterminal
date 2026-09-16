@@ -27,6 +27,7 @@ CLI_PATH_PREFIX = (
     str(Path.home() / ".local" / "bin"),
 )
 STRIP_INHERITED_ENV = ("ANTHROPIC_AUTH_TOKEN",)
+NOT_CONNECTED_MESSAGE = "Not connected. Call connect() first."
 
 
 try:
@@ -37,21 +38,41 @@ except ImportError:  # pragma: no cover - exercised when the extra is missing
     HookMatcher = None  # type: ignore[assignment]
 
 
+def _is_not_connected_error(exc: BaseException) -> bool:
+    return (
+        type(exc).__name__ == "CLIConnectionError"
+        and str(exc).strip() == NOT_CONNECTED_MESSAGE
+    )
+
+
 class AgentSession:
     def __init__(self, cwd: str, emit: Emit):
         self.cwd = cwd
         self.emit = emit
-        self.client = None
+        self.client: Any | None = None
         self.model = ""
         self._running = False
         self._cli_stderr: list[str] = []
+        self._connect_lock = asyncio.Lock()
+        self._closing = False
 
     async def start(self) -> None:
+        await self._ensure_client()
+
+    async def _ensure_client(self):
+        async with self._connect_lock:
+            if self.client is not None:
+                return self.client
+            if self._closing:
+                return None
+            return await self._connect_unlocked()
+
+    async def _connect_unlocked(self):
         try:
             config = load_agent_settings()
         except AgentConfigError as exc:
             await self.emit({"type": "error", "code": "config", "message": str(exc)})
-            return
+            return None
         if ClaudeSDKClient is None:
             await self.emit(
                 {
@@ -60,7 +81,7 @@ class AgentSession:
                     "message": "claude-agent-sdk is not installed on this Jupyter server.",
                 }
             )
-            return
+            return None
         self.model = config["ANTHROPIC_MODEL"]
         self._cli_stderr = []
         options = _build_options(
@@ -68,11 +89,11 @@ class AgentSession:
                 config, self.cwd, self._pre_tool_use, self._cli_stderr
             )
         )
+        client = None
         try:
-            self.client = ClaudeSDKClient(options)
-            await self.client.connect()
+            client = ClaudeSDKClient(options)
+            await client.connect()
         except Exception as exc:  # noqa: BLE001 - relay/CLI failures stay visible
-            self.client = None
             await self.emit(
                 {
                     "type": "error",
@@ -80,7 +101,13 @@ class AgentSession:
                     "message": format_sdk_error(exc, self._cli_stderr),
                 }
             )
-            return
+            return None
+        if self._closing:
+            disconnect = getattr(client, "disconnect", None)
+            if disconnect is not None:
+                await disconnect()
+            return None
+        self.client = client
         await self.emit(
             {
                 "type": "ready",
@@ -89,15 +116,12 @@ class AgentSession:
                 "cwd": self.cwd,
             }
         )
+        return client
 
     async def query(self, text: str) -> None:
         prompt = text.strip()
         if not prompt:
             return
-        if self.client is None:
-            await self.start()
-            if self.client is None:
-                return
         if self._running:
             await self.emit(
                 {
@@ -109,16 +133,36 @@ class AgentSession:
             return
         self._running = True
         try:
-            await self.client.query(prompt)
-            async for message in self.client.receive_response():
+            client = await self._ensure_client()
+            if client is None:
+                return
+            stale = False
+            try:
+                await client.query(prompt)
+            except Exception as exc:  # noqa: BLE001 - retry only a stale client
+                if not _is_not_connected_error(exc):
+                    raise
+                stale = True
+            if stale:
+                await self._discard_client(client)
+                client = await self._ensure_client()
+                if client is None:
+                    return
+                await client.query(prompt)
+            async for message in client.receive_response():
                 for event in events_from_message(message):
                     await self.emit(event)
         except Exception as exc:  # noqa: BLE001 - surface SDK/relay failures
+            message = (
+                "Agent connection is not available after reconnecting."
+                if _is_not_connected_error(exc)
+                else format_sdk_error(exc, self._cli_stderr)
+            )
             await self.emit(
                 {
                     "type": "error",
                     "code": "runtime",
-                    "message": format_sdk_error(exc, self._cli_stderr),
+                    "message": message,
                 }
             )
         finally:
@@ -132,13 +176,25 @@ class AgentSession:
             await interrupt()
 
     async def close(self) -> None:
-        client = self.client
-        self.client = None
-        if client is None:
-            return
+        self._closing = True
+        async with self._connect_lock:
+            client = self.client
+            self.client = None
+        if client is not None:
+            disconnect = getattr(client, "disconnect", None)
+            if disconnect is not None:
+                await disconnect()
+
+    async def _discard_client(self, client: Any) -> None:
+        async with self._connect_lock:
+            if self.client is client:
+                self.client = None
         disconnect = getattr(client, "disconnect", None)
         if disconnect is not None:
-            await disconnect()
+            try:
+                await disconnect()
+            except Exception:  # noqa: BLE001 - stale clients are already unusable
+                pass
 
     async def _pre_tool_use(self, input_data, tool_use_id, context):
         del tool_use_id, context
