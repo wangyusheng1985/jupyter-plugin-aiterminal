@@ -23,6 +23,7 @@ import {
 import type { AgentWorkspaceContent } from './agent/workspace';
 import {
   AGENT_COMMAND_ID,
+  AGENT_RESTORE_COMMAND_ID,
   PLUGIN_ID,
   TRACKER_NAMESPACE,
   TRANSLATION_DOMAIN
@@ -30,6 +31,7 @@ import {
 
 export {
   AGENT_COMMAND_ID,
+  AGENT_RESTORE_COMMAND_ID,
   AGENT_PANEL_CLASS,
   PLUGIN_ID,
   ShutdownCoordinator
@@ -52,6 +54,41 @@ export {
 } from './agent/notebook';
 
 type AgentDocument = DocumentWidget<AgentWorkspaceContent>;
+
+const CLOSED_WORKSPACE_KEY_PREFIX = `${TRACKER_NAMESPACE}:closed:`;
+
+function closedWorkspaceKey(path: string): string {
+  return `${CLOSED_WORKSPACE_KEY_PREFIX}${encodeURIComponent(path)}`;
+}
+
+function markWorkspaceClosed(path: string): void {
+  try {
+    window.sessionStorage.setItem(closedWorkspaceKey(path), '1');
+  } catch {
+    // Session storage can be unavailable in privacy-restricted browsers.
+  }
+}
+
+function clearWorkspaceClosed(path: string): void {
+  try {
+    window.sessionStorage.removeItem(closedWorkspaceKey(path));
+  } catch {
+    // Session storage can be unavailable in privacy-restricted browsers.
+  }
+}
+
+function consumeWorkspaceClosed(path: string): boolean {
+  try {
+    const key = closedWorkspaceKey(path);
+    const closed = window.sessionStorage.getItem(key) !== null;
+    if (closed) {
+      window.sessionStorage.removeItem(key);
+    }
+    return closed;
+  } catch {
+    return false;
+  }
+}
 
 export function activate(
   app: JupyterFrontEnd,
@@ -80,14 +117,37 @@ export function activate(
   });
   docManager.registry.addWidgetFactory(factory as never);
   factory.widgetCreated.connect((_sender, widget) => {
+    clearWorkspaceClosed(widget.context.path);
     void tracker.add(widget);
     widget.context.pathChanged.connect(() => {
       void tracker.save(widget);
     });
+    widget.disposed.connect(() => {
+      markWorkspaceClosed(widget.context.path);
+    });
+  });
+  app.commands.addCommand(AGENT_RESTORE_COMMAND_ID, {
+    describedBy: {
+      args: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          factory: { type: 'string' }
+        },
+        required: ['path']
+      }
+    },
+    execute: async args => {
+      const path = args['path'] as string;
+      if (consumeWorkspaceClosed(path)) {
+        throw new Error(`AI Terminal workspace was closed: ${path}`);
+      }
+      return openAgentWorkspace(docManager, path);
+    }
   });
   if (restorer) {
     void restorer.restore(tracker as never, {
-      command: 'docmanager:open',
+      command: AGENT_RESTORE_COMMAND_ID,
       args: (widget: AgentDocument) => ({
         path: widget.context.path,
         factory: AGENT_FACTORY

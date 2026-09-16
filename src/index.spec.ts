@@ -78,12 +78,17 @@ jest.mock('@jupyterlab/services', () => ({
 
 import {
   AGENT_COMMAND_ID,
+  AGENT_RESTORE_COMMAND_ID,
   PLUGIN_ID,
   ShutdownCoordinator,
   activate
 } from './index';
 
 describe('jupyter-aiterminal launcher', () => {
+  beforeEach(() => {
+    window.sessionStorage.clear();
+  });
+
   it('registers AI Terminal only', () => {
     const commands = new CommandRegistry();
     const launcherAdd = jest.fn();
@@ -198,7 +203,7 @@ describe('jupyter-aiterminal launcher', () => {
       args: (widget: { context: { path: string } }) => object;
       when: Promise<void>;
     };
-    expect(options.command).toBe('docmanager:open');
+    expect(options.command).toBe(AGENT_RESTORE_COMMAND_ID);
     expect(options.when).toBe(ready);
     expect(options.args({ context: { path: 'work/session.agentnb' } })).toEqual(
       {
@@ -206,6 +211,66 @@ describe('jupyter-aiterminal launcher', () => {
         factory: 'Agent Workspace'
       }
     );
+  });
+
+  it('does not restore a tab after that tab has been closed', async () => {
+    const commands = new CommandRegistry();
+    const translator = { load: () => ({ __: (value: string) => value }) };
+    const restorer = { restore: jest.fn() };
+    const registry = {
+      addFileType: jest.fn(),
+      addModelFactory: jest.fn(),
+      addWidgetFactory: jest.fn()
+    };
+    const docManager = {
+      registry,
+      openOrReveal: jest.fn(),
+      open: jest.fn(),
+      newUntitled: jest.fn()
+    };
+
+    activate(
+      {
+        commands,
+        shell: {},
+        serviceManager: { ready: Promise.resolve() }
+      } as never,
+      { add: jest.fn() } as never,
+      translator as never,
+      {} as never,
+      docManager as never,
+      restorer as never
+    );
+
+    const factory = registry.addWidgetFactory.mock.calls[0][0] as {
+      widgetCreated: { connect: jest.Mock };
+    };
+    const onWidgetCreated = factory.widgetCreated.connect.mock.calls[0][0] as (
+      sender: unknown,
+      widget: unknown
+    ) => void;
+    let onDisposed: (() => void) | undefined;
+    const widget = {
+      context: {
+        path: 'work/session.agentnb',
+        pathChanged: { connect: jest.fn() }
+      },
+      disposed: {
+        connect: jest.fn((callback: () => void) => {
+          onDisposed = callback;
+        })
+      }
+    };
+    onWidgetCreated(undefined, widget);
+    onDisposed?.();
+
+    await expect(
+      commands.execute(AGENT_RESTORE_COMMAND_ID, {
+        path: 'work/session.agentnb',
+        factory: 'Agent Workspace'
+      })
+    ).rejects.toThrow('AI Terminal workspace was closed');
+    expect(docManager.openOrReveal).not.toHaveBeenCalled();
   });
 
   it('reopens an existing Agent Workspace path instead of creating untitled', async () => {

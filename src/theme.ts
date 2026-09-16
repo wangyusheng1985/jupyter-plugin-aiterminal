@@ -1,5 +1,6 @@
 export const PLUGIN_ID = 'jupyter-aiterminal:plugin';
 export const AGENT_COMMAND_ID = 'aiterminal:open';
+export const AGENT_RESTORE_COMMAND_ID = 'aiterminal:restore';
 export const AGENT_PANEL_CLASS = 'jp-AgentWorkspace';
 export const TRACKER_NAMESPACE = 'aiterminal-workspace';
 export const TRANSLATION_DOMAIN = 'jupyter-aiterminal';
