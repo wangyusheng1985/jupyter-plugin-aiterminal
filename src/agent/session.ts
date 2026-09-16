@@ -123,7 +123,6 @@ export class AgentSession {
 
   interrupt(): void {
     this.send({ type: 'interrupt' });
-    this.running = false;
     this.notify();
   }
 

@@ -1,8 +1,16 @@
 import type { ChatBlock, WorkspaceMode } from './protocol';
 
 export type CellKind = WorkspaceMode;
-export type CellStatus = 'idle' | 'running' | 'done' | 'interrupted';
+export type CellStatus = 'idle' | 'queued' | 'running' | 'done' | 'interrupted';
 export type EditorMode = 'command' | 'edit';
+
+export interface RunRequest {
+  id: string;
+  cellId: string;
+  kind: CellKind;
+  source: string;
+  advance: boolean;
+}
 
 export interface WorkspaceCell {
   id: string;
@@ -17,6 +25,7 @@ export interface WorkspaceCell {
 
 let cellCounter = 0;
 let executionCounter = 0;
+let runCounter = 0;
 
 export function restoreCounters(cells: WorkspaceCell[]): void {
   cells.forEach(cell => {
@@ -51,6 +60,16 @@ export class WorkspaceNotebook {
   active = 0;
   mode: EditorMode = 'edit';
   insertKind: CellKind = 'ai';
+  private runQueue: RunRequest[] = [];
+  private activeRequest: RunRequest | null = null;
+
+  get activeRun(): RunRequest | null {
+    return this.activeRequest;
+  }
+
+  get queuedRuns(): readonly RunRequest[] {
+    return this.runQueue;
+  }
 
   get current(): WorkspaceCell {
     if (this.empty) {
@@ -73,27 +92,29 @@ export class WorkspaceNotebook {
     this.insertKind = this.current.kind;
   }
 
-  setKind(kind: CellKind): void {
+  setKind(kind: CellKind): boolean {
     this.insertKind = kind;
-    if (this.empty) return;
+    if (this.empty) return true;
     const cell = this.current;
-    if (cell.kind === kind) return;
+    if (cell.kind === kind) return true;
+    if (this.activeRequest?.cellId === cell.id) return false;
+    this.cancelQueuedRuns(cell.id);
     cell.kind = kind;
     cell.output = '';
     cell.blocks = [];
     cell.status = 'idle';
     cell.executionCount = null;
     cell.outputCollapsed = false;
+    return true;
   }
 
-  toggleKind(): CellKind {
+  toggleKind(): CellKind | null {
     if (this.empty) {
       this.insertKind = this.insertKind === 'ai' ? 'command' : 'ai';
       return this.insertKind;
     }
     const kind = this.current.kind === 'ai' ? 'command' : 'ai';
-    this.setKind(kind);
-    return kind;
+    return this.setKind(kind) ? kind : null;
   }
 
   insertAbove(kind: CellKind = this.insertKind): WorkspaceCell {
@@ -124,9 +145,10 @@ export class WorkspaceNotebook {
       return false;
     }
     const cell = this.current;
-    if (cell.status === 'running') {
+    if (this.activeRequest?.cellId === cell.id) {
       return false;
     }
+    this.cancelQueuedRuns(cell.id);
     const kind = cell.kind;
     const index = this.active;
     this.cells.splice(index, 1);
@@ -163,23 +185,58 @@ export class WorkspaceNotebook {
     this.current.source = source;
   }
 
-  beginRun(): WorkspaceCell {
-    if (this.empty) {
-      throw new Error('Workspace notebook has no cells.');
+  enqueueRun(index = this.active, advance = false): RunRequest | null {
+    const cell = this.cells[index];
+    const source = cell?.source.trim();
+    if (!cell || !source) return null;
+    const request: RunRequest = {
+      id: `run-${++runCounter}`,
+      cellId: cell.id,
+      kind: cell.kind,
+      source,
+      advance
+    };
+    this.runQueue.push(request);
+    if (this.activeRequest?.cellId !== cell.id) {
+      cell.status = 'queued';
     }
-    const cell = this.current;
-    cell.status = 'running';
-    cell.output = '';
-    cell.blocks = [];
-    cell.executionCount = ++executionCounter;
-    cell.outputCollapsed = false;
-    return cell;
+    return request;
   }
 
-  finishRun(output: string, status: CellStatus = 'done'): void {
-    if (this.empty) return;
-    this.current.output = output;
-    this.current.status = status;
+  promoteNextRun(): RunRequest | null {
+    if (this.activeRequest) return null;
+    while (this.runQueue.length) {
+      const request = this.runQueue.shift() as RunRequest;
+      const cell = this.cells.find(
+        candidate => candidate.id === request.cellId
+      );
+      if (!cell || cell.kind !== request.kind) continue;
+      this.activeRequest = request;
+      cell.status = 'running';
+      cell.output = '';
+      cell.blocks = [];
+      cell.executionCount = ++executionCounter;
+      cell.outputCollapsed = false;
+      return request;
+    }
+    return null;
+  }
+
+  finishRun(
+    requestId: string,
+    output: string,
+    status: CellStatus = 'done'
+  ): boolean {
+    if (this.activeRequest?.id !== requestId) return false;
+    const cell = this.cells.find(
+      candidate => candidate.id === this.activeRequest?.cellId
+    );
+    if (cell) {
+      cell.output = output;
+      cell.status = status;
+    }
+    this.activeRequest = null;
+    return true;
   }
 
   setBlocks(blocks: ChatBlock[]): void {
@@ -188,7 +245,28 @@ export class WorkspaceNotebook {
   }
 
   busy(): boolean {
-    return this.cells.some(cell => cell.status === 'running');
+    return this.activeRequest !== null;
+  }
+
+  clearRuns(): void {
+    this.runQueue = [];
+    this.activeRequest = null;
+    this.cells.forEach(cell => {
+      if (cell.status === 'queued') {
+        cell.status = 'idle';
+      } else if (cell.status === 'running') {
+        cell.status = 'interrupted';
+      }
+    });
+  }
+
+  cancelQueuedRuns(cellId: string): void {
+    this.runQueue = this.runQueue.filter(request => request.cellId !== cellId);
+    if (this.activeRequest?.cellId === cellId) return;
+    const cell = this.cells.find(candidate => candidate.id === cellId);
+    if (cell?.status === 'queued') {
+      cell.status = 'idle';
+    }
   }
 
   toggleOutputCollapsed(index = this.active): void {

@@ -51,8 +51,10 @@ describe('WorkspaceNotebook', () => {
   it('clears output when changing a run cell kind', () => {
     const notebook = new WorkspaceNotebook();
     notebook.setSource('pwd');
-    notebook.beginRun();
-    notebook.finishRun('/root');
+    const request = notebook.enqueueRun();
+    expect(request).not.toBeNull();
+    notebook.promoteNextRun();
+    notebook.finishRun(request?.id ?? '', '/root');
     notebook.setKind('command');
     expect(notebook.current.source).toBe('pwd');
     expect(notebook.current.output).toBe('');
@@ -64,8 +66,9 @@ describe('WorkspaceNotebook', () => {
     const notebook = new WorkspaceNotebook();
     notebook.setKind('command');
     notebook.setSource('pwd');
-    notebook.beginRun();
-    notebook.finishRun('/root\n');
+    const request = notebook.enqueueRun();
+    notebook.promoteNextRun();
+    notebook.finishRun(request?.id ?? '', '/root\n');
     notebook.advanceAfterRun();
     expect(notebook.cells).toHaveLength(2);
     expect(notebook.active).toBe(1);
@@ -76,8 +79,9 @@ describe('WorkspaceNotebook', () => {
   it('toggles output collapsed on a cell', () => {
     const notebook = new WorkspaceNotebook();
     notebook.setSource('pwd');
-    notebook.beginRun();
-    notebook.finishRun('/root\n');
+    const request = notebook.enqueueRun();
+    notebook.promoteNextRun();
+    notebook.finishRun(request?.id ?? '', '/root\n');
     expect(notebook.current.outputCollapsed).toBe(false);
     notebook.toggleOutputCollapsed();
     expect(notebook.current.outputCollapsed).toBe(true);
@@ -128,7 +132,8 @@ describe('WorkspaceNotebook', () => {
   it('refuses to delete a running cell', () => {
     const notebook = new WorkspaceNotebook();
     notebook.setSource('pwd');
-    notebook.beginRun();
+    notebook.enqueueRun();
+    notebook.promoteNextRun();
     expect(notebook.deleteActive()).toBe(false);
     expect(notebook.cells).toHaveLength(1);
     expect(notebook.current.status).toBe('running');
@@ -137,8 +142,9 @@ describe('WorkspaceNotebook', () => {
   it('keeps a single empty trailing input after a finished cell', () => {
     const notebook = new WorkspaceNotebook();
     notebook.setSource('list files');
-    notebook.beginRun();
-    notebook.finishRun('', 'done');
+    const request = notebook.enqueueRun();
+    notebook.promoteNextRun();
+    notebook.finishRun(request?.id ?? '', '', 'done');
     notebook.ensureTrailingInput();
     notebook.ensureTrailingInput();
     expect(notebook.cells).toHaveLength(2);
@@ -147,5 +153,129 @@ describe('WorkspaceNotebook', () => {
     notebook.advanceAfterRun();
     expect(notebook.cells).toHaveLength(2);
     expect(notebook.active).toBe(1);
+  });
+
+  it('snapshots source for every queued submission', () => {
+    const notebook = new WorkspaceNotebook();
+    notebook.setSource('first');
+    const first = notebook.enqueueRun();
+    notebook.setSource('second');
+    const second = notebook.enqueueRun();
+
+    expect(first).toMatchObject({ source: 'first' });
+    expect(second).toMatchObject({ source: 'second' });
+    expect(notebook.queuedRuns.map(request => request.source)).toEqual([
+      'first',
+      'second'
+    ]);
+  });
+
+  it('promotes queued runs FIFO and assigns counts only when they start', () => {
+    const notebook = new WorkspaceNotebook();
+    notebook.setSource('one');
+    const first = notebook.enqueueRun();
+    notebook.insertBelow('command');
+    notebook.setSource('two');
+    const second = notebook.enqueueRun();
+
+    expect(first?.id).not.toBe(second?.id);
+    expect(notebook.cells.map(cell => cell.executionCount)).toEqual([
+      null,
+      null
+    ]);
+    expect(notebook.cells.map(cell => cell.status)).toEqual([
+      'queued',
+      'queued'
+    ]);
+
+    const active = notebook.promoteNextRun();
+    const firstCount = notebook.cells[0].executionCount;
+    expect(active?.id).toBe(first?.id);
+    expect(notebook.cells[0]).toMatchObject({
+      status: 'running',
+      executionCount: firstCount
+    });
+    expect(notebook.cells[1]).toMatchObject({
+      status: 'queued',
+      executionCount: null
+    });
+
+    notebook.finishRun(active?.id ?? '', 'first output');
+    const next = notebook.promoteNextRun();
+    expect(next?.id).toBe(second?.id);
+    expect(notebook.cells[1]).toMatchObject({
+      status: 'running',
+      executionCount: (firstCount ?? 0) + 1
+    });
+  });
+
+  it('preserves prior output while waiting and clears it on promotion', () => {
+    const notebook = new WorkspaceNotebook();
+    notebook.setSource('first');
+    const first = notebook.enqueueRun();
+    notebook.promoteNextRun();
+    notebook.finishRun(first?.id ?? '', 'old output');
+    const second = notebook.enqueueRun();
+
+    expect(second).not.toBeNull();
+    expect(notebook.current).toMatchObject({
+      status: 'queued',
+      output: 'old output'
+    });
+
+    notebook.promoteNextRun();
+    expect(notebook.current).toMatchObject({
+      status: 'running',
+      output: ''
+    });
+  });
+
+  it('cancels every queued request for a deleted or reclassified cell', () => {
+    const notebook = new WorkspaceNotebook();
+    notebook.setSource('one');
+    notebook.enqueueRun();
+    notebook.enqueueRun();
+    notebook.insertBelow('command');
+    notebook.setSource('two');
+    const other = notebook.enqueueRun();
+
+    notebook.select(0);
+    expect(notebook.setKind('command')).toBe(true);
+    expect(notebook.cells[0].status).toBe('idle');
+    expect(notebook.queuedRuns).toEqual([other]);
+
+    notebook.setSource('three');
+    notebook.enqueueRun();
+    expect(notebook.deleteActive()).toBe(true);
+    expect(notebook.queuedRuns.map(request => request.source)).toEqual(['two']);
+  });
+
+  it('does not reclassify or delete the active running cell', () => {
+    const notebook = new WorkspaceNotebook();
+    notebook.setSource('pwd');
+    notebook.enqueueRun();
+    notebook.promoteNextRun();
+
+    expect(notebook.setKind('command')).toBe(false);
+    expect(notebook.toggleKind()).toBeNull();
+    expect(notebook.deleteActive()).toBe(false);
+    expect(notebook.current.kind).toBe('ai');
+    expect(notebook.current.status).toBe('running');
+  });
+
+  it('clears queued work without leaving pending cell state', () => {
+    const notebook = new WorkspaceNotebook();
+    notebook.setSource('one');
+    notebook.enqueueRun();
+    notebook.promoteNextRun();
+    notebook.insertBelow('command');
+    notebook.setSource('two');
+    notebook.enqueueRun();
+
+    notebook.clearRuns();
+    expect(notebook.queuedRuns).toEqual([]);
+    expect(notebook.activeRun).toBeNull();
+    expect(notebook.cells[0].status).toBe('interrupted');
+    expect(notebook.cells[1].status).toBe('idle');
   });
 });

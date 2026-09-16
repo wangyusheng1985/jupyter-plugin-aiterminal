@@ -9,7 +9,8 @@ describe('Agent Workspace document', () => {
   it('round-trips mixed cells including outputs and collapse', () => {
     const notebook = new WorkspaceNotebook();
     notebook.setSource('list files');
-    notebook.beginRun();
+    const firstRequest = notebook.enqueueRun();
+    notebook.promoteNextRun();
     notebook.setBlocks([
       { kind: 'text', id: 't1', text: 'done' },
       {
@@ -21,13 +22,14 @@ describe('Agent Workspace document', () => {
         status: 'done'
       }
     ]);
-    notebook.finishRun('', 'done');
+    notebook.finishRun(firstRequest?.id ?? '', '', 'done');
     notebook.toggleOutputCollapsed();
     notebook.advanceAfterRun();
     notebook.setKind('command');
     notebook.setSource('pwd');
-    notebook.beginRun();
-    notebook.finishRun('/root\n');
+    const secondRequest = notebook.enqueueRun();
+    notebook.promoteNextRun();
+    notebook.finishRun(secondRequest?.id ?? '', '/root\n');
 
     const restored = new WorkspaceNotebook();
     restoreNotebook(restored, serializeNotebook(notebook));
@@ -64,6 +66,74 @@ describe('Agent Workspace document', () => {
     );
     expect(snapshot.cells[0].status).toBe('interrupted');
     expect(snapshot.cells[0].output).toBe('PING');
+  });
+
+  it('does not restore queued requests as active work', () => {
+    const snapshot = parseWorkspaceSnapshot(
+      JSON.stringify({
+        version: 1,
+        active: 0,
+        cells: [
+          {
+            id: 'cell-8',
+            kind: 'command',
+            source: 'sleep 10',
+            output: 'previous',
+            blocks: [],
+            status: 'queued',
+            executionCount: null,
+            outputCollapsed: true
+          }
+        ]
+      })
+    );
+    expect(snapshot.cells[0]).toMatchObject({
+      status: 'idle',
+      output: 'previous',
+      outputCollapsed: true
+    });
+  });
+
+  it('round-trips compact AI and Command output', () => {
+    const notebook = new WorkspaceNotebook();
+    notebook.setSource('long AI output');
+    const aiRequest = notebook.enqueueRun();
+    notebook.promoteNextRun();
+    notebook.setBlocks([
+      { kind: 'text', id: 'long-ai', text: 'AI output\n'.repeat(100) }
+    ]);
+    notebook.finishRun(aiRequest?.id ?? '', '', 'done');
+    notebook.toggleOutputCollapsed();
+
+    notebook.insertBelow('command');
+    notebook.setSource('printf long-output');
+    const commandRequest = notebook.enqueueRun();
+    notebook.promoteNextRun();
+    notebook.finishRun(
+      commandRequest?.id ?? '',
+      'command output\n'.repeat(100),
+      'done'
+    );
+    notebook.toggleOutputCollapsed();
+
+    const restored = new WorkspaceNotebook();
+    restoreNotebook(restored, serializeNotebook(notebook));
+
+    expect(restored.cells[0]).toMatchObject({
+      kind: 'ai',
+      status: 'done',
+      outputCollapsed: true
+    });
+    expect(restored.cells[0].blocks[0]).toMatchObject({
+      kind: 'text',
+      text: 'AI output\n'.repeat(100)
+    });
+    expect(restored.cells[1]).toMatchObject({
+      kind: 'command',
+      status: 'done',
+      output: 'command output\n'.repeat(100),
+      outputCollapsed: true
+    });
   });
 
   it('falls back to one empty AI cell for blank or invalid files', () => {

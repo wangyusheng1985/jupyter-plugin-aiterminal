@@ -148,6 +148,9 @@ function persistStatus(status: CellStatus | undefined): CellStatus {
   if (status === 'running') {
     return 'interrupted';
   }
+  if (status === 'queued') {
+    return 'idle';
+  }
   return 'idle';
 }
 

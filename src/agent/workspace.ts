@@ -1,4 +1,3 @@
-import { OutputPlaceholder } from '@jupyterlab/cells';
 import type { DocumentRegistry } from '@jupyterlab/docregistry';
 import type { IRenderMimeRegistry } from '@jupyterlab/rendermime';
 import type { Message } from '@lumino/messaging';
@@ -15,7 +14,7 @@ import { formatToolInput } from './tool';
 import type { AgentToolbarHost, CellTypeSwitcher } from './toolbar';
 import type { ChatBlock, WorkspaceMode } from './protocol';
 
-interface CellHandlers {
+export interface CellHandlers {
   onSource: (source: string) => void;
   onSelect: (index: number, options?: { focusEditor?: boolean }) => void;
   onToggleCollapse: (index: number) => void;
@@ -28,8 +27,7 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   readonly notebook = new WorkspaceNotebook();
   readonly session: AgentSession;
   private closing = false;
-  private runningCellId: string | null = null;
-  private advanceAfterRun = false;
+  private aiInterruptRequested = false;
   private readonly shutdown = new ShutdownCoordinator();
   private readonly notebookView: NotebookView;
   private readonly status: StatusBar;
@@ -109,10 +107,14 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   }
 
   setCellKind(kind: WorkspaceMode): void {
-    this.notebook.setKind(kind);
+    const changed = this.notebook.setKind(kind);
     if (this.notebook.empty) {
       this.refresh();
       this.persistSoon();
+      return;
+    }
+    if (!changed) {
+      this.status.setMessage('Cannot change the kind of a running cell.');
       return;
     }
     this.notebook.enterEdit();
@@ -169,15 +171,19 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   }
 
   runAndAdvance(): void {
-    void this.runCell(true);
+    this.runCell(true);
   }
 
   interrupt(): void {
-    if (this.session.running) {
+    const request = this.notebook.activeRun;
+    if (request?.kind === 'ai') {
+      this.aiInterruptRequested = true;
       this.session.interrupt();
       return;
     }
-    this.session.interruptExec();
+    if (request?.kind === 'command') {
+      this.session.interruptExec();
+    }
   }
 
   shutdownOnce(): Promise<void> {
@@ -192,6 +198,7 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     this.closing = true;
     this.clearDeleteChord();
     this.copyButton.dispose();
+    this.notebook.clearRuns();
     this.persistNow();
     void this.shutdownOnce().catch(error => {
       console.error(`Agent Workspace not shut down: ${error}`);
@@ -237,7 +244,11 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   private toggleCellKind(index: number): void {
     if (this.notebook.empty) return;
     this.notebook.select(index);
-    this.notebook.toggleKind();
+    const kind = this.notebook.toggleKind();
+    if (kind === null) {
+      this.status.setMessage('Cannot change the kind of a running cell.');
+      return;
+    }
     this.notebook.enterEdit();
     this.refresh();
     this.persistSoon();
@@ -312,11 +323,11 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
         break;
       case 'run-advance':
         this.clearDeleteChord();
-        void this.runCell(true);
+        this.runCell(true);
         break;
       case 'run-stay':
         this.clearDeleteChord();
-        void this.runCell(false);
+        this.runCell(false);
         break;
     }
   }
@@ -339,62 +350,79 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     this.deleteChordTimer = 0;
   }
 
-  private async runCell(advance: boolean): Promise<void> {
+  private runCell(advance: boolean): void {
     if (this.notebook.empty) return;
-    const source = this.notebook.current.source.trim();
-    if (!source) return;
-    if (this.notebook.busy()) {
-      this.status.setMessage('A cell is already running.');
-      return;
-    }
-    const cell = this.notebook.beginRun();
-    this.runningCellId = cell.id;
-    this.advanceAfterRun = advance;
+    const request = this.notebook.enqueueRun(this.notebook.active, advance);
+    if (!request) return;
+    this.notebook.ensureTrailingInput();
     this.refresh();
-    try {
-      if (cell.kind === 'ai') {
-        this.session.sendUser(source);
-        return;
-      }
-      const result = await this.session.exec(source);
-      this.finishCommandCell(
-        cell.id,
-        result.output,
-        result.returncode === 0 ? 'done' : 'interrupted'
-      );
-    } catch (error) {
-      this.finishCommandCell(cell.id, String(error), 'interrupted');
+    this.persistSoon();
+    if (advance) {
+      this.notebook.advanceAfterRun();
+      this.notebookView.focusActive();
     }
+    this.drainQueue();
   }
 
-  private finishCommandCell(
-    cellId: string,
+  private drainQueue(): void {
+    const request = this.notebook.promoteNextRun();
+    if (!request) {
+      this.refresh();
+      return;
+    }
+    this.refresh();
+    if (request.kind === 'ai') {
+      this.session.sendUser(request.source);
+      return;
+    }
+    void this.session
+      .exec(request.source)
+      .then(result => {
+        this.finishRun(
+          request.id,
+          result.output,
+          result.returncode === 0 ? 'done' : 'interrupted'
+        );
+      })
+      .catch(error => {
+        this.finishRun(request.id, String(error), 'interrupted');
+      });
+  }
+
+  private finishRun(
+    requestId: string,
     output: string,
     status: 'done' | 'interrupted'
   ): void {
-    const index = this.notebook.cells.findIndex(cell => cell.id === cellId);
-    if (index >= 0) {
-      this.notebook.select(index);
-    }
-    this.notebook.finishRun(output, status);
-    this.completeRun(index >= 0 ? index : undefined);
+    if (!this.notebook.finishRun(requestId, output, status)) return;
+    this.aiInterruptRequested = false;
+    this.refresh();
+    this.persistNow();
+    this.drainQueue();
   }
 
   private onSessionChange(): void {
-    const cellId = this.runningCellId;
-    if (cellId) {
-      const index = this.notebook.cells.findIndex(cell => cell.id === cellId);
+    const request = this.notebook.activeRun;
+    if (request) {
+      const index = this.notebook.cells.findIndex(
+        cell => cell.id === request.cellId
+      );
       if (index >= 0) {
         const cell = this.notebook.cells[index];
-        if (cell.kind === 'ai') {
+        if (request.kind === 'ai') {
           cell.blocks = this.session.blocks;
-          if (this.session.error) {
-            cell.status = 'interrupted';
-          } else if (!this.session.running) {
-            cell.status = 'done';
-          }
           if (!this.session.running) {
-            this.completeRun(index);
+            cell.status =
+              this.session.error ||
+              this.aiInterruptRequested ||
+              !this.session.connected
+                ? 'interrupted'
+                : 'done';
+            this.finishRun(
+              request.id,
+              '',
+              cell.status === 'interrupted' ? 'interrupted' : 'done'
+            );
             return;
           }
         } else if (cell.status === 'running') {
@@ -403,28 +431,8 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
       }
     }
     this.refresh();
-    if (this.runningCellId) {
+    if (this.notebook.activeRun) {
       this.persistSoon();
-    }
-  }
-
-  private completeRun(cellIndex?: number): void {
-    this.runningCellId = null;
-    if (cellIndex !== undefined) {
-      this.notebook.select(cellIndex);
-    }
-    const shouldAdvance =
-      this.advanceAfterRun ||
-      this.notebook.active === this.notebook.cells.length - 1;
-    this.advanceAfterRun = false;
-    this.notebook.ensureTrailingInput();
-    if (shouldAdvance) {
-      this.notebook.advanceAfterRun();
-    }
-    this.refresh();
-    this.persistNow();
-    if (shouldAdvance) {
-      this.notebookView.focusActive();
     }
   }
 
@@ -547,7 +555,7 @@ class NotebookView extends Widget {
   }
 }
 
-class CellView {
+export class CellView {
   readonly node: HTMLDivElement;
   private readonly editor: HTMLTextAreaElement;
   private readonly inputPrompt: HTMLDivElement;
@@ -557,7 +565,6 @@ class CellView {
   private outputPrompt: HTMLDivElement | null = null;
   private outputBody: HTMLDivElement | null = null;
   private outputCollapser: HTMLDivElement | null = null;
-  private outputPlaceholder: OutputPlaceholder | null = null;
   private index = 0;
   private lastOutputKey = '';
 
@@ -576,6 +583,12 @@ class CellView {
         return;
       }
       if (this.isCollapser(target)) return;
+      if (
+        this.outputBody?.contains(target) &&
+        this.outputRow?.classList.contains('is-collapsed')
+      ) {
+        return;
+      }
       this.handlers.onSelect(this.index, { focusEditor: false });
     });
 
@@ -641,9 +654,9 @@ class CellView {
     const hasOutput =
       Boolean(cell.output) ||
       cell.blocks.length > 0 ||
+      cell.status === 'queued' ||
       cell.status === 'running';
     if (!hasOutput) {
-      this.detachPlaceholder();
       this.outputRow?.remove();
       this.outputRow = null;
       this.outputPrompt = null;
@@ -663,6 +676,7 @@ class CellView {
       prompt.className = 'jp-AgentWorkspace-prompt is-output';
       const body = document.createElement('div');
       body.className = 'jp-AgentWorkspace-cellOutput jp-Cell-outputArea';
+      body.tabIndex = -1;
       row.append(collapser, prompt, body);
       this.node.append(row);
       this.outputRow = row;
@@ -671,16 +685,16 @@ class CellView {
       this.outputCollapser = collapser;
     }
     this.outputRow.classList.toggle('is-collapsed', cell.outputCollapsed);
+    this.outputBody.tabIndex = cell.outputCollapsed ? 0 : -1;
     setPrompt(this.outputPrompt, null, cell, 'output');
-    if (cell.outputCollapsed) {
-      this.showPlaceholder(cell);
-      return;
-    }
-    this.hidePlaceholder();
     const key = outputKey(cell);
     if (key === this.lastOutputKey) return;
     this.lastOutputKey = key;
-    renderCellOutput(this.outputBody, cell, this.handlers.rendermime);
+    renderCellOutputPreservingScroll(
+      this.outputBody,
+      cell,
+      this.handlers.rendermime
+    );
   }
 
   private bindCollapser(node: HTMLElement): void {
@@ -695,47 +709,7 @@ class CellView {
   }
 
   private isCollapser(target: Node): boolean {
-    return (
-      Boolean(this.outputCollapser?.contains(target)) ||
-      Boolean(this.outputPlaceholder?.node.contains(target))
-    );
-  }
-
-  private showPlaceholder(cell: WorkspaceCell): void {
-    if (!this.outputRow || !this.outputBody || !this.outputPrompt) return;
-    this.outputPrompt.hidden = true;
-    this.outputBody.hidden = true;
-    if (!this.outputPlaceholder) {
-      this.outputPlaceholder = new OutputPlaceholder({
-        callback: event => {
-          event.preventDefault();
-          event.stopPropagation();
-          this.handlers.onToggleCollapse(this.index);
-        },
-        text: placeholderText(cell)
-      });
-    } else {
-      this.outputPlaceholder.text = placeholderText(cell);
-    }
-    if (!this.outputPlaceholder.isAttached) {
-      Widget.attach(this.outputPlaceholder, this.outputRow);
-    }
-  }
-
-  private hidePlaceholder(): void {
-    if (this.outputPrompt) this.outputPrompt.hidden = false;
-    if (this.outputBody) this.outputBody.hidden = false;
-    if (this.outputPlaceholder?.isAttached) {
-      Widget.detach(this.outputPlaceholder);
-    }
-  }
-
-  private detachPlaceholder(): void {
-    if (this.outputPlaceholder?.isAttached) {
-      Widget.detach(this.outputPlaceholder);
-    }
-    this.outputPlaceholder?.dispose();
-    this.outputPlaceholder = null;
+    return Boolean(this.outputCollapser?.contains(target));
   }
 }
 
@@ -779,6 +753,16 @@ export function renderCellOutput(
   }
 }
 
+export function renderCellOutputPreservingScroll(
+  body: HTMLElement,
+  cell: WorkspaceCell,
+  rendermime: IRenderMimeRegistry | null = null
+): void {
+  const scrollTop = body.scrollTop;
+  renderCellOutput(body, cell, rendermime);
+  body.scrollTop = scrollTop;
+}
+
 function setPrompt(
   prompt: HTMLElement,
   kind: HTMLSpanElement | null,
@@ -786,7 +770,7 @@ function setPrompt(
   row: 'input' | 'output'
 ): void {
   const count =
-    cell.status === 'running'
+    cell.status === 'queued' || cell.status === 'running'
       ? '*'
       : cell.executionCount !== null
         ? String(cell.executionCount)
@@ -821,26 +805,6 @@ function hasTextSelection(target: EventTarget | null): boolean {
   }
   const selection = window.getSelection();
   return Boolean(selection && !selection.isCollapsed && selection.toString());
-}
-
-function placeholderText(cell: WorkspaceCell): string {
-  if (cell.kind === 'command') {
-    return cell.output.split('\n').find(line => line.trim()) ?? '';
-  }
-  const text = cell.blocks.find(
-    (block): block is Extract<ChatBlock, { kind: 'text' }> =>
-      block.kind === 'text' && Boolean(block.text.trim())
-  );
-  if (text) return text.text.split('\n').find(line => line.trim()) ?? '';
-  const first = cell.blocks[0];
-  if (!first) return '';
-  if (first.kind === 'tool') {
-    return formatToolInput(first.name, first.input) || first.name;
-  }
-  if (first.kind === 'error') return first.message;
-  if (first.kind === 'denied') return first.command;
-  if (first.kind === 'install') return first.command;
-  return first.kind === 'user' ? first.text : '';
 }
 
 function blurEditor(): void {

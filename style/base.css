@@ -132,11 +132,6 @@
   background: var(--jp-brand-color2, #64b5f6);
 }
 
-.jp-AgentWorkspace-row.is-output .jp-Placeholder {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
 .jp-AgentWorkspace-prompt {
   flex: 0 0 var(--jp-cell-prompt-width, 64px);
   box-sizing: border-box;
@@ -219,6 +214,20 @@
   margin: 0;
   font: inherit;
   white-space: pre-wrap;
+}
+
+.jp-AgentWorkspace-row.is-output.is-collapsed .jp-AgentWorkspace-cellOutput {
+  max-height: var(--jp-AgentWorkspace-outputPreviewHeight, 20em);
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.jp-AgentWorkspace-row.is-output.is-collapsed
+  .jp-AgentWorkspace-cellOutput:focus-visible {
+  outline: var(--jp-border-width, 1px) solid var(--jp-brand-color1, #1976d2);
+  outline-offset: -1px;
 }
 
 .jp-AgentWorkspace-runningIndicator {
