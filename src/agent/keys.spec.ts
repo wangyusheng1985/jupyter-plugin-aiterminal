@@ -182,7 +182,6 @@ describe('mapHistoryKey', () => {
     overrides: Partial<HistoryKeyContext> = {}
   ): HistoryKeyContext {
     return {
-      kind: 'command',
       editable: true,
       value: '',
       selectionStart: 0,
@@ -206,14 +205,13 @@ describe('mapHistoryKey', () => {
     ).toEqual({ type: 'history-next' });
   });
 
-  it('preserves normal arrow behavior for AI, read-only, modified, and selected inputs', () => {
+  it('preserves normal arrow behavior for read-only, modified, and selected inputs', () => {
     const stroke = {
       key: 'ArrowUp',
       shiftKey: false,
       ctrlKey: false,
       metaKey: false
     };
-    expect(mapHistoryKey(stroke, context({ kind: 'ai' }))).toBeNull();
     expect(mapHistoryKey(stroke, context({ editable: false }))).toBeNull();
     expect(mapHistoryKey({ ...stroke, ctrlKey: true }, context())).toBeNull();
     expect(

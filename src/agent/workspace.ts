@@ -593,7 +593,6 @@ export class CellView {
   private outputBody: HTMLDivElement | null = null;
   private outputCollapser: HTMLDivElement | null = null;
   private index = 0;
-  private kind: WorkspaceCell['kind'] = 'ai';
   private lastOutputKey = '';
 
   constructor(
@@ -663,7 +662,6 @@ export class CellView {
 
   sync(cell: WorkspaceCell, index: number, notebook: WorkspaceNotebook): void {
     this.index = index;
-    this.kind = cell.kind;
     const active = index === notebook.active;
     const editing = active && notebook.mode === 'edit';
     this.node.classList.toggle('is-active', active);
@@ -677,7 +675,7 @@ export class CellView {
     }
     this.editor.rows = Math.max(1, this.editor.value.split('\n').length);
     this.editor.readOnly = !editing;
-    if (cell.kind !== 'command' || !editing) {
+    if (!editing) {
       this.handlers.onHistoryReset();
     }
     this.syncOutput(cell);
@@ -693,7 +691,6 @@ export class CellView {
 
   private onEditorKey(event: KeyboardEvent): void {
     const action = mapHistoryKey(strokeFromEvent(event), {
-      kind: this.kind,
       editable: !this.editor.readOnly,
       value: this.editor.value,
       selectionStart: this.editor.selectionStart,

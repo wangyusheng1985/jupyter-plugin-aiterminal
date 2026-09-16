@@ -363,7 +363,7 @@ describe('CellView command history', () => {
     expect(onSource).toHaveBeenLastCalledWith('draft', { fromHistory: true });
   });
 
-  it('leaves AI and multiline editor arrow behavior untouched', () => {
+  it('uses tab history in AI cells while preserving multiline caret movement', () => {
     const history = new CommandHistory();
     history.add('shell command');
     const previous = jest.fn(() => history.previous('ignored'));
@@ -388,12 +388,13 @@ describe('CellView command history', () => {
     if (!textarea) return;
     textarea.setSelectionRange(0, 0);
     press(textarea, 'ArrowUp');
-    expect(previous).not.toHaveBeenCalled();
-    expect(textarea.value).toBe('prompt');
+    expect(previous).toHaveBeenCalledWith('prompt');
+    expect(textarea.value).toBe('shell command');
 
     const multiline = cell({ source: 'one\ntwo' });
     view.sync(multiline, 0, notebook);
     textarea.setSelectionRange(5, 5);
+    previous.mockClear();
     press(textarea, 'ArrowUp');
     expect(previous).not.toHaveBeenCalled();
     expect(textarea.value).toBe('one\ntwo');
@@ -801,7 +802,7 @@ describe('AgentWorkspaceContent command history', () => {
     content.dispose();
   });
 
-  it('recalls per-tab history in real inputs and leaves AI arrows unchanged', () => {
+  it('recalls per-tab history in a new AI cell', () => {
     jest
       .spyOn(AgentSession.prototype, 'exec')
       .mockResolvedValue({ output: 'ok\n', returncode: 0, cwd: '/tmp' });
@@ -867,6 +868,14 @@ describe('AgentWorkspaceContent command history', () => {
     aiInput.dispatchEvent(
       new KeyboardEvent('keydown', {
         key: 'ArrowUp',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    expect(aiInput.value).toBe('first command');
+    aiInput.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'ArrowDown',
         bubbles: true,
         cancelable: true
       })

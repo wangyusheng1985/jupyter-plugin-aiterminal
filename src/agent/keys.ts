@@ -24,7 +24,6 @@ export type KeyAction =
   | { type: 'run-stay' };
 
 export interface HistoryKeyContext {
-  kind: 'ai' | 'command';
   editable: boolean;
   value: string;
   selectionStart: number;
@@ -39,7 +38,6 @@ export function mapHistoryKey(
   context: HistoryKeyContext
 ): HistoryKeyAction | null {
   if (
-    context.kind !== 'command' ||
     !context.editable ||
     stroke.shiftKey ||
     stroke.ctrlKey ||
