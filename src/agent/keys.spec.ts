@@ -1,4 +1,4 @@
-import { mapWorkspaceKey } from './keys';
+import { mapHistoryKey, mapWorkspaceKey, type HistoryKeyContext } from './keys';
 
 describe('mapWorkspaceKey', () => {
   it('uses Enter to edit, not run, in command mode', () => {
@@ -172,6 +172,66 @@ describe('mapWorkspaceKey', () => {
         'notebook',
         'edit',
         true
+      )
+    ).toBeNull();
+  });
+});
+
+describe('mapHistoryKey', () => {
+  function context(
+    overrides: Partial<HistoryKeyContext> = {}
+  ): HistoryKeyContext {
+    return {
+      kind: 'command',
+      editable: true,
+      value: '',
+      selectionStart: 0,
+      selectionEnd: 0,
+      ...overrides
+    };
+  }
+
+  it('maps unmodified up and down at command editor boundaries', () => {
+    expect(
+      mapHistoryKey(
+        { key: 'ArrowUp', shiftKey: false, ctrlKey: false, metaKey: false },
+        context()
+      )
+    ).toEqual({ type: 'history-previous' });
+    expect(
+      mapHistoryKey(
+        { key: 'ArrowDown', shiftKey: false, ctrlKey: false, metaKey: false },
+        context({ value: 'one\ntwo', selectionStart: 7, selectionEnd: 7 })
+      )
+    ).toEqual({ type: 'history-next' });
+  });
+
+  it('preserves normal arrow behavior for AI, read-only, modified, and selected inputs', () => {
+    const stroke = {
+      key: 'ArrowUp',
+      shiftKey: false,
+      ctrlKey: false,
+      metaKey: false
+    };
+    expect(mapHistoryKey(stroke, context({ kind: 'ai' }))).toBeNull();
+    expect(mapHistoryKey(stroke, context({ editable: false }))).toBeNull();
+    expect(mapHistoryKey({ ...stroke, ctrlKey: true }, context())).toBeNull();
+    expect(
+      mapHistoryKey(stroke, context({ selectionStart: 0, selectionEnd: 1 }))
+    ).toBeNull();
+  });
+
+  it('preserves multiline caret movement away from the navigation boundary', () => {
+    expect(
+      mapHistoryKey(
+        { key: 'ArrowUp', shiftKey: false, ctrlKey: false, metaKey: false },
+        context({ value: 'one\ntwo', selectionStart: 5, selectionEnd: 5 })
+      )
+    ).toBeNull();
+    expect(
+      mapHistoryKey(
+        { key: 'ArrowDown', shiftKey: false, ctrlKey: false, metaKey: false },
+        context({ value: 'one\ntwo', selectionStart: 1, selectionEnd: 1 })
       )
     ).toBeNull();
   });

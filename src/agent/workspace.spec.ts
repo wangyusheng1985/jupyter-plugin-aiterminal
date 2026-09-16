@@ -7,6 +7,8 @@ import {
   renderCellOutputPreservingScroll,
   runningIndicatorNode
 } from './workspace';
+import { restoreNotebook, serializeNotebook } from './document';
+import { CommandHistory } from './history';
 import { WorkspaceNotebook, type WorkspaceCell } from './notebook';
 import { AgentSession } from './session';
 
@@ -220,13 +222,19 @@ describe('CellView output state', () => {
     };
   }
 
-  function handlers(onSelect = jest.fn()): CellHandlers {
+  function handlers(
+    onSelect = jest.fn(),
+    history = new CommandHistory()
+  ): CellHandlers {
     return {
       onSource: jest.fn(),
       onSelect,
       onToggleCollapse: jest.fn(),
       onToggleKind: jest.fn(),
       onAddCell: jest.fn(),
+      onHistoryPrevious: draft => history.previous(draft),
+      onHistoryNext: () => history.next(),
+      onHistoryReset: () => history.resetNavigation(),
       rendermime: null
     };
   }
@@ -295,6 +303,150 @@ describe('CellView output state', () => {
 
     expect(onSelect).not.toHaveBeenCalled();
   });
+});
+
+describe('CellView command history', () => {
+  function cell(overrides: Partial<WorkspaceCell> = {}): WorkspaceCell {
+    return {
+      id: 'cell-1',
+      kind: 'command',
+      source: '',
+      output: '',
+      blocks: [],
+      status: 'idle',
+      executionCount: null,
+      outputCollapsed: false,
+      ...overrides
+    };
+  }
+
+  function press(textarea: HTMLTextAreaElement, key: string): KeyboardEvent {
+    const event = new KeyboardEvent('keydown', {
+      key,
+      bubbles: true,
+      cancelable: true
+    });
+    textarea.dispatchEvent(event);
+    return event;
+  }
+
+  it('navigates older and newer commands and restores the draft', () => {
+    const history = new CommandHistory();
+    history.add('first');
+    history.add('second');
+    const command = cell({ source: 'draft' });
+    const onSource = jest.fn((source: string) => {
+      command.source = source;
+    });
+    const view = new CellView('cell-1', {
+      ...new CommandHistoryHandlers(history),
+      onSource
+    });
+    view.sync(command, 0, new WorkspaceNotebook());
+    const textarea = view.node.querySelector<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    );
+    expect(textarea).not.toBeNull();
+    textarea?.setSelectionRange(0, 0);
+
+    if (!textarea) return;
+    press(textarea, 'ArrowUp');
+    expect(textarea.value).toBe('second');
+    press(textarea, 'ArrowUp');
+    expect(textarea.value).toBe('first');
+    press(textarea, 'ArrowDown');
+    expect(textarea.value).toBe('second');
+    press(textarea, 'ArrowDown');
+    expect(textarea.value).toBe('draft');
+    expect(command.source).toBe('draft');
+    expect(history.browsing).toBe(false);
+    expect(onSource).toHaveBeenLastCalledWith('draft', { fromHistory: true });
+  });
+
+  it('leaves AI and multiline editor arrow behavior untouched', () => {
+    const history = new CommandHistory();
+    history.add('shell command');
+    const previous = jest.fn(() => history.previous('ignored'));
+    const next = jest.fn(() => history.next());
+    const view = new CellView('cell-1', {
+      onSource: jest.fn(),
+      onSelect: jest.fn(),
+      onToggleCollapse: jest.fn(),
+      onToggleKind: jest.fn(),
+      onAddCell: jest.fn(),
+      onHistoryPrevious: previous,
+      onHistoryNext: next,
+      onHistoryReset: jest.fn(),
+      rendermime: null
+    });
+    const notebook = new WorkspaceNotebook();
+    const ai = cell({ kind: 'ai', source: 'prompt' });
+    view.sync(ai, 0, notebook);
+    const textarea = view.node.querySelector<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    );
+    if (!textarea) return;
+    textarea.setSelectionRange(0, 0);
+    press(textarea, 'ArrowUp');
+    expect(previous).not.toHaveBeenCalled();
+    expect(textarea.value).toBe('prompt');
+
+    const multiline = cell({ source: 'one\ntwo' });
+    view.sync(multiline, 0, notebook);
+    textarea.setSelectionRange(5, 5);
+    press(textarea, 'ArrowUp');
+    expect(previous).not.toHaveBeenCalled();
+    expect(textarea.value).toBe('one\ntwo');
+  });
+
+  it('ends history navigation when recalled text is edited or the editor blurs', () => {
+    const history = new CommandHistory();
+    history.add('command');
+    const view = new CellView('cell-1', new CommandHistoryHandlers(history));
+    view.sync(cell(), 0, new WorkspaceNotebook());
+    const textarea = view.node.querySelector<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    );
+    if (!textarea) return;
+
+    press(textarea, 'ArrowUp');
+    expect(history.browsing).toBe(true);
+    textarea.value = 'edited';
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(history.browsing).toBe(false);
+
+    press(textarea, 'ArrowUp');
+    expect(history.browsing).toBe(true);
+    textarea.dispatchEvent(new FocusEvent('blur'));
+    expect(history.browsing).toBe(false);
+  });
+
+  class CommandHistoryHandlers implements CellHandlers {
+    onSource = jest.fn(
+      (source: string, options?: { fromHistory?: boolean }) => {
+        if (!options?.fromHistory) this.history.resetNavigation();
+      }
+    );
+    onSelect = jest.fn();
+    onToggleCollapse = jest.fn();
+    onToggleKind = jest.fn();
+    onAddCell = jest.fn();
+    rendermime = null;
+
+    constructor(private readonly history: CommandHistory) {}
+
+    onHistoryPrevious = (draft: string) => {
+      return this.history.previous(draft);
+    };
+
+    onHistoryNext = () => {
+      return this.history.next();
+    };
+
+    onHistoryReset = (): void => {
+      this.history.resetNavigation();
+    };
+  }
 });
 
 describe('AgentWorkspaceContent queue scheduling', () => {
@@ -527,5 +679,201 @@ describe('AgentWorkspaceContent queue scheduling', () => {
     expect(content.notebook.queuedRuns).toEqual([]);
     expect(content.notebook.cells[0].status).toBe('interrupted');
     expect(content.notebook.cells[1].status).toBe('idle');
+  });
+});
+
+describe('AgentWorkspaceContent command history', () => {
+  interface WorkspaceInternals {
+    runCell(advance: boolean): void;
+    refresh(): void;
+  }
+
+  beforeEach(() => {
+    jest.spyOn(AgentSession.prototype, 'connect').mockImplementation(() => {});
+    jest.spyOn(AgentSession.prototype, 'close').mockImplementation(() => {});
+    jest.spyOn(AgentSession.prototype, 'sendUser').mockImplementation(function (
+      this: AgentSession,
+      text: string
+    ): void {
+      this.blocks = [{ kind: 'user', id: 'history-user', text }];
+      this.error = null;
+      this.running = true;
+    });
+    jest
+      .spyOn(AgentSession.prototype, 'interrupt')
+      .mockImplementation(() => {});
+    jest
+      .spyOn(AgentSession.prototype, 'interruptExec')
+      .mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('keeps command histories isolated by tab and out of serialization', () => {
+    jest
+      .spyOn(AgentSession.prototype, 'exec')
+      .mockResolvedValue({ output: 'ok\n', returncode: 0, cwd: '/tmp' });
+    const first = new AgentWorkspaceContent(null);
+    const second = new AgentWorkspaceContent(null);
+    const firstInternals = first as unknown as WorkspaceInternals;
+
+    first.notebook.setKind('command');
+    first.notebook.setSource('pwd');
+    firstInternals.runCell(false);
+
+    expect(first.commandHistory.values).toEqual(['pwd']);
+    expect(second.commandHistory.values).toEqual([]);
+
+    const restored = new AgentWorkspaceContent(null);
+    restoreNotebook(restored.notebook, serializeNotebook(first.notebook));
+    expect(restored.commandHistory.values).toEqual([]);
+
+    first.dispose();
+    second.dispose();
+    restored.dispose();
+  });
+
+  it('records a command when accepted and keeps it after a failed run', async () => {
+    jest
+      .spyOn(AgentSession.prototype, 'exec')
+      .mockRejectedValue(new Error('command failed'));
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as WorkspaceInternals;
+
+    content.notebook.setKind('command');
+    content.notebook.setSource('false');
+    internals.runCell(false);
+    expect(content.commandHistory.values).toEqual(['false']);
+
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(content.commandHistory.values).toEqual(['false']);
+    content.dispose();
+  });
+
+  it('records a queued command before it starts executing', () => {
+    jest
+      .spyOn(AgentSession.prototype, 'exec')
+      .mockImplementation(() => new Promise(() => undefined));
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as WorkspaceInternals;
+
+    content.notebook.setSource('first AI request');
+    internals.runCell(false);
+    content.notebook.select(1);
+    content.notebook.setKind('command');
+    content.notebook.setSource('pwd');
+    internals.runCell(false);
+
+    expect(content.notebook.cells[1].status).toBe('queued');
+    expect(content.commandHistory.values).toEqual(['pwd']);
+    content.dispose();
+  });
+
+  it('does not add AI submissions to command history', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as WorkspaceInternals;
+
+    content.notebook.setSource('explain this repository');
+    internals.runCell(false);
+
+    expect(content.commandHistory.values).toEqual([]);
+    content.dispose();
+  });
+
+  it('keeps queued command entries after interrupted execution', async () => {
+    jest.spyOn(AgentSession.prototype, 'exec').mockResolvedValue({
+      output: 'interrupted\n',
+      returncode: 1,
+      cwd: '/tmp'
+    });
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as WorkspaceInternals;
+
+    content.notebook.setKind('command');
+    content.notebook.setSource('sleep 10');
+    internals.runCell(false);
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(content.notebook.cells[0].status).toBe('interrupted');
+    expect(content.commandHistory.values).toEqual(['sleep 10']);
+    content.dispose();
+  });
+
+  it('recalls per-tab history in real inputs and leaves AI arrows unchanged', () => {
+    jest
+      .spyOn(AgentSession.prototype, 'exec')
+      .mockResolvedValue({ output: 'ok\n', returncode: 0, cwd: '/tmp' });
+    const first = new AgentWorkspaceContent(null);
+    const second = new AgentWorkspaceContent(null);
+    const firstInternals = first as unknown as WorkspaceInternals;
+    const secondInternals = second as unknown as WorkspaceInternals;
+
+    first.notebook.setKind('command');
+    first.notebook.setSource('first command');
+    firstInternals.runCell(false);
+    first.notebook.select(1);
+    first.notebook.enterEdit();
+    firstInternals.refresh();
+
+    const firstInputs = first.node.querySelectorAll<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    );
+    const firstInput = firstInputs[first.notebook.active];
+    firstInput.setSelectionRange(0, 0);
+    firstInput.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'ArrowUp',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    expect(firstInput.value).toBe('first command');
+    firstInput.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'ArrowDown',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    expect(firstInput.value).toBe('');
+
+    second.notebook.setKind('command');
+    second.notebook.enterEdit();
+    secondInternals.refresh();
+    const secondInput = second.node.querySelector<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    );
+    if (!secondInput) return;
+    secondInput.setSelectionRange(0, 0);
+    secondInput.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'ArrowUp',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    expect(secondInput.value).toBe('');
+
+    first.setCellKind('ai');
+    first.notebook.setSource('prompt text');
+    firstInternals.refresh();
+    const aiInputs = first.node.querySelectorAll<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    );
+    const aiInput = aiInputs[first.notebook.active];
+    aiInput.setSelectionRange(0, 0);
+    aiInput.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'ArrowUp',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    expect(aiInput.value).toBe('prompt text');
+
+    first.dispose();
+    second.dispose();
   });
 });
