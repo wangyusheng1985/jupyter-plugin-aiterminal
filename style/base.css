@@ -3,9 +3,9 @@
   min-width: 0;
   min-height: 0;
   flex-direction: column;
-  background: #f4f6f8;
-  color: #17283a;
-  font-family: Geneva, Tahoma, sans-serif;
+  background: var(--jp-layout-color1, #ffffff);
+  color: var(--jp-ui-font-color0, #111111);
+  font-family: var(--jp-ui-font-family, sans-serif);
 }
 
 .jp-AgentWorkspace-toolbar.jp-Toolbar {
@@ -214,6 +214,386 @@
   outline-offset: -1px;
 }
 
+.jp-AgentWorkspace-turn {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+  container-type: inline-size;
+}
+
+.jp-AgentWorkspace-outcome {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.jp-AgentWorkspace-outcomeBody {
+  min-width: 0;
+  max-width: 78ch;
+  color: var(--jp-content-font-color0, #111111);
+  font-family: 'Iowan Old Style', 'Source Serif 4', Georgia, serif;
+  font-size: var(--jp-content-font-size1, 16px);
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
+.jp-AgentWorkspace-outcomeBody > :first-child {
+  margin-top: 0;
+}
+
+.jp-AgentWorkspace-outcomeBody > :last-child {
+  margin-bottom: 0;
+}
+
+.jp-AgentWorkspace-outcomeBody :is(p, ul, ol, blockquote) {
+  margin: 0.65em 0;
+}
+
+.jp-AgentWorkspace-outcomeBody code {
+  font-family: var(--jp-code-font-family, monospace);
+}
+
+.jp-AgentWorkspace-outcomeBody.is-preview {
+  max-height: 30em;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.jp-AgentWorkspace-disclosure {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px;
+  box-sizing: border-box;
+  align-items: center;
+  width: 100%;
+  min-width: 0;
+  padding: 5px 7px;
+  border: 0;
+  border-radius: 0;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.jp-AgentWorkspace-disclosure:hover {
+  background: var(--jp-layout-color2, #eeeeee);
+}
+
+.jp-AgentWorkspace-disclosure:focus-visible {
+  outline: var(--jp-border-width, 1px) solid var(--jp-brand-color1, #1976d2);
+  outline-offset: -1px;
+}
+
+.jp-AgentWorkspace-disclosureMarker {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  color: var(--jp-ui-font-color2, #5b6570);
+}
+
+.jp-AgentWorkspace-disclosureText {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.jp-AgentWorkspace-outcome .jp-AgentWorkspace-disclosure,
+.jp-AgentWorkspace-auditToggle,
+.jp-AgentWorkspace-evidenceToggle {
+  width: auto;
+  color: var(--jp-content-link-color, #1976d2);
+}
+
+.jp-AgentWorkspace-auditSummary {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  gap: 4px 14px;
+  box-sizing: border-box;
+  align-items: center;
+  min-width: 0;
+  max-width: 100%;
+  margin-top: 2px;
+  padding-top: 8px;
+  border-top: var(--jp-border-width, 1px) solid var(--jp-border-color2, #e0e0e0);
+  color: var(--jp-ui-font-color2, #5b6570);
+  font-family: var(--jp-ui-font-family, sans-serif);
+  font-size: var(--jp-ui-font-size1, 13px);
+}
+
+.jp-AgentWorkspace-auditToggle {
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 0;
+  color: var(--jp-ui-font-color2, #5b6570);
+}
+
+.jp-AgentWorkspace-auditToggle:hover {
+  color: var(--jp-content-link-color, #1976d2);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.jp-AgentWorkspace-failureNavigation {
+  min-height: 28px;
+  padding: 2px 0;
+  border: 0;
+  color: var(--jp-error-color1, #d32f2f);
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  white-space: nowrap;
+}
+
+.jp-AgentWorkspace-failureNavigation:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.jp-AgentWorkspace-failureNavigation:focus-visible {
+  outline: var(--jp-border-width, 1px) solid var(--jp-brand-color1, #1976d2);
+  outline-offset: 2px;
+}
+
+.jp-AgentWorkspace-auditStats {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 5px 12px;
+  color: var(--jp-ui-font-color2, #5b6570);
+  font-variant-numeric: tabular-nums;
+}
+
+.jp-AgentWorkspace-auditStats span {
+  white-space: nowrap;
+}
+
+.jp-AgentWorkspace-auditStats span + span::before {
+  margin-right: 12px;
+  color: var(--jp-border-color1, #bdbdbd);
+  content: '·';
+}
+
+.jp-AgentWorkspace-executionRecord {
+  grid-column: 1 / -1;
+  min-width: 0;
+  max-width: 100%;
+  margin-top: 2px;
+  border-bottom: var(--jp-border-width, 1px) solid
+    var(--jp-border-color2, #e0e0e0);
+}
+
+.jp-AgentWorkspace-recordHeading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 1px 7px;
+  border-bottom: var(--jp-border-width, 1px) solid
+    var(--jp-border-color2, #e0e0e0);
+}
+
+.jp-AgentWorkspace-recordTitle {
+  color: var(--jp-ui-font-color0, #111111);
+  font-size: var(--jp-ui-font-size1, 13px);
+  font-weight: 600;
+}
+
+.jp-AgentWorkspace-recordNote {
+  color: var(--jp-ui-font-color3, #9e9e9e);
+  font-size: var(--jp-ui-font-size0, 11px);
+}
+
+.jp-AgentWorkspace-earlierActivities {
+  padding: 5px 1px;
+  color: var(--jp-ui-font-color2, #5b6570);
+  font-size: var(--jp-ui-font-size0, 11px);
+}
+
+.jp-AgentWorkspace-activity {
+  min-width: 0;
+  border-bottom: var(--jp-border-width, 1px) solid
+    var(--jp-border-color2, #e0e0e0);
+}
+
+.jp-AgentWorkspace-activity:last-child {
+  border-bottom: 0;
+}
+
+.jp-AgentWorkspace-activity.is-compact {
+  opacity: 0.78;
+}
+
+.jp-AgentWorkspace-activity.is-current > .jp-AgentWorkspace-activityHeader {
+  box-shadow: inset 2px 0 0 var(--jp-brand-color1, #1976d2);
+}
+
+.jp-AgentWorkspace-activity.is-failed > .jp-AgentWorkspace-activityHeader {
+  background: var(--jp-error-color3, #fff3f3);
+  box-shadow: inset 2px 0 0 var(--jp-error-color1, #d32f2f);
+}
+
+.jp-AgentWorkspace-activityHeader {
+  display: grid;
+  grid-template-columns:
+    14px 28px minmax(0, 1.5fr)
+    minmax(110px, 0.9fr) 68px;
+  gap: 8px;
+  min-height: 36px;
+  align-items: center;
+  padding: 5px 2px;
+}
+
+.jp-AgentWorkspace-activityHeader:hover {
+  background: var(--jp-layout-color2, #eeeeee);
+}
+
+.jp-AgentWorkspace-stepNumber {
+  color: var(--jp-ui-font-color3, #9e9e9e);
+  font-family: var(--jp-code-font-family, monospace);
+  font-size: var(--jp-code-font-size, 13px);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.jp-AgentWorkspace-stepOperation {
+  min-width: 0;
+}
+
+.jp-AgentWorkspace-stepOperation strong,
+.jp-AgentWorkspace-stepOperation span {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.jp-AgentWorkspace-stepOperation strong {
+  color: var(--jp-ui-font-color0, #111111);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.jp-AgentWorkspace-stepOperation span {
+  margin-top: 1px;
+  color: var(--jp-ui-font-color2, #5b6570);
+  font-family: var(--jp-code-font-family, monospace);
+  font-size: var(--jp-code-font-size0, 11px);
+  line-height: 1.35;
+}
+
+.jp-AgentWorkspace-stepResult {
+  min-width: 0;
+  color: var(--jp-ui-font-color2, #5b6570);
+  font-size: var(--jp-ui-font-size1, 13px);
+  overflow-wrap: anywhere;
+}
+
+.jp-AgentWorkspace-stepResult.is-error,
+.jp-AgentWorkspace-stepResult.is-failed {
+  color: var(--jp-error-color1, #d32f2f);
+}
+
+.jp-AgentWorkspace-stepResult.is-running,
+.jp-AgentWorkspace-stepResult.is-started {
+  color: var(--jp-brand-color1, #1976d2);
+}
+
+.jp-AgentWorkspace-stepDuration {
+  color: var(--jp-ui-font-color3, #9e9e9e);
+  font-family: var(--jp-code-font-family, monospace);
+  font-size: var(--jp-code-font-size0, 11px);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.jp-AgentWorkspace-activityBody {
+  min-width: 0;
+  padding: 2px 2px 10px 50px;
+}
+
+.jp-AgentWorkspace-activityEvidence {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.jp-AgentWorkspace-evidenceLabel {
+  margin: 4px 0 0;
+  color: var(--jp-ui-font-color2, #5b6570);
+  font-size: var(--jp-ui-font-size0, 11px);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.jp-AgentWorkspace-activityBody .jp-AgentWorkspace-toolInput,
+.jp-AgentWorkspace-activityBody .jp-AgentWorkspace-toolOutput {
+  box-sizing: border-box;
+  max-width: 100%;
+  max-height: 168px;
+  margin: 0;
+  padding: 8px 10px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 0;
+  border-left: 2px solid var(--jp-border-color1, #bdbdbd);
+  background: var(--jp-layout-color2, #eeeeee);
+  color: var(--jp-content-font-color0, #111111);
+  font-family: var(--jp-code-font-family, monospace);
+  font-size: var(--jp-code-font-size, 13px);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  scrollbar-gutter: stable;
+  white-space: pre-wrap;
+}
+
+.jp-AgentWorkspace-hiddenEvidence {
+  margin-top: 3px;
+  color: var(--jp-ui-font-color2, #5b6570);
+  font-family: var(--jp-ui-font-family, sans-serif);
+  font-size: var(--jp-ui-font-size0, 11px);
+}
+
+.jp-AgentWorkspace-evidenceToggle {
+  width: auto;
+  padding-left: 0;
+  color: var(--jp-content-link-color, #1976d2);
+}
+
+.jp-AgentWorkspace-activityDiagnostics {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+  padding-left: 9px;
+  border-left: 2px solid var(--jp-warn-color1, #ff9800);
+}
+
+.jp-AgentWorkspace-activityDiagnostic {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  color: var(--jp-ui-font-color2, #5b6570);
+  font-size: var(--jp-ui-font-size1, 13px);
+}
+
+.jp-AgentWorkspace-activityDiagnostic.is-error {
+  color: var(--jp-error-color1, #d32f2f);
+}
+
+.jp-AgentWorkspace-activityDiagnostic strong,
+.jp-AgentWorkspace-activityDiagnostic span {
+  overflow-wrap: anywhere;
+}
+
 .jp-AgentWorkspace-runningIndicator {
   display: inline-block;
   color: inherit;
@@ -242,17 +622,79 @@
   .jp-AgentWorkspace-runningIndicator {
     animation: none;
   }
+
+  .jp-AgentWorkspace-disclosure,
+  .jp-AgentWorkspace-activityHeader {
+    transition: none;
+  }
+}
+
+@container (max-width: 560px) {
+  .jp-AgentWorkspace-auditSummary {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .jp-AgentWorkspace-auditStats {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+  }
+
+  .jp-AgentWorkspace-activityHeader {
+    grid-template-columns: 14px 28px minmax(0, 1fr) 64px;
+  }
+
+  .jp-AgentWorkspace-stepResult {
+    grid-column: 3;
+    grid-row: 2;
+  }
+
+  .jp-AgentWorkspace-stepDuration {
+    grid-column: 4;
+    grid-row: 1 / span 2;
+  }
+
+  .jp-AgentWorkspace-activityBody {
+    padding-left: 50px;
+  }
+}
+
+@media (max-width: 600px) {
+  .jp-AgentWorkspace-auditSummary {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .jp-AgentWorkspace-auditStats {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+  }
+
+  .jp-AgentWorkspace-activityHeader {
+    grid-template-columns: 14px 28px minmax(0, 1fr) 64px;
+  }
+
+  .jp-AgentWorkspace-stepResult {
+    grid-column: 3;
+    grid-row: 2;
+  }
+
+  .jp-AgentWorkspace-stepDuration {
+    grid-column: 4;
+    grid-row: 1 / span 2;
+  }
+
+  .jp-AgentWorkspace-activityBody {
+    padding-left: 50px;
+  }
 }
 
 .jp-AgentWorkspace-status {
   order: 3;
   min-height: 22px;
   padding: 4px 10px;
-  color: #17283a;
-  background: linear-gradient(#c9ced3, #aeb5bc);
-  border-top: 1px solid #f1f3f5;
+  color: var(--jp-ui-font-color0, #111111);
+  background: var(--jp-layout-color2, #eeeeee);
+  border-top: var(--jp-border-width, 1px) solid var(--jp-border-color2, #e0e0e0);
   font-size: 11px;
-  text-shadow: 0 1px #fff;
 }
 
 .jp-AgentWorkspace-footer.jp-Notebook-footer {

@@ -4,6 +4,7 @@ export type WorkspaceMode = 'ai' | 'command';
 
 export interface AgentUserMessage {
   type: 'user';
+  turnId?: string;
   text: string;
 }
 
@@ -35,32 +36,49 @@ export interface AgentReadyEvent {
 
 export interface AgentErrorEvent {
   type: 'error';
+  turnId?: string;
   code: 'config' | 'runtime' | 'denied';
   message: string;
 }
 
 export interface AgentTextEvent {
   type: 'text';
+  turnId?: string;
+  messageId?: string;
   text: string;
+}
+
+export interface AgentThinkingEvent {
+  type: 'thinking';
+  turnId?: string;
+  id: string;
+  state?: 'started' | 'finished';
 }
 
 export interface AgentToolStartEvent {
   type: 'tool_start';
+  turnId?: string;
   id: string;
   name: string;
   input: unknown;
+  startedAt?: number;
 }
 
 export interface AgentToolEndEvent {
   type: 'tool_end';
+  turnId?: string;
   id: string;
   name: string;
   output: string;
   isError?: boolean;
+  durationMs?: number;
+  lineCount?: number;
+  byteCount?: number;
 }
 
 export interface AgentInstallEvent {
   type: 'install';
+  turnId?: string;
   command: string;
   status: 'started' | 'ok' | 'failed';
   detail?: string;
@@ -68,14 +86,23 @@ export interface AgentInstallEvent {
 
 export interface AgentDeniedEvent {
   type: 'denied';
+  turnId?: string;
   command: string;
   reason: string;
 }
 
 export interface AgentResultEvent {
   type: 'result';
+  turnId?: string;
   text: string;
   isError?: boolean;
+  apiDurationMs?: number;
+  durationMs?: number;
+  numTurns?: number;
+  costUsd?: number | null;
+  usage?: Record<string, unknown> | null;
+  errors?: string[];
+  permissionDenials?: unknown[];
 }
 
 export interface AgentExecOutputEvent {
@@ -99,6 +126,7 @@ export type AgentServerEvent =
   | AgentReadyEvent
   | AgentErrorEvent
   | AgentTextEvent
+  | AgentThinkingEvent
   | AgentToolStartEvent
   | AgentToolEndEvent
   | AgentInstallEvent
@@ -110,7 +138,17 @@ export type AgentServerEvent =
 
 export type ChatBlock =
   | { kind: 'user'; id: string; text: string }
-  | { kind: 'text'; id: string; text: string }
+  | {
+      kind: 'text';
+      id: string;
+      text: string;
+      messageId?: string;
+    }
+  | {
+      kind: 'thinking';
+      id: string;
+      status: 'started' | 'finished';
+    }
   | {
       kind: 'tool';
       id: string;
@@ -118,6 +156,10 @@ export type ChatBlock =
       input: unknown;
       output: string;
       status: 'running' | 'done' | 'error';
+      startedAt?: number;
+      durationMs?: number;
+      lineCount?: number;
+      byteCount?: number;
     }
   | {
       kind: 'install';
@@ -140,10 +182,46 @@ export function applyServerEvent(
 ): ChatBlock[] {
   switch (event.type) {
     case 'text':
+      if (event.messageId) {
+        const existing = findLastTextBlock(blocks, event.messageId);
+        if (existing) {
+          return blocks.map(block =>
+            block.kind === 'text' && block.id === existing.id
+              ? { ...block, text: event.text }
+              : block
+          );
+        }
+      }
       return [
         ...blocks,
-        { kind: 'text', id: nextId('text'), text: event.text }
+        {
+          kind: 'text',
+          id: event.messageId ? `text-${event.messageId}` : nextId('text'),
+          text: event.text,
+          ...(event.messageId ? { messageId: event.messageId } : {})
+        }
       ];
+    case 'thinking': {
+      const id = `thinking-${event.id}`;
+      const existing = blocks.find(
+        block => block.kind === 'thinking' && block.id === id
+      );
+      if (existing) {
+        return blocks.map(block =>
+          block.kind === 'thinking' && block.id === id
+            ? { ...block, status: event.state ?? 'finished' }
+            : block
+        );
+      }
+      return [
+        ...blocks,
+        {
+          kind: 'thinking',
+          id,
+          status: event.state ?? 'finished'
+        }
+      ];
+    }
     case 'tool_start':
       return [
         ...blocks,
@@ -153,7 +231,10 @@ export function applyServerEvent(
           name: event.name,
           input: event.input,
           output: '',
-          status: 'running'
+          status: 'running',
+          ...(event.startedAt === undefined
+            ? {}
+            : { startedAt: event.startedAt })
         }
       ];
     case 'tool_end':
@@ -162,7 +243,16 @@ export function applyServerEvent(
           ? {
               ...block,
               output: event.output,
-              status: event.isError ? 'error' : 'done'
+              status: event.isError ? 'error' : 'done',
+              ...(event.durationMs === undefined
+                ? {}
+                : { durationMs: event.durationMs }),
+              ...(event.lineCount === undefined
+                ? {}
+                : { lineCount: event.lineCount }),
+              ...(event.byteCount === undefined
+                ? {}
+                : { byteCount: event.byteCount })
             }
           : block
       );
@@ -215,4 +305,17 @@ export function applyServerEvent(
 let eventCounter = 0;
 function nextId(prefix: string): string {
   return `${prefix}-${++eventCounter}`;
+}
+
+function findLastTextBlock(
+  blocks: ChatBlock[],
+  messageId: string
+): Extract<ChatBlock, { kind: 'text' }> | null {
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    const block = blocks[index];
+    if (block.kind === 'text' && block.messageId === messageId) {
+      return block;
+    }
+  }
+  return null;
 }

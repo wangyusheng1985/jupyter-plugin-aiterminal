@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 from jupyter_aiterminal.agent import (
     AgentSession,
@@ -250,6 +251,36 @@ def test_query_waits_for_in_progress_start(monkeypatch):
     asyncio.run(run())
     assert created[0].queries == ["hello"]
     assert not any(event["type"] == "error" for event in events)
+
+
+def test_query_scopes_events_to_active_turn(monkeypatch):
+    events = []
+
+    class FakeClient:
+        async def connect(self):
+            pass
+
+        async def query(self, _prompt):
+            pass
+
+        async def receive_response(self):
+            yield SimpleNamespace(message_id="m1", content="hello")
+
+    _configure_fake_sdk(monkeypatch, lambda _options: FakeClient())
+
+    async def run():
+        session = AgentSession("/tmp", _emit_to(events))
+        await session.query("hello", "run-7")
+
+    asyncio.run(run())
+    assert [event for event in events if event["type"] == "text"] == [
+        {
+            "type": "text",
+            "text": "hello",
+            "messageId": "m1",
+            "turnId": "run-7",
+        }
+    ]
 
 
 def test_close_during_start_does_not_publish_client(monkeypatch):

@@ -1,9 +1,11 @@
 import {
+  AGENT_WORKSPACE_VERSION,
   parseWorkspaceSnapshot,
   restoreNotebook,
   serializeNotebook
 } from './document';
 import { WorkspaceNotebook } from './notebook';
+import { createTurn, setTurnStatus, toggleOutcome, toggleTrace } from './turn';
 
 describe('Agent Workspace document', () => {
   it('round-trips mixed cells including outputs and collapse', () => {
@@ -189,5 +191,203 @@ describe('Agent Workspace document', () => {
     restoreNotebook(restored, serializeNotebook(notebook));
     expect(restored.cells).toHaveLength(0);
     expect(restored.empty).toBe(true);
+  });
+
+  it('migrates version 1 blocks into a turn without discarding evidence', () => {
+    const notebook = new WorkspaceNotebook();
+    notebook.cells[0].source = 'inspect the workspace';
+    notebook.cells[0].status = 'done';
+    notebook.cells[0].blocks = [
+      { kind: 'text', id: 'text-1', text: 'Working through the files.' },
+      {
+        kind: 'tool',
+        id: 'tool-1',
+        name: 'Read',
+        input: { file_path: '/tmp/a.ts' },
+        output: 'export const a = 1;\n',
+        status: 'done'
+      },
+      {
+        kind: 'install',
+        id: 'install-1',
+        command: 'npm install',
+        status: 'ok',
+        detail: ''
+      },
+      {
+        kind: 'denied',
+        id: 'denied-1',
+        command: 'rm -rf /tmp',
+        reason: 'blocked'
+      },
+      {
+        kind: 'error',
+        id: 'error-1',
+        code: 'runtime',
+        message: 'one command failed'
+      }
+    ];
+    const rawBlocks = JSON.parse(JSON.stringify(notebook.cells[0].blocks));
+
+    const restored = new WorkspaceNotebook();
+    restoreNotebook(
+      restored,
+      JSON.stringify({
+        version: 1,
+        active: 0,
+        cells: [
+          {
+            id: 'legacy-cell',
+            kind: 'ai',
+            source: 'inspect the workspace',
+            output: '',
+            blocks: notebook.cells[0].blocks,
+            status: 'done',
+            executionCount: 1,
+            outputCollapsed: false
+          }
+        ]
+      })
+    );
+
+    expect(restored.cells[0].blocks).toEqual(rawBlocks);
+    expect(restored.cells[0].turn).toMatchObject({
+      id: 'legacy-legacy-cell',
+      status: 'done',
+      outcome: 'Working through the files.',
+      outcomeKind: 'assistant'
+    });
+    expect(restored.cells[0].turn?.timeline.map(item => item.kind)).toEqual([
+      'tool',
+      'install',
+      'denied',
+      'error'
+    ]);
+  });
+
+  it('round-trips version 2 turn metrics and disclosure state', () => {
+    const notebook = new WorkspaceNotebook();
+    notebook.cells[0].status = 'done';
+    notebook.cells[0].blocks = [
+      { kind: 'text', id: 'text-1', text: 'finished' }
+    ];
+    let turn = setTurnStatus(
+      createTurn('run-42'),
+      'done',
+      notebook.cells[0].blocks
+    );
+    turn = toggleTrace(turn);
+    turn = toggleOutcome(turn);
+    turn.metrics = {
+      durationMs: 2300,
+      numTurns: 4,
+      costUsd: 0.02,
+      usage: { input_tokens: 100, output_tokens: 50 }
+    };
+    notebook.cells[0].turn = turn;
+
+    const snapshot = parseWorkspaceSnapshot(serializeNotebook(notebook));
+    expect(snapshot.version).toBe(AGENT_WORKSPACE_VERSION);
+    expect(snapshot.cells[0].blocks).toEqual(notebook.cells[0].blocks);
+    expect(snapshot.cells[0].turn).toMatchObject({
+      id: 'run-42',
+      status: 'done',
+      metrics: {
+        durationMs: 2300,
+        numTurns: 4,
+        costUsd: 0.02
+      },
+      presentation: {
+        trace: 'expanded',
+        outcomeExpanded: true
+      }
+    });
+
+    const restored = new WorkspaceNotebook();
+    restoreNotebook(restored, serializeNotebook(notebook));
+    expect(restored.cells[0].turn).toMatchObject({
+      status: 'done',
+      outcome: 'finished',
+      timeline: [],
+      presentation: {
+        trace: 'expanded',
+        outcomeExpanded: true
+      },
+      metrics: {
+        durationMs: 2300,
+        numTurns: 4,
+        costUsd: 0.02
+      }
+    });
+  });
+
+  it('restores a running turn as interrupted with partial evidence', () => {
+    const notebook = new WorkspaceNotebook();
+    notebook.cells[0].status = 'running';
+    notebook.cells[0].blocks = [
+      {
+        kind: 'tool',
+        id: 'tool-1',
+        name: 'Bash',
+        input: { command: 'sleep 30' },
+        output: 'started\n',
+        status: 'running'
+      }
+    ];
+    notebook.cells[0].turn = createTurn('run-running');
+
+    const restored = new WorkspaceNotebook();
+    restoreNotebook(restored, serializeNotebook(notebook));
+
+    expect(restored.cells[0]).toMatchObject({
+      status: 'interrupted'
+    });
+    expect(restored.cells[0].turn).toMatchObject({
+      id: 'run-running',
+      status: 'interrupted'
+    });
+    expect(restored.cells[0].turn?.timeline[0]).toMatchObject({
+      kind: 'tool',
+      status: 'running'
+    });
+  });
+
+  it('keeps unknown legacy blocks inspectable during migration', () => {
+    const legacyBlocks = [
+      {
+        kind: 'future-activity',
+        id: 'future-1',
+        status: 'ok',
+        text: 'legacy payload'
+      }
+    ] as unknown as import('./protocol').ChatBlock[];
+
+    const notebook = new WorkspaceNotebook();
+    restoreNotebook(
+      notebook,
+      JSON.stringify({
+        version: 1,
+        active: 0,
+        cells: [
+          {
+            id: 'legacy-cell',
+            kind: 'ai',
+            source: 'continue',
+            output: '',
+            blocks: legacyBlocks,
+            status: 'done',
+            executionCount: 1,
+            outputCollapsed: false
+          }
+        ]
+      })
+    );
+
+    expect(notebook.cells[0].blocks).toEqual(legacyBlocks);
+    expect(notebook.cells[0].turn?.timeline[0]).toMatchObject({
+      kind: 'unknown',
+      title: 'Unsupported future-activity activity',
+      detail: 'ok\nlegacy payload'
+    });
   });
 });

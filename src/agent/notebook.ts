@@ -1,4 +1,5 @@
 import type { ChatBlock, WorkspaceMode } from './protocol';
+import type { ChatTurn } from './turn';
 
 export type CellKind = WorkspaceMode;
 export type CellStatus = 'idle' | 'queued' | 'running' | 'done' | 'interrupted';
@@ -19,6 +20,7 @@ export interface WorkspaceCell {
   source: string;
   output: string;
   blocks: ChatBlock[];
+  turn: ChatTurn | null;
   status: CellStatus;
   executionCount: number | null;
   outputCollapsed: boolean;
@@ -50,6 +52,7 @@ export function createWorkspaceCell(
     source,
     output: '',
     blocks: [],
+    turn: null,
     status: 'idle',
     executionCount: null,
     outputCollapsed: false
@@ -197,6 +200,7 @@ export class WorkspaceNotebook {
       cell.status = 'running';
       cell.output = '';
       cell.blocks = [];
+      cell.turn = null;
       cell.executionCount = ++executionCounter;
       cell.outputCollapsed = false;
       return request;
@@ -224,6 +228,18 @@ export class WorkspaceNotebook {
   setBlocks(blocks: ChatBlock[]): void {
     if (this.empty) return;
     this.current.blocks = blocks;
+  }
+
+  setTurn(turn: ChatTurn | null): void {
+    if (this.empty) return;
+    this.current.turn = turn;
+  }
+
+  updateTurn(cellId: string, update: (turn: ChatTurn) => ChatTurn): boolean {
+    const cell = this.cells.find(candidate => candidate.id === cellId);
+    if (!cell?.turn) return false;
+    cell.turn = update(cell.turn);
+    return true;
   }
 
   busy(): boolean {

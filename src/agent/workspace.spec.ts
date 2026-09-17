@@ -17,6 +17,7 @@ import {
 } from './history-storage';
 import { WorkspaceNotebook, type WorkspaceCell } from './notebook';
 import { AgentSession } from './session';
+import { createTurn, setTurnStatus, toggleActivity, toggleTrace } from './turn';
 
 jest.mock('@jupyterlab/cells', () => ({
   OutputPlaceholder: class {
@@ -129,6 +130,7 @@ describe('renderCellOutput', () => {
       source: '',
       output: '',
       blocks: [],
+      turn: null,
       status: 'idle',
       executionCount: null,
       outputCollapsed: false,
@@ -223,6 +225,61 @@ describe('renderCellOutput', () => {
     expect(scrollTop).toBe(42);
     expect(body.textContent).toBe('one\ntwo\nthree');
   });
+
+  it('preserves nested evidence scroll and focused disclosure controls', () => {
+    const body = document.createElement('div');
+    document.body.append(body);
+    const blocks = [
+      {
+        kind: 'text' as const,
+        id: 'text-1',
+        text: 'done'
+      },
+      {
+        kind: 'tool' as const,
+        id: 'tool-1',
+        name: 'Bash',
+        input: { command: 'cat output.txt' },
+        output: Array.from({ length: 24 }, (_, index) => `line ${index}`).join(
+          '\n'
+        ),
+        status: 'done' as const
+      }
+    ];
+    let turn = setTurnStatus(createTurn('run-1'), 'done', blocks);
+    turn = toggleTrace(turn);
+    turn = toggleActivity(turn, 'activity-tool-1');
+    const ai = cell({ kind: 'ai', status: 'done', blocks, turn });
+
+    renderCellOutput(body, ai);
+    const output = body.querySelector<HTMLElement>(
+      '[data-turn-scroll-key="output:activity-tool-1"]'
+    );
+    let outputScrollTop = 37;
+    Object.defineProperty(output, 'scrollTop', {
+      configurable: true,
+      get: () => outputScrollTop,
+      set: value => {
+        outputScrollTop = value;
+      }
+    });
+    const evidence = body.querySelector<HTMLButtonElement>(
+      '[data-turn-focus-key="evidence:activity-tool-1"]'
+    );
+    evidence?.focus();
+    outputScrollTop = 37;
+
+    renderCellOutputPreservingScroll(body, ai);
+
+    const rerenderedOutput = body.querySelector<HTMLElement>(
+      '[data-turn-scroll-key="output:activity-tool-1"]'
+    );
+    expect(rerenderedOutput?.scrollTop).toBe(37);
+    expect(document.activeElement).toBe(
+      body.querySelector('[data-turn-focus-key="evidence:activity-tool-1"]')
+    );
+    body.remove();
+  });
 });
 
 describe('CellView output state', () => {
@@ -233,6 +290,7 @@ describe('CellView output state', () => {
       source: '',
       output: '',
       blocks: [],
+      turn: null,
       status: 'idle',
       executionCount: null,
       outputCollapsed: false,
@@ -340,6 +398,96 @@ describe('CellView output state', () => {
 
     expect(onSelect).not.toHaveBeenCalled();
   });
+
+  it('does not select the cell when operating a turn disclosure control', () => {
+    const notebook = new WorkspaceNotebook();
+    const onSelect = jest.fn();
+    const view = new CellView('cell-1', handlers(onSelect));
+    const blocks = [
+      {
+        kind: 'text' as const,
+        id: 'text-1',
+        text: 'finished'
+      },
+      {
+        kind: 'tool' as const,
+        id: 'tool-1',
+        name: 'Bash',
+        input: { command: 'pwd' },
+        output: '/tmp\n',
+        status: 'done' as const
+      }
+    ];
+    const turn = setTurnStatus(createTurn('run-1'), 'done', blocks);
+    view.sync(cell({ kind: 'ai', status: 'done', blocks, turn }), 0, notebook);
+
+    view.node
+      .querySelector('[data-turn-focus-key="trace:run-1"]')
+      ?.dispatchEvent(
+        new MouseEvent('mousedown', { bubbles: true, button: 0 })
+      );
+
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it('delegates failure navigation from the audit summary', () => {
+    const notebook = new WorkspaceNotebook();
+    const onRevealTurnFailure = jest.fn();
+    const view = new CellView('cell-1', {
+      ...handlers(),
+      onRevealTurnFailure
+    });
+    const blocks = [
+      {
+        kind: 'tool' as const,
+        id: 'tool-1',
+        name: 'Edit',
+        input: { file_path: '/tmp/a.ts' },
+        output: 'target text not found\n',
+        status: 'error' as const
+      }
+    ];
+    const turn = setTurnStatus(createTurn('run-1'), 'done', blocks);
+    view.sync(cell({ kind: 'ai', status: 'done', blocks, turn }), 0, notebook);
+
+    const failure = view.node.querySelector<HTMLButtonElement>(
+      '[data-failure-navigation]'
+    );
+    expect(failure?.type).toBe('button');
+    failure?.click();
+
+    expect(onRevealTurnFailure).toHaveBeenCalledWith(
+      'cell-1',
+      'run-1',
+      'activity-tool-1'
+    );
+  });
+
+  it('keeps a rendered turn inside the compact output collapser', () => {
+    const notebook = new WorkspaceNotebook();
+    const view = new CellView('cell-1', handlers());
+    const blocks = [{ kind: 'text' as const, id: 'text-1', text: 'finished' }];
+    const turn = setTurnStatus(createTurn('run-1'), 'done', blocks);
+
+    view.sync(
+      cell({
+        kind: 'ai',
+        status: 'done',
+        blocks,
+        turn,
+        outputCollapsed: true
+      }),
+      0,
+      notebook
+    );
+
+    expect(view.node.querySelector('.jp-AgentWorkspace-turn')).not.toBeNull();
+    expect(
+      view.node
+        .querySelector('.jp-AgentWorkspace-row.is-output')
+        ?.classList.contains('is-collapsed')
+    ).toBe(true);
+  });
 });
 
 describe('CellView input history', () => {
@@ -350,6 +498,7 @@ describe('CellView input history', () => {
       source: '',
       output: '',
       blocks: [],
+      turn: null,
       status: 'idle',
       executionCount: null,
       outputCollapsed: false,
@@ -489,6 +638,7 @@ describe('AgentWorkspaceContent queue scheduling', () => {
   interface WorkspaceInternals {
     runCell(advance: boolean): void;
     onSessionChange(): void;
+    refresh(): void;
   }
 
   beforeEach(() => {
@@ -529,10 +679,14 @@ describe('AgentWorkspaceContent queue scheduling', () => {
     internals.runCell(false);
 
     expect(sendUser).toHaveBeenCalledTimes(1);
-    expect(sendUser).toHaveBeenCalledWith('first');
+    expect(sendUser).toHaveBeenCalledWith(
+      'first',
+      expect.stringMatching(/^run-/)
+    );
     expect(exec).not.toHaveBeenCalled();
     expect(content.notebook.cells[0].status).toBe('running');
     expect(content.notebook.cells[1].status).toBe('queued');
+    expect(content.notebook.cells[1].turn).toBeNull();
 
     content.session.running = false;
     content.session.connected = true;
@@ -723,6 +877,120 @@ describe('AgentWorkspaceContent queue scheduling', () => {
     expect(content.notebook.queuedRuns).toEqual([]);
     expect(content.notebook.cells[0].status).toBe('interrupted');
     expect(content.notebook.cells[1].status).toBe('idle');
+  });
+
+  it('reveals a failed step once and focuses it after rendering', () => {
+    const scrollIntoView = jest.mocked(HTMLElement.prototype.scrollIntoView);
+    scrollIntoView.mockClear();
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as WorkspaceInternals;
+    const blocks = [
+      {
+        kind: 'tool' as const,
+        id: 'tool-1',
+        name: 'Edit',
+        input: { file_path: '/tmp/a.ts' },
+        output: 'target text not found\n',
+        status: 'error' as const,
+        durationMs: 198
+      }
+    ];
+    const cell = content.notebook.current;
+    cell.kind = 'ai';
+    cell.status = 'done';
+    cell.source = 'update the file';
+    cell.blocks = blocks;
+    cell.turn = setTurnStatus(createTurn('run-1'), 'done', blocks);
+    document.body.append(content.node);
+    internals.refresh();
+
+    content.node
+      .querySelector<HTMLButtonElement>('[data-failure-navigation]')
+      ?.click();
+
+    const row = content.node.querySelector<HTMLElement>(
+      '[data-turn-activity-id="activity-tool-1"]'
+    );
+    expect(cell.turn?.presentation.trace).toBe('expanded');
+    expect(cell.turn?.presentation.expandedActivityIds).toContain(
+      'activity-tool-1'
+    );
+    expect(document.activeElement).toBe(row);
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView).toHaveBeenCalledWith({
+      block: 'center',
+      inline: 'nearest',
+      behavior: 'smooth'
+    });
+
+    internals.refresh();
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    content.dispose();
+    content.node.remove();
+  });
+
+  it('uses instant failure navigation when reduced motion is requested', () => {
+    const scrollIntoView = jest.mocked(HTMLElement.prototype.scrollIntoView);
+    scrollIntoView.mockClear();
+    const originalMatchMedia = window.matchMedia;
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      writable: true,
+      value: jest.fn().mockReturnValue({
+        matches: true,
+        media: '(prefers-reduced-motion: reduce)',
+        onchange: null,
+        addListener: jest.fn(),
+        removeListener: jest.fn(),
+        addEventListener: jest.fn(),
+        removeEventListener: jest.fn(),
+        dispatchEvent: jest.fn()
+      })
+    });
+
+    try {
+      const content = new AgentWorkspaceContent(null);
+      const internals = content as unknown as WorkspaceInternals;
+      const blocks = [
+        {
+          kind: 'tool' as const,
+          id: 'tool-1',
+          name: 'Bash',
+          input: { command: 'false' },
+          output: 'failed\n',
+          status: 'error' as const
+        }
+      ];
+      const cell = content.notebook.current;
+      cell.kind = 'ai';
+      cell.status = 'done';
+      cell.blocks = blocks;
+      cell.turn = setTurnStatus(createTurn('run-1'), 'done', blocks);
+      document.body.append(content.node);
+      internals.refresh();
+
+      content.node
+        .querySelector<HTMLButtonElement>('[data-failure-navigation]')
+        ?.click();
+
+      expect(scrollIntoView).toHaveBeenCalledWith({
+        block: 'center',
+        inline: 'nearest',
+        behavior: 'auto'
+      });
+      content.dispose();
+      content.node.remove();
+    } finally {
+      if (originalMatchMedia) {
+        Object.defineProperty(window, 'matchMedia', {
+          configurable: true,
+          writable: true,
+          value: originalMatchMedia
+        });
+      } else {
+        Reflect.deleteProperty(window, 'matchMedia');
+      }
+    }
   });
 });
 

@@ -1,4 +1,5 @@
 import { restoreCounters, WorkspaceNotebook } from './notebook';
+import { createTurn, toggleOutcome, toggleTrace } from './turn';
 
 describe('WorkspaceNotebook', () => {
   it('starts with one editable unified input', () => {
@@ -266,5 +267,20 @@ describe('WorkspaceNotebook', () => {
     expect(notebook.activeRun).toBeNull();
     expect(notebook.cells[0].status).toBe('interrupted');
     expect(notebook.cells[1].status).toBe('idle');
+  });
+
+  it('resets persisted presentation choices when a cell starts a new run', () => {
+    const notebook = new WorkspaceNotebook();
+    notebook.setSource('run again');
+    let turn = createTurn('run-old');
+    turn = toggleTrace(turn);
+    turn = toggleOutcome(turn);
+    notebook.current.turn = turn;
+
+    notebook.enqueueRun();
+    notebook.promoteNextRun();
+
+    expect(notebook.current.turn).toBeNull();
+    expect(notebook.current.status).toBe('running');
   });
 });

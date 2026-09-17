@@ -84,9 +84,40 @@ describe('AgentSession', () => {
     session.sendUser('try again');
     expect(session.error).toBeNull();
     expect(session.blocks).toEqual([]);
-    expect(socket.sent[socket.sent.length - 1]).toBe(
-      JSON.stringify({ type: 'user', text: 'try again' })
-    );
+    expect(JSON.parse(socket.sent[socket.sent.length - 1])).toMatchObject({
+      type: 'user',
+      text: 'try again',
+      turnId: expect.any(String)
+    });
+  });
+
+  it('ignores events belonging to a different active turn', () => {
+    const { session, socket } = sessionWithSocket();
+    socket.open();
+    session.sendUser('first', 'run-1');
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: 'text',
+        turnId: 'run-2',
+        text: 'wrong cell'
+      })
+    });
+    expect(session.blocks).toEqual([]);
+
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: 'text',
+        turnId: 'run-1',
+        text: 'first answer'
+      })
+    });
+    expect(session.blocks).toEqual([
+      {
+        kind: 'text',
+        id: expect.stringContaining('text'),
+        text: 'first answer'
+      }
+    ]);
   });
 
   it('connects on first exec if start was skipped', async () => {

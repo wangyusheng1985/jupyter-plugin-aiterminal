@@ -81,7 +81,9 @@ class AgentWebSocketHandler(JupyterHandler, websocket.WebSocketHandler):
             if self.session is None:
                 return
             IOLoop.current().spawn_callback(
-                self.session.query, str(payload.get("text", ""))
+                self.session.query,
+                str(payload.get("text", "")),
+                str(payload.get("turnId", "")) or None,
             )
         elif kind == "interrupt":
             if self.session is None:

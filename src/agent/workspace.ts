@@ -15,6 +15,18 @@ import { SelectionCopyButton } from './selectioncopy';
 import { formatToolInput } from './tool';
 import type { AgentToolbarHost } from './toolbar';
 import type { ChatBlock } from './protocol';
+import { renderTurn, type TurnRenderHandlers } from './turn-renderer';
+import {
+  createTurn,
+  deriveTurn,
+  revealFailedActivity,
+  setTurnStatus,
+  toggleActivity,
+  toggleEvidence,
+  toggleOutcome,
+  toggleTrace,
+  type ChatTurn
+} from './turn';
 
 export interface SourceChangeOptions {
   fromHistory?: boolean;
@@ -28,6 +40,23 @@ export interface CellHandlers {
   onHistoryPrevious: (draft: string) => HistoryNavigation | null;
   onHistoryNext: () => HistoryNavigation | null;
   onHistoryReset: () => void;
+  onToggleTurnTrace?: (cellId: string, turnId: string) => void;
+  onToggleTurnActivity?: (
+    cellId: string,
+    turnId: string,
+    activityId: string
+  ) => void;
+  onToggleTurnEvidence?: (
+    cellId: string,
+    turnId: string,
+    activityId: string
+  ) => void;
+  onToggleTurnOutcome?: (cellId: string, turnId: string) => void;
+  onRevealTurnFailure?: (
+    cellId: string,
+    turnId: string,
+    activityId: string
+  ) => void;
   rendermime: IRenderMimeRegistry | null;
 }
 
@@ -70,6 +99,20 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
       onHistoryPrevious: draft => this.inputHistory.previous(draft),
       onHistoryNext: () => this.inputHistory.next(),
       onHistoryReset: () => this.inputHistory.resetNavigation(),
+      onToggleTurnTrace: (cellId, turnId) =>
+        this.updateTurn(cellId, turnId, toggleTrace),
+      onToggleTurnActivity: (cellId, turnId, activityId) =>
+        this.updateTurn(cellId, turnId, turn =>
+          toggleActivity(turn, activityId)
+        ),
+      onToggleTurnEvidence: (cellId, turnId, activityId) =>
+        this.updateTurn(cellId, turnId, turn =>
+          toggleEvidence(turn, activityId)
+        ),
+      onToggleTurnOutcome: (cellId, turnId) =>
+        this.updateTurn(cellId, turnId, toggleOutcome),
+      onRevealTurnFailure: (cellId, turnId, activityId) =>
+        this.revealTurnFailure(cellId, turnId, activityId),
       rendermime: this.rendermime
     });
     this.status = new StatusBar('Local tools');
@@ -241,6 +284,35 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     this.persistSoon();
   }
 
+  private updateTurn(
+    cellId: string,
+    turnId: string,
+    update: (turn: ChatTurn) => ChatTurn
+  ): void {
+    const cell = this.notebook.cells.find(candidate => candidate.id === cellId);
+    if (!cell) return;
+    const turn = cell.turn ?? turnForCell(cell);
+    if (!turn || turn.id !== turnId) return;
+    cell.turn = update(turn);
+    this.refresh();
+    this.persistSoon();
+  }
+
+  private revealTurnFailure(
+    cellId: string,
+    turnId: string,
+    activityId: string
+  ): void {
+    const cell = this.notebook.cells.find(candidate => candidate.id === cellId);
+    if (!cell) return;
+    const turn = cell.turn ?? turnForCell(cell);
+    if (!turn || turn.id !== turnId) return;
+    cell.turn = revealFailedActivity(turn, activityId);
+    this.refresh();
+    this.persistSoon();
+    this.notebookView.revealTurnActivity(cellId, activityId);
+  }
+
   private onKey(event: KeyboardEvent): void {
     if (this.notebook.empty) {
       const action = mapWorkspaceKey(
@@ -362,7 +434,7 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     }
     this.refresh();
     if (request.kind === 'ai') {
-      this.session.sendUser(request.source);
+      this.session.sendUser(request.source, request.id);
       return;
     }
     void this.session
@@ -401,6 +473,9 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
         const cell = this.notebook.cells[index];
         if (request.kind === 'ai') {
           cell.blocks = this.session.blocks;
+          cell.turn =
+            this.session.turn ??
+            deriveTurn(createTurn(request.id), this.session.blocks);
           if (!this.session.running) {
             cell.status =
               this.session.error ||
@@ -408,6 +483,11 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
               !this.session.connected
                 ? 'interrupted'
                 : 'done';
+            cell.turn = setTurnStatus(
+              cell.turn,
+              cell.status === 'interrupted' ? 'interrupted' : 'done',
+              cell.blocks
+            );
             this.finishRun(
               request.id,
               '',
@@ -540,6 +620,10 @@ class NotebookView extends Widget {
     this.views.get(cell.id)?.focus(options);
   }
 
+  revealTurnActivity(cellId: string, activityId: string): void {
+    this.views.get(cellId)?.revealActivity(activityId);
+  }
+
   private createView(cell: WorkspaceCell, index: number): CellView {
     const view = new CellView(cell.id, this.handlers);
     this.views.set(cell.id, view);
@@ -575,6 +659,7 @@ export class CellView {
         return;
       }
       if (this.isCollapser(target)) return;
+      if (this.isTurnDisclosure(target)) return;
       if (
         this.outputBody?.contains(target) &&
         this.outputRow?.classList.contains('is-collapsed')
@@ -641,6 +726,20 @@ export class CellView {
     if (!options.preventScroll) {
       this.editor.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     }
+  }
+
+  revealActivity(activityId: string): void {
+    if (!this.outputBody) return;
+    const target = Array.from(
+      this.outputBody.querySelectorAll<HTMLElement>('[data-turn-activity-id]')
+    ).find(node => node.dataset.turnActivityId === activityId);
+    if (!target) return;
+    target.focus({ preventScroll: true });
+    target.scrollIntoView({
+      block: 'center',
+      inline: 'nearest',
+      behavior: prefersReducedMotion() ? 'auto' : 'smooth'
+    });
   }
 
   private onEditorKey(event: KeyboardEvent): void {
@@ -710,8 +809,24 @@ export class CellView {
     renderCellOutputPreservingScroll(
       this.outputBody,
       cell,
-      this.handlers.rendermime
+      this.handlers.rendermime,
+      this.turnRenderHandlers()
     );
+  }
+
+  private turnRenderHandlers(): TurnRenderHandlers {
+    return {
+      onToggleTrace: turnId =>
+        this.handlers.onToggleTurnTrace?.(this.id, turnId),
+      onToggleActivity: (turnId, activityId) =>
+        this.handlers.onToggleTurnActivity?.(this.id, turnId, activityId),
+      onToggleEvidence: (turnId, activityId) =>
+        this.handlers.onToggleTurnEvidence?.(this.id, turnId, activityId),
+      onToggleOutcome: turnId =>
+        this.handlers.onToggleTurnOutcome?.(this.id, turnId),
+      onRevealFailure: (turnId, activityId) =>
+        this.handlers.onRevealTurnFailure?.(this.id, turnId, activityId)
+    };
   }
 
   private bindCollapser(node: HTMLElement): void {
@@ -727,6 +842,11 @@ export class CellView {
 
   private isCollapser(target: Node): boolean {
     return Boolean(this.outputCollapser?.contains(target));
+  }
+
+  private isTurnDisclosure(target: Node): boolean {
+    const element = target instanceof Element ? target : target.parentElement;
+    return Boolean(element?.closest('.jp-AgentWorkspace-disclosure'));
   }
 }
 
@@ -755,11 +875,22 @@ export function runningIndicatorNode(): HTMLElement {
 export function renderCellOutput(
   body: HTMLElement,
   cell: WorkspaceCell,
-  rendermime: IRenderMimeRegistry | null = null
+  rendermime: IRenderMimeRegistry | null = null,
+  turnHandlers?: TurnRenderHandlers
 ): void {
   body.replaceChildren();
   if (cell.kind === 'ai') {
-    cell.blocks.forEach(block => body.append(renderBlock(block, rendermime)));
+    const turn = turnForCell(cell);
+    if (turn) {
+      body.append(
+        renderTurn(turn, {
+          rendermime,
+          handlers: turnHandlers ?? noopTurnHandlers()
+        })
+      );
+    } else {
+      cell.blocks.forEach(block => body.append(renderBlock(block, rendermime)));
+    }
   } else if (cell.output) {
     const pre = document.createElement('pre');
     pre.textContent = cell.output;
@@ -773,11 +904,12 @@ export function renderCellOutput(
 export function renderCellOutputPreservingScroll(
   body: HTMLElement,
   cell: WorkspaceCell,
-  rendermime: IRenderMimeRegistry | null = null
+  rendermime: IRenderMimeRegistry | null = null,
+  turnHandlers?: TurnRenderHandlers
 ): void {
-  const scrollTop = body.scrollTop;
-  renderCellOutput(body, cell, rendermime);
-  body.scrollTop = scrollTop;
+  const state = captureOutputRenderState(body);
+  renderCellOutput(body, cell, rendermime, turnHandlers);
+  restoreOutputRenderState(body, state);
 }
 
 function setPrompt(prompt: HTMLElement, cell: WorkspaceCell): void {
@@ -791,12 +923,94 @@ function setPrompt(prompt: HTMLElement, cell: WorkspaceCell): void {
 }
 
 function outputKey(cell: WorkspaceCell): string {
+  const turn = cell.kind === 'ai' ? turnForCell(cell) : null;
   return JSON.stringify({
     kind: cell.kind,
     status: cell.status,
     output: cell.output,
-    blocks: cell.blocks
+    turn: turn
+      ? {
+          id: turn.id,
+          status: turn.status,
+          outcome: turn.outcome,
+          metrics: turn.metrics,
+          presentation: turn.presentation,
+          revision: turn.revision
+        }
+      : null,
+    blocks: cell.turn ? [] : cell.blocks
   });
+}
+
+export function turnForCell(cell: WorkspaceCell): ChatTurn | null {
+  if (cell.kind !== 'ai') return null;
+  if (cell.turn) return cell.turn;
+  if (!cell.blocks.length && cell.status !== 'running') return null;
+  const status =
+    cell.status === 'running'
+      ? 'running'
+      : cell.status === 'interrupted'
+        ? 'interrupted'
+        : 'done';
+  return setTurnStatus(createTurn(`legacy-${cell.id}`), status, cell.blocks);
+}
+
+interface OutputRenderState {
+  scrollTop: number;
+  focusKey: string | null;
+  scrollPositions: Map<string, number>;
+}
+
+function captureOutputRenderState(body: HTMLElement): OutputRenderState {
+  const active = document.activeElement;
+  const focusKey =
+    active instanceof HTMLElement && body.contains(active)
+      ? (active.dataset.turnFocusKey ?? null)
+      : null;
+  const scrollPositions = new Map<string, number>();
+  body.querySelectorAll<HTMLElement>('[data-turn-scroll-key]').forEach(node => {
+    const key = node.dataset.turnScrollKey;
+    if (key) scrollPositions.set(key, node.scrollTop);
+  });
+  return {
+    scrollTop: body.scrollTop,
+    focusKey,
+    scrollPositions
+  };
+}
+
+function restoreOutputRenderState(
+  body: HTMLElement,
+  state: OutputRenderState
+): void {
+  body.scrollTop = state.scrollTop;
+  body.querySelectorAll<HTMLElement>('[data-turn-scroll-key]').forEach(node => {
+    const key = node.dataset.turnScrollKey;
+    if (!key || !state.scrollPositions.has(key)) return;
+    node.scrollTop = state.scrollPositions.get(key) ?? 0;
+  });
+  if (!state.focusKey) return;
+  const focusTarget = Array.from(
+    body.querySelectorAll<HTMLElement>('[data-turn-focus-key]')
+  ).find(node => node.dataset.turnFocusKey === state.focusKey);
+  focusTarget?.focus({ preventScroll: true });
+}
+
+function noopTurnHandlers(): TurnRenderHandlers {
+  return {
+    onToggleTrace: () => undefined,
+    onToggleActivity: () => undefined,
+    onToggleEvidence: () => undefined,
+    onToggleOutcome: () => undefined,
+    onRevealFailure: () => undefined
+  };
+}
+
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  );
 }
 
 function isEditorTarget(target: EventTarget | null): boolean {

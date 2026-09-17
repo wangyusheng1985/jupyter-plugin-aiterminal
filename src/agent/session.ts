@@ -9,6 +9,7 @@ import {
   type AgentServerEvent,
   type ChatBlock
 } from './protocol';
+import { applyTurnEvent, createTurn, type ChatTurn } from './turn';
 
 export function agentSocketUrl(
   settings: ServerConnection.ISettings = ServerConnection.makeSettings(),
@@ -31,9 +32,11 @@ export interface ExecResult {
 
 export class AgentSession {
   blocks: ChatBlock[] = [];
+  turn: ChatTurn | null = null;
   connected = false;
   error: string | null = null;
   running = false;
+  activeTurnId: string | null = null;
   execCwd: string | null = null;
   execOutput = '';
   private socket: WebSocket | null = null;
@@ -70,7 +73,18 @@ export class AgentSession {
     socket.onmessage = event => {
       const payload = parseEvent(event.data);
       if (!payload) return;
+      if (
+        this.activeTurnId &&
+        isTurnScopedEvent(payload) &&
+        payload.turnId &&
+        payload.turnId !== this.activeTurnId
+      ) {
+        return;
+      }
       this.blocks = applyServerEvent(this.blocks, payload);
+      if (this.turn && isTurnScopedEvent(payload)) {
+        this.turn = applyTurnEvent(this.turn, this.blocks, payload);
+      }
       if (payload.type === 'error') {
         this.error = payload.message;
         this.running = false;
@@ -99,13 +113,15 @@ export class AgentSession {
     };
   }
 
-  sendUser(text: string): void {
+  sendUser(text: string, turnId = nextTurnId()): void {
     const trimmed = text.trim();
     if (!trimmed) return;
     this.blocks = [];
+    this.turn = createTurn(turnId);
     this.error = null;
     this.running = true;
-    this.send({ type: 'user', text: trimmed });
+    this.activeTurnId = turnId;
+    this.send({ type: 'user', turnId, text: trimmed });
     this.notify();
   }
 
@@ -195,4 +211,28 @@ function parseEvent(data: unknown): AgentServerEvent | null {
   } catch {
     return null;
   }
+}
+
+let turnCounter = 0;
+function nextTurnId(): string {
+  return `turn-${++turnCounter}`;
+}
+
+type TurnScopedAgentEvent = Exclude<
+  AgentServerEvent,
+  | { type: 'ready' }
+  | { type: 'exec_output' }
+  | { type: 'exec_done' }
+  | { type: 'exec_error' }
+>;
+
+function isTurnScopedEvent(
+  event: AgentServerEvent
+): event is TurnScopedAgentEvent {
+  return !(
+    event.type === 'ready' ||
+    event.type === 'exec_output' ||
+    event.type === 'exec_done' ||
+    event.type === 'exec_error'
+  );
 }

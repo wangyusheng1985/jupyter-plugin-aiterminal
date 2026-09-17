@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shutil
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,8 @@ class AgentSession:
         self._cli_stderr: list[str] = []
         self._connect_lock = asyncio.Lock()
         self._closing = False
+        self._active_turn_id: str | None = None
+        self._tool_started_at: dict[str, float] = {}
 
     async def start(self) -> None:
         await self._ensure_client()
@@ -71,10 +74,12 @@ class AgentSession:
         try:
             config = load_agent_settings()
         except AgentConfigError as exc:
-            await self.emit({"type": "error", "code": "config", "message": str(exc)})
+            await self._emit_event(
+                {"type": "error", "code": "config", "message": str(exc)}
+            )
             return None
         if ClaudeSDKClient is None:
-            await self.emit(
+            await self._emit_event(
                 {
                     "type": "error",
                     "code": "runtime",
@@ -94,7 +99,7 @@ class AgentSession:
             client = ClaudeSDKClient(options)
             await client.connect()
         except Exception as exc:  # noqa: BLE001 - relay/CLI failures stay visible
-            await self.emit(
+            await self._emit_event(
                 {
                     "type": "error",
                     "code": "runtime",
@@ -108,7 +113,7 @@ class AgentSession:
                 await disconnect()
             return None
         self.client = client
-        await self.emit(
+        await self._emit_event(
             {
                 "type": "ready",
                 "sessionId": "default",
@@ -118,12 +123,12 @@ class AgentSession:
         )
         return client
 
-    async def query(self, text: str) -> None:
+    async def query(self, text: str, turn_id: str | None = None) -> None:
         prompt = text.strip()
         if not prompt:
             return
         if self._running:
-            await self.emit(
+            await self._emit_event(
                 {
                     "type": "error",
                     "code": "runtime",
@@ -132,6 +137,8 @@ class AgentSession:
             )
             return
         self._running = True
+        self._active_turn_id = turn_id
+        self._tool_started_at = {}
         try:
             client = await self._ensure_client()
             if client is None:
@@ -150,15 +157,19 @@ class AgentSession:
                     return
                 await client.query(prompt)
             async for message in client.receive_response():
-                for event in events_from_message(message):
-                    await self.emit(event)
+                for event in events_from_message(
+                    message,
+                    turn_id=turn_id,
+                    tool_started_at=self._tool_started_at,
+                ):
+                    await self._emit_event(event)
         except Exception as exc:  # noqa: BLE001 - surface SDK/relay failures
             message = (
                 "Agent connection is not available after reconnecting."
                 if _is_not_connected_error(exc)
                 else format_sdk_error(exc, self._cli_stderr)
             )
-            await self.emit(
+            await self._emit_event(
                 {
                     "type": "error",
                     "code": "runtime",
@@ -167,6 +178,8 @@ class AgentSession:
             )
         finally:
             self._running = False
+            self._active_turn_id = None
+            self._tool_started_at = {}
 
     async def interrupt(self) -> None:
         if self.client is None:
@@ -203,7 +216,7 @@ class AgentSession:
         command = str(input_data.get("tool_input", {}).get("command", ""))
         reason = forbidden_reason(command)
         if reason:
-            await self.emit(
+            await self._emit_event(
                 {"type": "denied", "command": command, "reason": reason}
             )
             return {
@@ -217,13 +230,13 @@ class AgentSession:
         argv = install_argv(binary) if binary else None
         if argv:
             display = " ".join(argv)
-            await self.emit(
+            await self._emit_event(
                 {"type": "install", "command": display, "status": "started"}
             )
             try:
                 detail = await _run_install(argv)
             except Exception as exc:  # noqa: BLE001
-                await self.emit(
+                await self._emit_event(
                     {
                         "type": "install",
                         "command": display,
@@ -232,7 +245,7 @@ class AgentSession:
                     }
                 )
             else:
-                await self.emit(
+                await self._emit_event(
                     {
                         "type": "install",
                         "command": display,
@@ -241,6 +254,11 @@ class AgentSession:
                     }
                 )
         return {}
+
+    async def _emit_event(self, event: dict[str, Any]) -> None:
+        if self._active_turn_id and event.get("type") != "ready":
+            event = {**event, "turnId": self._active_turn_id}
+        await self.emit(event)
 
 
 def claude_home_dir() -> str:
@@ -392,54 +410,150 @@ async def _run_install(argv: list[str]) -> str:
     return text
 
 
-def events_from_message(message: Any) -> list[dict[str, Any]]:
+def events_from_message(
+    message: Any,
+    turn_id: str | None = None,
+    tool_started_at: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     name = type(message).__name__
     content = getattr(message, "content", None)
+    message_id = (
+        getattr(message, "message_id", None)
+        or getattr(message, "uuid", None)
+        or f"{name}:{id(message):x}"
+    )
+    starts = tool_started_at if tool_started_at is not None else {}
     if isinstance(content, str) and content.strip():
-        events.append({"type": "text", "text": content})
-    for block in content if isinstance(content, list) else []:
-        events.extend(_events_from_block(block))
+        events.append(
+            {
+                "type": "text",
+                "text": content,
+                "messageId": str(message_id),
+            }
+        )
+    for index, block in enumerate(content if isinstance(content, list) else []):
+        events.extend(
+            _events_from_block(
+                block,
+                message_id=str(message_id),
+                block_index=index,
+                tool_started_at=starts,
+            )
+        )
     result_text = getattr(message, "result", None)
     if name == "ResultMessage" or result_text is not None:
         is_error = bool(getattr(message, "is_error", False))
-        text = result_text if is_error and isinstance(result_text, str) else ""
+        text = result_text if isinstance(result_text, str) else ""
         events.append(
             {
                 "type": "result",
                 "text": text,
                 "isError": is_error,
+                "durationMs": _optional_int(message, "duration_ms"),
+                "apiDurationMs": _optional_int(message, "duration_api_ms"),
+                "numTurns": _optional_int(message, "num_turns"),
+                "costUsd": _optional_number(message, "total_cost_usd"),
+                "usage": _optional_mapping(message, "usage"),
+                "errors": _optional_string_list(message, "errors"),
+                "permissionDenials": _optional_list(
+                    message, "permission_denials"
+                ),
             }
         )
+    if turn_id:
+        return [{**event, "turnId": turn_id} for event in events]
     return events
 
 
-def _events_from_block(block: Any) -> list[dict[str, Any]]:
+def _events_from_block(
+    block: Any,
+    *,
+    message_id: str,
+    block_index: int,
+    tool_started_at: dict[str, float],
+) -> list[dict[str, Any]]:
     text = getattr(block, "text", None)
+    thinking = getattr(block, "thinking", None)
     block_name = getattr(block, "name", None)
     tool_input = getattr(block, "input", None)
     tool_use_id = getattr(block, "id", None) or getattr(block, "tool_use_id", None)
     if block_name and tool_input is not None:
+        tool_id = str(tool_use_id or f"{message_id}:{block_index}")
+        tool_started_at[tool_id] = time.perf_counter()
         return [
             {
                 "type": "tool_start",
-                "id": str(tool_use_id or block_name),
+                "id": tool_id,
                 "name": str(block_name),
                 "input": tool_input,
+                "startedAt": round(time.time() * 1000),
             }
         ]
     content = getattr(block, "content", None)
     if tool_use_id and content is not None and block_name is None:
         output = content if isinstance(content, str) else json.dumps(content)
+        tool_id = str(tool_use_id)
+        started = tool_started_at.pop(tool_id, None)
         return [
             {
                 "type": "tool_end",
-                "id": str(tool_use_id),
+                "id": tool_id,
                 "name": str(getattr(block, "name", "") or ""),
                 "output": output,
                 "isError": bool(getattr(block, "is_error", False)),
+                "lineCount": _line_count(output),
+                "byteCount": len(output.encode("utf-8")),
+                **(
+                    {}
+                    if started is None
+                    else {"durationMs": round((time.perf_counter() - started) * 1000)}
+                ),
             }
         ]
     if isinstance(text, str) and text:
-        return [{"type": "text", "text": text}]
+        return [{"type": "text", "text": text, "messageId": message_id}]
+    if isinstance(thinking, str):
+        return [
+            {
+                "type": "thinking",
+                "id": f"{message_id}:{block_index}",
+                "state": "finished",
+            }
+        ]
     return []
+
+
+def _optional_int(message: Any, attribute: str) -> int | None:
+    value = getattr(message, attribute, None)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _optional_number(message: Any, attribute: str) -> float | None:
+    value = getattr(message, attribute, None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _optional_mapping(message: Any, attribute: str) -> dict[str, Any] | None:
+    value = getattr(message, attribute, None)
+    return value if isinstance(value, dict) else None
+
+
+def _optional_string_list(message: Any, attribute: str) -> list[str] | None:
+    value = getattr(message, attribute, None)
+    if not isinstance(value, list):
+        return None
+    return [item for item in value if isinstance(item, str)]
+
+
+def _optional_list(message: Any, attribute: str) -> list[Any] | None:
+    value = getattr(message, attribute, None)
+    return value if isinstance(value, list) else None
+
+
+def _line_count(text: str) -> int:
+    if not text:
+        return 0
+    return len(text.splitlines())

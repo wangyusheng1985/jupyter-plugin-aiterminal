@@ -1,5 +1,14 @@
 import type { ChatBlock } from './protocol';
 import {
+  createTurn,
+  deriveTurn,
+  restoreTurn,
+  setTurnStatus,
+  toPersistedTurn,
+  type ChatTurn,
+  type PersistedTurn
+} from './turn';
+import {
   createWorkspaceCell,
   isShellEscapeSource,
   restoreCounters,
@@ -9,7 +18,7 @@ import {
   type WorkspaceNotebook
 } from './notebook';
 
-export const AGENT_WORKSPACE_VERSION = 1;
+export const AGENT_WORKSPACE_VERSION = 2;
 export const AGENT_FILE_TYPE = 'agent-workspace';
 export const AGENT_FILE_EXT = '.agentnb';
 export const AGENT_FACTORY = 'Agent Workspace';
@@ -21,6 +30,7 @@ export interface CellSnapshot {
   source: string;
   output: string;
   blocks: ChatBlock[];
+  turn: PersistedTurn | null;
   status: CellStatus;
   executionCount: number | null;
   outputCollapsed: boolean;
@@ -83,6 +93,7 @@ function snapshotFromCell(cell: WorkspaceCell): CellSnapshot {
     source: input.source,
     output: cell.output,
     blocks: cell.blocks,
+    turn: cell.turn ? toPersistedTurn(cell.turn) : null,
     status: persistStatus(cell.status),
     executionCount: cell.executionCount,
     outputCollapsed: Boolean(cell.outputCollapsed)
@@ -91,13 +102,19 @@ function snapshotFromCell(cell: WorkspaceCell): CellSnapshot {
 
 function cellFromSnapshot(cell: CellSnapshot): WorkspaceCell {
   const input = normalizeInput(cell.source, cell.kind);
+  const blocks = Array.isArray(cell.blocks) ? cell.blocks : [];
+  const status = persistStatus(cell.status);
+  const restoredTurn = restoreTurn(cell.turn);
   return {
     id: cell.id,
     kind: input.kind,
     source: input.source,
     output: cell.output,
-    blocks: Array.isArray(cell.blocks) ? cell.blocks : [],
-    status: persistStatus(cell.status),
+    blocks,
+    turn: restoredTurn
+      ? deriveTurn(restoredTurn, blocks)
+      : legacyTurn(cell.id, input.kind, status, blocks),
+    status,
     executionCount:
       typeof cell.executionCount === 'number' ? cell.executionCount : null,
     outputCollapsed: Boolean(cell.outputCollapsed)
@@ -131,6 +148,7 @@ function normalizeCell(cell: Partial<CellSnapshot>): CellSnapshot {
     source: input.source,
     output: typeof cell.output === 'string' ? cell.output : '',
     blocks: Array.isArray(cell.blocks) ? cell.blocks : [],
+    turn: normalizeTurn(cell.turn),
     status: persistStatus(cell.status),
     executionCount:
       typeof cell.executionCount === 'number' ? cell.executionCount : null,
@@ -172,6 +190,28 @@ function persistStatus(status: CellStatus | undefined): CellStatus {
     return 'idle';
   }
   return 'idle';
+}
+
+function normalizeTurn(value: unknown): PersistedTurn | null {
+  if (!value || typeof value !== 'object') return null;
+  const restored = restoreTurn(value as PersistedTurn);
+  return restored ? toPersistedTurn(restored) : null;
+}
+
+function legacyTurn(
+  cellId: string,
+  kind: CellKind,
+  status: CellStatus,
+  blocks: ChatBlock[]
+): ChatTurn | null {
+  if (kind !== 'ai' || !blocks.length) return null;
+  const turnStatus =
+    status === 'running'
+      ? 'interrupted'
+      : status === 'interrupted'
+        ? 'interrupted'
+        : 'done';
+  return setTurnStatus(createTurn(`legacy-${cellId}`), turnStatus, blocks);
 }
 
 function clamp(value: number, min: number, max: number): number {
