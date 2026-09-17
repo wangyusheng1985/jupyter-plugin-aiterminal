@@ -9,6 +9,7 @@ export interface RunRequest {
   cellId: string;
   kind: CellKind;
   source: string;
+  executionSource: string;
   advance: boolean;
 }
 
@@ -55,11 +56,19 @@ export function createWorkspaceCell(
   };
 }
 
+export function isShellEscapeSource(source: string): boolean {
+  return /^\s*!/.test(source);
+}
+
+function executionSource(source: string): string {
+  const input = source.trim();
+  return isShellEscapeSource(input) ? input.slice(1).trim() : input;
+}
+
 export class WorkspaceNotebook {
   cells: WorkspaceCell[] = [createWorkspaceCell('ai')];
   active = 0;
   mode: EditorMode = 'edit';
-  insertKind: CellKind = 'ai';
   private runQueue: RunRequest[] = [];
   private activeRequest: RunRequest | null = null;
 
@@ -89,54 +98,26 @@ export class WorkspaceNotebook {
     }
     if (index < 0 || index >= this.cells.length) return;
     this.active = index;
-    this.insertKind = this.current.kind;
   }
 
-  setKind(kind: CellKind): boolean {
-    this.insertKind = kind;
-    if (this.empty) return true;
-    const cell = this.current;
-    if (cell.kind === kind) return true;
-    if (this.activeRequest?.cellId === cell.id) return false;
-    this.cancelQueuedRuns(cell.id);
-    cell.kind = kind;
-    cell.output = '';
-    cell.blocks = [];
-    cell.status = 'idle';
-    cell.executionCount = null;
-    cell.outputCollapsed = false;
-    return true;
-  }
-
-  toggleKind(): CellKind | null {
+  insertAbove(): WorkspaceCell {
     if (this.empty) {
-      this.insertKind = this.insertKind === 'ai' ? 'command' : 'ai';
-      return this.insertKind;
+      return this.appendCell();
     }
-    const kind = this.current.kind === 'ai' ? 'command' : 'ai';
-    return this.setKind(kind) ? kind : null;
-  }
-
-  insertAbove(kind: CellKind = this.insertKind): WorkspaceCell {
-    if (this.empty) {
-      return this.appendCell(kind);
-    }
-    const cell = createWorkspaceCell(kind);
+    const cell = createWorkspaceCell();
     this.cells.splice(this.active, 0, cell);
     this.mode = 'edit';
-    this.insertKind = kind;
     return cell;
   }
 
-  insertBelow(kind: CellKind = this.insertKind): WorkspaceCell {
+  insertBelow(): WorkspaceCell {
     if (this.empty) {
-      return this.appendCell(kind);
+      return this.appendCell();
     }
-    const cell = createWorkspaceCell(kind);
+    const cell = createWorkspaceCell();
     this.cells.splice(this.active + 1, 0, cell);
     this.active += 1;
     this.mode = 'edit';
-    this.insertKind = kind;
     return cell;
   }
 
@@ -149,26 +130,22 @@ export class WorkspaceNotebook {
       return false;
     }
     this.cancelQueuedRuns(cell.id);
-    const kind = cell.kind;
     const index = this.active;
     this.cells.splice(index, 1);
     this.mode = 'command';
-    this.insertKind = kind;
     if (this.cells.length === 0) {
       this.active = 0;
       return true;
     }
     this.active = Math.min(index, this.cells.length - 1);
-    this.insertKind = this.current.kind;
     return true;
   }
 
-  appendCell(kind: CellKind = this.insertKind): WorkspaceCell {
-    const cell = createWorkspaceCell(kind);
+  appendCell(): WorkspaceCell {
+    const cell = createWorkspaceCell();
     this.cells.push(cell);
     this.active = this.cells.length - 1;
     this.mode = 'edit';
-    this.insertKind = kind;
     return cell;
   }
 
@@ -189,11 +166,15 @@ export class WorkspaceNotebook {
     const cell = this.cells[index];
     const source = cell?.source.trim();
     if (!cell || !source) return null;
+    const kind: CellKind = isShellEscapeSource(source) ? 'command' : 'ai';
+    const executableSource = executionSource(source);
+    if (!executableSource) return null;
     const request: RunRequest = {
       id: `run-${++runCounter}`,
       cellId: cell.id,
-      kind: cell.kind,
+      kind,
       source,
+      executionSource: executableSource,
       advance
     };
     this.runQueue.push(request);
@@ -210,8 +191,9 @@ export class WorkspaceNotebook {
       const cell = this.cells.find(
         candidate => candidate.id === request.cellId
       );
-      if (!cell || cell.kind !== request.kind) continue;
+      if (!cell) continue;
       this.activeRequest = request;
+      cell.kind = request.kind;
       cell.status = 'running';
       cell.output = '';
       cell.blocks = [];
@@ -288,7 +270,7 @@ export class WorkspaceNotebook {
     ) {
       return last;
     }
-    const cell = createWorkspaceCell(last.kind);
+    const cell = createWorkspaceCell();
     this.cells.push(cell);
     return cell;
   }
@@ -301,7 +283,6 @@ export class WorkspaceNotebook {
       this.active += 1;
     }
     this.mode = 'edit';
-    this.insertKind = this.current.kind;
     return this.current;
   }
 }

@@ -25,8 +25,7 @@ describe('Agent Workspace document', () => {
     notebook.finishRun(firstRequest?.id ?? '', '', 'done');
     notebook.toggleOutputCollapsed();
     notebook.advanceAfterRun();
-    notebook.setKind('command');
-    notebook.setSource('pwd');
+    notebook.setSource('!pwd');
     const secondRequest = notebook.enqueueRun();
     notebook.promoteNextRun();
     notebook.finishRun(secondRequest?.id ?? '', '/root\n');
@@ -40,7 +39,7 @@ describe('Agent Workspace document', () => {
     expect(restored.cells[0].blocks).toEqual(notebook.cells[0].blocks);
     expect(restored.cells[0].outputCollapsed).toBe(true);
     expect(restored.cells[1].kind).toBe('command');
-    expect(restored.cells[1].source).toBe('pwd');
+    expect(restored.cells[1].source).toBe('!pwd');
     expect(restored.cells[1].output).toBe('/root\n');
     expect(restored.active).toBe(notebook.active);
   });
@@ -105,8 +104,8 @@ describe('Agent Workspace document', () => {
     notebook.finishRun(aiRequest?.id ?? '', '', 'done');
     notebook.toggleOutputCollapsed();
 
-    notebook.insertBelow('command');
-    notebook.setSource('printf long-output');
+    notebook.insertBelow();
+    notebook.setSource('!printf long-output');
     const commandRequest = notebook.enqueueRun();
     notebook.promoteNextRun();
     notebook.finishRun(
@@ -130,9 +129,50 @@ describe('Agent Workspace document', () => {
     });
     expect(restored.cells[1]).toMatchObject({
       kind: 'command',
+      source: '!printf long-output',
       status: 'done',
       output: 'command output\n'.repeat(100),
       outputCollapsed: true
+    });
+  });
+
+  it('normalizes legacy Command cells to one visible shell marker', () => {
+    const snapshot = parseWorkspaceSnapshot(
+      JSON.stringify({
+        version: 1,
+        active: 0,
+        cells: [
+          {
+            id: 'cell-9',
+            kind: 'command',
+            source: 'pwd',
+            output: '/root\n',
+            blocks: [],
+            status: 'done',
+            executionCount: 1,
+            outputCollapsed: false
+          },
+          {
+            id: 'cell-10',
+            kind: 'command',
+            source: ' !ls',
+            output: '',
+            blocks: [],
+            status: 'idle',
+            executionCount: null,
+            outputCollapsed: false
+          }
+        ]
+      })
+    );
+
+    expect(snapshot.cells[0]).toMatchObject({
+      kind: 'command',
+      source: '!pwd'
+    });
+    expect(snapshot.cells[1]).toMatchObject({
+      kind: 'command',
+      source: ' !ls'
     });
   });
 

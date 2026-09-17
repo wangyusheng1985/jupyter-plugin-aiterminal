@@ -1,11 +1,4 @@
-# cell-input-history Specification
-
-## Purpose
-
-Provide one persistent, workspace-isolated input history that shares accepted
-AI and Command submissions across cells in the same workspace tab.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Command history is isolated by workspace tab
 
@@ -55,8 +48,8 @@ draft that has not been submitted SHALL NOT be recorded.
 #### Scenario: A queued command is recorded before execution
 
 - **WHEN** a Command input is accepted while another request is running
-- **THEN** its source is available in history immediately
-- **AND** it remains available if the queued command later fails or is
+- **THEN** its source is available in shared history immediately
+- **AND** it remains available if the queued request later fails or is
   interrupted
 
 #### Scenario: An AI submission is not command history
@@ -127,32 +120,3 @@ immediately without an additional click.
 - **WHEN** a Command cell is submitted with run-and-advance
 - **THEN** the newly created input is editable and focused
 - **AND** pressing `ArrowUp` immediately recalls the submitted command
-
-### Requirement: Normal text editing remains available
-
-History navigation SHALL affect only editable cell inputs. Read-only cells,
-modified arrow-key commands, text selections, and caret movement within
-multiline text SHALL retain normal editor behavior. Editing a recalled command
-SHALL end history navigation, and the edited text SHALL become the new draft.
-
-#### Scenario: Arrow keys in an AI cell retain normal behavior
-
-- **WHEN** an AI cell has no command history or the caret is not at a history
-  navigation boundary
-- **THEN** its arrow keys retain normal editor behavior
-
-#### Scenario: Up inside multiline Command text moves the caret
-
-- **WHEN** the caret is not on the first line of an editable cell
-- **THEN** `ArrowUp` retains normal multiline caret movement
-
-#### Scenario: A recalled command is edited
-
-- **WHEN** the user edits text after recalling a history entry
-- **THEN** history navigation ends
-- **AND** subsequent ordinary arrow navigation follows normal editor behavior
-
-#### Scenario: No command history exists
-
-- **WHEN** the current tab has no submitted Command cells
-- **THEN** unmodified arrow keys retain normal editor behavior

@@ -1,6 +1,7 @@
 import type { ChatBlock } from './protocol';
 import {
   createWorkspaceCell,
+  isShellEscapeSource,
   restoreCounters,
   type CellKind,
   type CellStatus,
@@ -70,16 +71,16 @@ export function restoreNotebook(
     return;
   }
   notebook.active = clamp(snapshot.active, 0, notebook.cells.length - 1);
-  notebook.insertKind = notebook.current.kind;
   notebook.mode = 'edit';
   restoreCounters(notebook.cells);
 }
 
 function snapshotFromCell(cell: WorkspaceCell): CellSnapshot {
+  const input = normalizeInput(cell.source, cell.kind);
   return {
     id: cell.id,
-    kind: cell.kind === 'command' ? 'command' : 'ai',
-    source: cell.source,
+    kind: input.kind,
+    source: input.source,
     output: cell.output,
     blocks: cell.blocks,
     status: persistStatus(cell.status),
@@ -89,10 +90,11 @@ function snapshotFromCell(cell: WorkspaceCell): CellSnapshot {
 }
 
 function cellFromSnapshot(cell: CellSnapshot): WorkspaceCell {
+  const input = normalizeInput(cell.source, cell.kind);
   return {
     id: cell.id,
-    kind: cell.kind === 'command' ? 'command' : 'ai',
-    source: cell.source,
+    kind: input.kind,
+    source: input.source,
     output: cell.output,
     blocks: Array.isArray(cell.blocks) ? cell.blocks : [],
     status: persistStatus(cell.status),
@@ -116,19 +118,37 @@ function normalizeSnapshot(
 }
 
 function normalizeCell(cell: Partial<CellSnapshot>): CellSnapshot {
+  const input = normalizeInput(
+    typeof cell.source === 'string' ? cell.source : '',
+    cell.kind
+  );
   return {
     id:
       typeof cell.id === 'string' && cell.id
         ? cell.id
         : createWorkspaceCell().id,
-    kind: cell.kind === 'command' ? 'command' : 'ai',
-    source: typeof cell.source === 'string' ? cell.source : '',
+    kind: input.kind,
+    source: input.source,
     output: typeof cell.output === 'string' ? cell.output : '',
     blocks: Array.isArray(cell.blocks) ? cell.blocks : [],
     status: persistStatus(cell.status),
     executionCount:
       typeof cell.executionCount === 'number' ? cell.executionCount : null,
     outputCollapsed: Boolean(cell.outputCollapsed)
+  };
+}
+
+function normalizeInput(
+  source: string,
+  kind: unknown
+): { kind: CellKind; source: string } {
+  const shell = kind === 'command' || isShellEscapeSource(source);
+  if (!shell) {
+    return { kind: 'ai', source };
+  }
+  return {
+    kind: 'command',
+    source: isShellEscapeSource(source) ? source : `!${source}`
   };
 }
 

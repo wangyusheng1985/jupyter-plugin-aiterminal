@@ -158,22 +158,6 @@
   opacity: var(--jp-cell-prompt-not-active-opacity, 0.5);
 }
 
-.jp-AgentWorkspace-kind {
-  display: block;
-  margin-top: 2px;
-  color: var(--jp-ui-font-color2, #616161);
-  font-family: var(--jp-ui-font-family, sans-serif);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  cursor: pointer;
-}
-
-.jp-AgentWorkspace-prompt.is-input {
-  cursor: pointer;
-}
-
 .jp-AgentWorkspace-cellInput {
   flex: 1 1 auto;
   min-width: 0;

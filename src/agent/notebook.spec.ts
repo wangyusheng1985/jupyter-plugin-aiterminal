@@ -1,7 +1,7 @@
 import { restoreCounters, WorkspaceNotebook } from './notebook';
 
 describe('WorkspaceNotebook', () => {
-  it('starts with one editable AI cell', () => {
+  it('starts with one editable unified input', () => {
     const notebook = new WorkspaceNotebook();
     expect(notebook.cells).toHaveLength(1);
     expect(notebook.current.kind).toBe('ai');
@@ -11,61 +11,48 @@ describe('WorkspaceNotebook', () => {
   it('inserts above and below the active cell', () => {
     const notebook = new WorkspaceNotebook();
     notebook.setSource('pwd');
-    notebook.insertBelow('command');
+    notebook.insertBelow();
     notebook.setSource('ls');
     notebook.select(0);
-    notebook.insertAbove('ai');
+    notebook.insertAbove();
     expect(notebook.cells.map(cell => cell.source)).toEqual(['', 'pwd', 'ls']);
-    expect(notebook.cells.map(cell => cell.kind)).toEqual([
-      'ai',
-      'ai',
-      'command'
-    ]);
+    expect(notebook.cells.map(cell => cell.kind)).toEqual(['ai', 'ai', 'ai']);
     expect(notebook.active).toBe(0);
   });
 
-  it('cycles the active cell between AI and Command', () => {
+  it('classifies ordinary, marked, whitespace-prefixed, and marker-only input', () => {
     const notebook = new WorkspaceNotebook();
     notebook.setSource('list files');
-    expect(notebook.toggleKind()).toBe('command');
-    expect(notebook.current.kind).toBe('command');
-    expect(notebook.current.source).toBe('list files');
-    expect(notebook.toggleKind()).toBe('ai');
-    expect(notebook.current.kind).toBe('ai');
+    const ordinary = notebook.enqueueRun();
+    expect(ordinary).toMatchObject({
+      kind: 'ai',
+      source: 'list files',
+      executionSource: 'list files'
+    });
+
+    notebook.setSource('!pwd');
+    const marked = notebook.enqueueRun();
+    expect(marked).toMatchObject({
+      kind: 'command',
+      source: '!pwd',
+      executionSource: 'pwd'
+    });
+
+    notebook.setSource(' \n ! ls -la ');
+    const whitespaceMarked = notebook.enqueueRun();
+    expect(whitespaceMarked).toMatchObject({
+      kind: 'command',
+      source: '! ls -la',
+      executionSource: 'ls -la'
+    });
+
+    notebook.setSource('  !  ');
+    expect(notebook.enqueueRun()).toBeNull();
   });
 
-  it('keeps sibling cells when changing the active kind', () => {
+  it('advances after a command run by creating a unified AI input', () => {
     const notebook = new WorkspaceNotebook();
-    notebook.setSource('list files');
-    notebook.insertBelow('command');
-    notebook.setSource('pwd');
-    notebook.select(0);
-    notebook.setKind('command');
-    expect(notebook.cells).toHaveLength(2);
-    expect(notebook.cells[0].kind).toBe('command');
-    expect(notebook.cells[0].source).toBe('list files');
-    expect(notebook.cells[1].kind).toBe('command');
-    expect(notebook.cells[1].source).toBe('pwd');
-  });
-
-  it('clears output when changing a run cell kind', () => {
-    const notebook = new WorkspaceNotebook();
-    notebook.setSource('pwd');
-    const request = notebook.enqueueRun();
-    expect(request).not.toBeNull();
-    notebook.promoteNextRun();
-    notebook.finishRun(request?.id ?? '', '/root');
-    notebook.setKind('command');
-    expect(notebook.current.source).toBe('pwd');
-    expect(notebook.current.output).toBe('');
-    expect(notebook.current.blocks).toEqual([]);
-    expect(notebook.current.status).toBe('idle');
-  });
-
-  it('advances after a run by creating a trailing cell of the same kind', () => {
-    const notebook = new WorkspaceNotebook();
-    notebook.setKind('command');
-    notebook.setSource('pwd');
+    notebook.setSource('!pwd');
     const request = notebook.enqueueRun();
     notebook.promoteNextRun();
     notebook.finishRun(request?.id ?? '', '/root\n');
@@ -73,7 +60,8 @@ describe('WorkspaceNotebook', () => {
     expect(notebook.cells).toHaveLength(2);
     expect(notebook.active).toBe(1);
     expect(notebook.cells[0].output).toBe('/root\n');
-    expect(notebook.current.kind).toBe('command');
+    expect(notebook.current.kind).toBe('ai');
+    expect(notebook.current.source).toBe('');
   });
 
   it('toggles output collapsed on a cell', () => {
@@ -116,14 +104,12 @@ describe('WorkspaceNotebook', () => {
 
   it('can delete the last remaining cell', () => {
     const notebook = new WorkspaceNotebook();
-    notebook.setKind('command');
-    notebook.setSource('pwd');
+    notebook.setSource('!pwd');
     expect(notebook.deleteActive()).toBe(true);
     expect(notebook.cells).toHaveLength(0);
     expect(notebook.empty).toBe(true);
-    expect(notebook.insertKind).toBe('command');
     const cell = notebook.appendCell();
-    expect(cell.kind).toBe('command');
+    expect(cell.kind).toBe('ai');
     expect(notebook.cells).toHaveLength(1);
     expect(notebook.active).toBe(0);
     expect(notebook.mode).toBe('edit');
@@ -159,14 +145,22 @@ describe('WorkspaceNotebook', () => {
     const notebook = new WorkspaceNotebook();
     notebook.setSource('first');
     const first = notebook.enqueueRun();
-    notebook.setSource('second');
+    notebook.setSource('!second');
     const second = notebook.enqueueRun();
 
-    expect(first).toMatchObject({ source: 'first' });
-    expect(second).toMatchObject({ source: 'second' });
+    expect(first).toMatchObject({
+      source: 'first',
+      executionSource: 'first',
+      kind: 'ai'
+    });
+    expect(second).toMatchObject({
+      source: '!second',
+      executionSource: 'second',
+      kind: 'command'
+    });
     expect(notebook.queuedRuns.map(request => request.source)).toEqual([
       'first',
-      'second'
+      '!second'
     ]);
   });
 
@@ -174,8 +168,8 @@ describe('WorkspaceNotebook', () => {
     const notebook = new WorkspaceNotebook();
     notebook.setSource('one');
     const first = notebook.enqueueRun();
-    notebook.insertBelow('command');
-    notebook.setSource('two');
+    notebook.insertBelow();
+    notebook.setSource('!two');
     const second = notebook.enqueueRun();
 
     expect(first?.id).not.toBe(second?.id);
@@ -230,36 +224,31 @@ describe('WorkspaceNotebook', () => {
     });
   });
 
-  it('cancels every queued request for a deleted or reclassified cell', () => {
+  it('cancels every queued request for a deleted cell', () => {
     const notebook = new WorkspaceNotebook();
     notebook.setSource('one');
     notebook.enqueueRun();
     notebook.enqueueRun();
-    notebook.insertBelow('command');
-    notebook.setSource('two');
+    notebook.insertBelow();
+    notebook.setSource('!two');
     const other = notebook.enqueueRun();
 
     notebook.select(0);
-    expect(notebook.setKind('command')).toBe(true);
-    expect(notebook.cells[0].status).toBe('idle');
-    expect(notebook.queuedRuns).toEqual([other]);
-
-    notebook.setSource('three');
-    notebook.enqueueRun();
     expect(notebook.deleteActive()).toBe(true);
-    expect(notebook.queuedRuns.map(request => request.source)).toEqual(['two']);
+    expect(notebook.queuedRuns).toEqual([other]);
+    expect(notebook.queuedRuns.map(request => request.source)).toEqual([
+      '!two'
+    ]);
   });
 
-  it('does not reclassify or delete the active running cell', () => {
+  it('does not delete the active running cell', () => {
     const notebook = new WorkspaceNotebook();
-    notebook.setSource('pwd');
+    notebook.setSource('!pwd');
     notebook.enqueueRun();
     notebook.promoteNextRun();
 
-    expect(notebook.setKind('command')).toBe(false);
-    expect(notebook.toggleKind()).toBeNull();
     expect(notebook.deleteActive()).toBe(false);
-    expect(notebook.current.kind).toBe('ai');
+    expect(notebook.current.kind).toBe('command');
     expect(notebook.current.status).toBe('running');
   });
 
@@ -268,8 +257,8 @@ describe('WorkspaceNotebook', () => {
     notebook.setSource('one');
     notebook.enqueueRun();
     notebook.promoteNextRun();
-    notebook.insertBelow('command');
-    notebook.setSource('two');
+    notebook.insertBelow();
+    notebook.setSource('!two');
     notebook.enqueueRun();
 
     notebook.clearRuns();

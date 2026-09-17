@@ -5,15 +5,16 @@ import { Panel, Widget } from '@lumino/widgets';
 
 import { AGENT_PANEL_CLASS, ShutdownCoordinator } from '../theme';
 import { restoreNotebook, serializeNotebook } from './document';
-import { CommandHistory, type HistoryNavigation } from './history';
+import { WorkspaceInputHistory, type HistoryNavigation } from './history';
+import { InputHistoryStorage } from './history-storage';
 import { mapHistoryKey, mapWorkspaceKey, strokeFromEvent } from './keys';
 import { renderMarkdownSource } from './markdown';
 import { WorkspaceNotebook, type WorkspaceCell } from './notebook';
 import { AgentSession } from './session';
 import { SelectionCopyButton } from './selectioncopy';
 import { formatToolInput } from './tool';
-import type { AgentToolbarHost, CellTypeSwitcher } from './toolbar';
-import type { ChatBlock, WorkspaceMode } from './protocol';
+import type { AgentToolbarHost } from './toolbar';
+import type { ChatBlock } from './protocol';
 
 export interface SourceChangeOptions {
   fromHistory?: boolean;
@@ -23,7 +24,6 @@ export interface CellHandlers {
   onSource: (source: string, options?: SourceChangeOptions) => void;
   onSelect: (index: number, options?: { focusEditor?: boolean }) => void;
   onToggleCollapse: (index: number) => void;
-  onToggleKind: (index: number) => void;
   onAddCell: () => void;
   onHistoryPrevious: (draft: string) => HistoryNavigation | null;
   onHistoryNext: () => HistoryNavigation | null;
@@ -34,7 +34,7 @@ export interface CellHandlers {
 export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   readonly notebook = new WorkspaceNotebook();
   readonly session: AgentSession;
-  readonly commandHistory = new CommandHistory();
+  readonly inputHistory = new WorkspaceInputHistory();
   private closing = false;
   private aiInterruptRequested = false;
   private readonly shutdown = new ShutdownCoordinator();
@@ -42,15 +42,16 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   private readonly status: StatusBar;
   private context: DocumentRegistry.IContext<DocumentRegistry.ICodeModel> | null =
     null;
+  private historyPath: string | null = null;
   private applyingModel = false;
   private persistTimer = 0;
   private deleteChordTimer = 0;
   private readonly copyButton: SelectionCopyButton;
-  cellTypeSwitcher: CellTypeSwitcher | null = null;
 
   constructor(
     private readonly rendermime: IRenderMimeRegistry | null = null,
-    cwd?: string
+    cwd?: string,
+    private readonly historyStorage = new InputHistoryStorage()
   ) {
     super();
     this.session = new AgentSession(undefined, cwd);
@@ -58,21 +59,20 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     this.notebookView = new NotebookView(this.notebook, {
       onSource: (source, options) => {
         if (!options?.fromHistory) {
-          this.commandHistory.resetNavigation();
+          this.inputHistory.resetNavigation();
         }
         this.notebook.setSource(source);
         this.persistSoon();
       },
       onSelect: (index, options) => this.selectCell(index, options),
       onToggleCollapse: index => this.toggleOutputCollapsed(index),
-      onToggleKind: index => this.toggleCellKind(index),
       onAddCell: () => this.addCellFromFooter(),
-      onHistoryPrevious: draft => this.commandHistory.previous(draft),
-      onHistoryNext: () => this.commandHistory.next(),
-      onHistoryReset: () => this.commandHistory.resetNavigation(),
+      onHistoryPrevious: draft => this.inputHistory.previous(draft),
+      onHistoryNext: () => this.inputHistory.next(),
+      onHistoryReset: () => this.inputHistory.resetNavigation(),
       rendermime: this.rendermime
     });
-    this.status = new StatusBar('AI cell  •  Local tools');
+    this.status = new StatusBar('Local tools');
     this.addWidget(this.notebookView);
     this.addWidget(this.status);
     this.node.tabIndex = -1;
@@ -81,12 +81,6 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     this.session.subscribe(() => this.onSessionChange());
     this.refresh();
     this.start();
-  }
-
-  get mode(): WorkspaceMode {
-    return this.notebook.empty
-      ? this.notebook.insertKind
-      : this.notebook.current.kind;
   }
 
   protected onActivateRequest(msg: Message): void {
@@ -107,6 +101,8 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     this.context = context;
     void context.ready.then(() => {
       if (this.isDisposed || this.closing) return;
+      this.historyPath = context.path;
+      this.inputHistory.restore(this.historyStorage.load(context.path));
       this.applyModel();
       if (!context.model.toString().trim()) {
         this.persistNow();
@@ -121,26 +117,8 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     this.applyModel();
   }
 
-  setCellKind(kind: WorkspaceMode): void {
-    this.commandHistory.resetNavigation();
-    const changed = this.notebook.setKind(kind);
-    if (this.notebook.empty) {
-      this.refresh();
-      this.persistSoon();
-      return;
-    }
-    if (!changed) {
-      this.status.setMessage('Cannot change the kind of a running cell.');
-      return;
-    }
-    this.notebook.enterEdit();
-    this.refresh();
-    this.persistSoon();
-    this.notebookView.focusActive();
-  }
-
   insertAbove(): void {
-    this.commandHistory.resetNavigation();
+    this.inputHistory.resetNavigation();
     this.notebook.insertAbove();
     this.refresh();
     this.persistSoon();
@@ -148,7 +126,7 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   }
 
   insertBelow(): void {
-    this.commandHistory.resetNavigation();
+    this.inputHistory.resetNavigation();
     this.notebook.insertBelow();
     this.refresh();
     this.persistSoon();
@@ -157,7 +135,7 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
 
   addCellFromFooter(): void {
     this.clearDeleteChord();
-    this.commandHistory.resetNavigation();
+    this.inputHistory.resetNavigation();
     if (this.notebook.empty) {
       this.notebook.appendCell();
     } else {
@@ -171,7 +149,7 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
 
   deleteActive(): void {
     this.clearDeleteChord();
-    this.commandHistory.resetNavigation();
+    this.inputHistory.resetNavigation();
     if (this.notebook.empty) {
       return;
     }
@@ -218,7 +196,7 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     this.closing = true;
     this.clearDeleteChord();
     this.copyButton.dispose();
-    this.commandHistory.resetNavigation();
+    this.inputHistory.resetNavigation();
     this.notebook.clearRuns();
     this.persistNow();
     void this.shutdownOnce().catch(error => {
@@ -232,7 +210,7 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     options: { focusEditor?: boolean } = {}
   ): void {
     if (this.notebook.empty) return;
-    this.commandHistory.resetNavigation();
+    this.inputHistory.resetNavigation();
     const focusEditor = options.focusEditor !== false;
     const alreadyActive = this.notebook.active === index;
     const alreadyEditing = alreadyActive && this.notebook.mode === 'edit';
@@ -261,21 +239,6 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     this.notebook.toggleOutputCollapsed(index);
     this.refresh();
     this.persistSoon();
-  }
-
-  private toggleCellKind(index: number): void {
-    if (this.notebook.empty) return;
-    this.notebook.select(index);
-    const kind = this.notebook.toggleKind();
-    if (kind === null) {
-      this.status.setMessage('Cannot change the kind of a running cell.');
-      return;
-    }
-    this.commandHistory.resetNavigation();
-    this.notebook.enterEdit();
-    this.refresh();
-    this.persistSoon();
-    this.notebookView.focusActive();
   }
 
   private onKey(event: KeyboardEvent): void {
@@ -377,14 +340,15 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     if (this.notebook.empty) return;
     const request = this.notebook.enqueueRun(this.notebook.active, advance);
     if (!request) return;
-    if (request.kind === 'command') {
-      this.commandHistory.add(request.source);
+    if (this.inputHistory.add(request.source)) {
+      this.saveInputHistory();
     }
     this.notebook.ensureTrailingInput();
     this.refresh();
     this.persistSoon();
     if (advance) {
       this.notebook.advanceAfterRun();
+      this.refresh();
       this.notebookView.focusActive();
     }
     this.drainQueue();
@@ -402,7 +366,7 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
       return;
     }
     void this.session
-      .exec(request.source)
+      .exec(request.executionSource)
       .then(result => {
         this.finishRun(
           request.id,
@@ -466,7 +430,7 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     if (!this.context) return;
     const text = this.context.model.toString();
     if (text === serializeNotebook(this.notebook)) return;
-    this.commandHistory.resetNavigation();
+    this.inputHistory.resetNavigation();
     this.applyingModel = true;
     restoreNotebook(this.notebook, text);
     this.applyingModel = false;
@@ -480,6 +444,11 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
       this.persistTimer = 0;
       this.persistNow();
     }, 400);
+  }
+
+  private saveInputHistory(): void {
+    if (!this.historyPath) return;
+    this.historyStorage.save(this.historyPath, this.inputHistory.values);
   }
 
   private persistNow(): void {
@@ -506,16 +475,13 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   }
 
   private refresh(): void {
-    this.cellTypeSwitcher?.update();
     this.notebookView.render();
     if (this.notebook.empty) {
       this.status.setMessage('Click to add a cell.');
       return;
     }
-    const kind =
-      this.notebook.current.kind === 'ai' ? 'AI cell' : 'Command cell';
-    const cwd = this.session.execCwd ? `  •  ${this.session.execCwd}` : '';
-    this.status.setMessage(`${kind}${cwd}`);
+    const cwd = this.session.execCwd;
+    this.status.setMessage(cwd ? `Local tools  •  ${cwd}` : 'Local tools');
   }
 }
 
@@ -586,7 +552,6 @@ export class CellView {
   readonly node: HTMLDivElement;
   private readonly editor: HTMLTextAreaElement;
   private readonly inputPrompt: HTMLDivElement;
-  private readonly inputKind: HTMLSpanElement;
   private readonly inputCollapser: HTMLDivElement;
   private outputRow: HTMLDivElement | null = null;
   private outputPrompt: HTMLDivElement | null = null;
@@ -625,15 +590,6 @@ export class CellView {
     this.inputCollapser.className = 'jp-AgentWorkspace-collapser';
     this.inputPrompt = document.createElement('div');
     this.inputPrompt.className = 'jp-AgentWorkspace-prompt is-input';
-    this.inputKind = document.createElement('span');
-    this.inputKind.className = 'jp-AgentWorkspace-kind';
-    // CellView has no translator; keep the Lab prompt tooltip as-is.
-    this.inputPrompt.title = 'Double-click to switch AI / Command'; // eslint-disable-line jupyter/no-untranslated-string
-    this.inputPrompt.addEventListener('dblclick', event => {
-      event.preventDefault();
-      event.stopPropagation();
-      this.handlers.onToggleKind(this.index);
-    });
     this.editor = document.createElement('textarea');
     this.editor.className = 'jp-AgentWorkspace-cellInput';
     this.editor.spellcheck = false;
@@ -666,10 +622,8 @@ export class CellView {
     const editing = active && notebook.mode === 'edit';
     this.node.classList.toggle('is-active', active);
     this.node.classList.toggle('is-edit', editing);
-    this.node.classList.toggle('is-ai', cell.kind === 'ai');
-    this.node.classList.toggle('is-command', cell.kind === 'command');
     this.node.classList.toggle('is-collapsed', cell.outputCollapsed);
-    setPrompt(this.inputPrompt, this.inputKind, cell, 'input');
+    setPrompt(this.inputPrompt, cell);
     if (document.activeElement !== this.editor) {
       this.editor.value = cell.source;
     }
@@ -749,7 +703,7 @@ export class CellView {
     }
     this.outputRow.classList.toggle('is-collapsed', cell.outputCollapsed);
     this.outputBody.tabIndex = cell.outputCollapsed ? 0 : -1;
-    setPrompt(this.outputPrompt, null, cell, 'output');
+    setPrompt(this.outputPrompt, cell);
     const key = outputKey(cell);
     if (key === this.lastOutputKey) return;
     this.lastOutputKey = key;
@@ -826,12 +780,7 @@ export function renderCellOutputPreservingScroll(
   body.scrollTop = scrollTop;
 }
 
-function setPrompt(
-  prompt: HTMLElement,
-  kind: HTMLSpanElement | null,
-  cell: WorkspaceCell,
-  row: 'input' | 'output'
-): void {
+function setPrompt(prompt: HTMLElement, cell: WorkspaceCell): void {
   const count =
     cell.status === 'queued' || cell.status === 'running'
       ? '*'
@@ -839,11 +788,6 @@ function setPrompt(
         ? String(cell.executionCount)
         : ' ';
   prompt.textContent = `[${count}]:`;
-  if (row !== 'input') return;
-  const tag = kind ?? document.createElement('span');
-  tag.className = 'jp-AgentWorkspace-kind';
-  tag.textContent = cell.kind === 'ai' ? 'AI' : 'sh';
-  prompt.append(tag);
 }
 
 function outputKey(cell: WorkspaceCell): string {

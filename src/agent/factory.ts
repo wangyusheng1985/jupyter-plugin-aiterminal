@@ -72,7 +72,7 @@ export class AgentWorkspaceWidgetFactory extends ABCWidgetFactory<
       cwd || undefined
     );
     const widget = new DocumentWidget({ content, context });
-    content.cellTypeSwitcher = installAgentToolbar(widget.toolbar, content);
+    installAgentToolbar(widget.toolbar, content);
     content.attachContext(context);
     widget.id = `agent-workspace:${context.path}`;
     widget.title.icon = terminalIcon;

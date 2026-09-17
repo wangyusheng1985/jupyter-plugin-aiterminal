@@ -1,3 +1,5 @@
+import type { DocumentRegistry } from '@jupyterlab/docregistry';
+
 import {
   AgentWorkspaceContent,
   CellView,
@@ -8,7 +10,11 @@ import {
   runningIndicatorNode
 } from './workspace';
 import { restoreNotebook, serializeNotebook } from './document';
-import { CommandHistory } from './history';
+import { WorkspaceInputHistory } from './history';
+import {
+  InputHistoryStorage,
+  type InputHistoryStorageLike
+} from './history-storage';
 import { WorkspaceNotebook, type WorkspaceCell } from './notebook';
 import { AgentSession } from './session';
 
@@ -33,6 +39,18 @@ beforeAll(() => {
     value: jest.fn()
   });
 });
+
+class MemoryStorage implements InputHistoryStorageLike {
+  readonly values = new Map<string, string>();
+
+  getItem(key: string): string | null {
+    return this.values.get(key) ?? null;
+  }
+
+  setItem(key: string, value: string): void {
+    this.values.set(key, value);
+  }
+}
 
 describe('renderBlock', () => {
   it('creates a presentation-only three-dot running indicator', () => {
@@ -224,13 +242,12 @@ describe('CellView output state', () => {
 
   function handlers(
     onSelect = jest.fn(),
-    history = new CommandHistory()
+    history = new WorkspaceInputHistory()
   ): CellHandlers {
     return {
       onSource: jest.fn(),
       onSelect,
       onToggleCollapse: jest.fn(),
-      onToggleKind: jest.fn(),
       onAddCell: jest.fn(),
       onHistoryPrevious: draft => history.previous(draft),
       onHistoryNext: () => history.next(),
@@ -252,6 +269,26 @@ describe('CellView output state', () => {
     expect(
       view.node.querySelector('.jp-AgentWorkspace-runningIndicator')
     ).toBeNull();
+  });
+
+  it('renders a unified prompt without an AI or shell badge', () => {
+    const notebook = new WorkspaceNotebook();
+    const view = new CellView('cell-1', handlers());
+    const command = cell({
+      kind: 'command',
+      source: '!pwd',
+      status: 'done',
+      executionCount: 2
+    });
+
+    view.sync(command, 0, notebook);
+
+    const prompt = view.node.querySelector(
+      '.jp-AgentWorkspace-prompt.is-input'
+    );
+    expect(prompt?.textContent).toBe('[2]:');
+    expect(prompt?.querySelector('.jp-AgentWorkspace-kind')).toBeNull();
+    expect(view.node.classList.contains('is-command')).toBe(false);
   });
 
   it('shows compact collapsed output without hiding the body', () => {
@@ -305,7 +342,7 @@ describe('CellView output state', () => {
   });
 });
 
-describe('CellView command history', () => {
+describe('CellView input history', () => {
   function cell(overrides: Partial<WorkspaceCell> = {}): WorkspaceCell {
     return {
       id: 'cell-1',
@@ -331,7 +368,7 @@ describe('CellView command history', () => {
   }
 
   it('navigates older and newer commands and restores the draft', () => {
-    const history = new CommandHistory();
+    const history = new WorkspaceInputHistory();
     history.add('first');
     history.add('second');
     const command = cell({ source: 'draft' });
@@ -339,7 +376,7 @@ describe('CellView command history', () => {
       command.source = source;
     });
     const view = new CellView('cell-1', {
-      ...new CommandHistoryHandlers(history),
+      ...new InputHistoryHandlers(history),
       onSource
     });
     view.sync(command, 0, new WorkspaceNotebook());
@@ -363,8 +400,8 @@ describe('CellView command history', () => {
     expect(onSource).toHaveBeenLastCalledWith('draft', { fromHistory: true });
   });
 
-  it('uses tab history in AI cells while preserving multiline caret movement', () => {
-    const history = new CommandHistory();
+  it('uses shared history in the unified input while preserving multiline caret movement', () => {
+    const history = new WorkspaceInputHistory();
     history.add('shell command');
     const previous = jest.fn(() => history.previous('ignored'));
     const next = jest.fn(() => history.next());
@@ -372,7 +409,6 @@ describe('CellView command history', () => {
       onSource: jest.fn(),
       onSelect: jest.fn(),
       onToggleCollapse: jest.fn(),
-      onToggleKind: jest.fn(),
       onAddCell: jest.fn(),
       onHistoryPrevious: previous,
       onHistoryNext: next,
@@ -401,9 +437,9 @@ describe('CellView command history', () => {
   });
 
   it('ends history navigation when recalled text is edited or the editor blurs', () => {
-    const history = new CommandHistory();
+    const history = new WorkspaceInputHistory();
     history.add('command');
-    const view = new CellView('cell-1', new CommandHistoryHandlers(history));
+    const view = new CellView('cell-1', new InputHistoryHandlers(history));
     view.sync(cell(), 0, new WorkspaceNotebook());
     const textarea = view.node.querySelector<HTMLTextAreaElement>(
       '.jp-AgentWorkspace-cellInput'
@@ -422,7 +458,7 @@ describe('CellView command history', () => {
     expect(history.browsing).toBe(false);
   });
 
-  class CommandHistoryHandlers implements CellHandlers {
+  class InputHistoryHandlers implements CellHandlers {
     onSource = jest.fn(
       (source: string, options?: { fromHistory?: boolean }) => {
         if (!options?.fromHistory) this.history.resetNavigation();
@@ -430,11 +466,10 @@ describe('CellView command history', () => {
     );
     onSelect = jest.fn();
     onToggleCollapse = jest.fn();
-    onToggleKind = jest.fn();
     onAddCell = jest.fn();
     rendermime = null;
 
-    constructor(private readonly history: CommandHistory) {}
+    constructor(private readonly history: WorkspaceInputHistory) {}
 
     onHistoryPrevious = (draft: string) => {
       return this.history.previous(draft);
@@ -490,8 +525,7 @@ describe('AgentWorkspaceContent queue scheduling', () => {
     content.notebook.setSource('first');
     internals.runCell(false);
     content.notebook.select(1);
-    content.notebook.setKind('command');
-    content.notebook.setSource('second');
+    content.notebook.setSource('!second');
     internals.runCell(false);
 
     expect(sendUser).toHaveBeenCalledTimes(1);
@@ -508,6 +542,11 @@ describe('AgentWorkspaceContent queue scheduling', () => {
     expect(content.notebook.cells[0].status).toBe('done');
     expect(content.notebook.cells[1].status).toBe('running');
     expect(exec).toHaveBeenCalledWith('second');
+    expect(content.notebook.activeRun).toMatchObject({
+      kind: 'command',
+      source: '!second',
+      executionSource: 'second'
+    });
 
     content.dispose();
   });
@@ -523,8 +562,7 @@ describe('AgentWorkspaceContent queue scheduling', () => {
     content.notebook.setSource('first');
     internals.runCell(false);
     content.notebook.select(1);
-    content.notebook.setKind('command');
-    content.notebook.setSource('second');
+    content.notebook.setSource('!second');
     internals.runCell(false);
 
     content.interrupt();
@@ -542,19 +580,24 @@ describe('AgentWorkspaceContent queue scheduling', () => {
     content.dispose();
   });
 
-  it('advances immediately at enqueue and does not move selection on completion', () => {
+  it('advances a shell command to a new unified input without moving on completion', () => {
     const content = new AgentWorkspaceContent(null);
     const internals = content as unknown as WorkspaceInternals;
 
     content.notebook.setSource('first');
     internals.runCell(false);
     content.notebook.select(1);
-    content.notebook.setSource('second');
+    content.notebook.setSource('!second');
     internals.runCell(true);
 
     const selectedAfterEnqueue = content.notebook.active;
     expect(selectedAfterEnqueue).toBe(2);
     expect(content.notebook.cells[1].status).toBe('queued');
+    expect(content.notebook.current).toMatchObject({
+      kind: 'ai',
+      source: '',
+      status: 'idle'
+    });
 
     content.session.running = false;
     content.session.connected = true;
@@ -574,8 +617,7 @@ describe('AgentWorkspaceContent queue scheduling', () => {
     content.notebook.setSource('first');
     internals.runCell(false);
     content.notebook.select(1);
-    content.notebook.setKind('command');
-    content.notebook.setSource('second');
+    content.notebook.setSource('!second');
     internals.runCell(false);
 
     content.session.running = false;
@@ -583,6 +625,9 @@ describe('AgentWorkspaceContent queue scheduling', () => {
     internals.onSessionChange();
     await new Promise(resolve => setTimeout(resolve, 0));
 
+    expect(jest.mocked(AgentSession.prototype.exec)).toHaveBeenCalledWith(
+      'second'
+    );
     expect(content.notebook.cells[1]).toMatchObject({
       status: 'interrupted',
       output: 'Error: command failed'
@@ -621,11 +666,10 @@ describe('AgentWorkspaceContent queue scheduling', () => {
     const firstCount = content.notebook.cells[0].executionCount;
 
     content.notebook.select(1);
-    content.notebook.setKind('command');
-    content.notebook.setSource('two');
+    content.notebook.setSource('!two');
     internals.runCell(false);
     content.notebook.select(2);
-    content.notebook.setSource('three');
+    content.notebook.setSource('!three');
     internals.runCell(false);
 
     expect(exec).not.toHaveBeenCalled();
@@ -670,8 +714,7 @@ describe('AgentWorkspaceContent queue scheduling', () => {
     content.notebook.setSource('first');
     internals.runCell(false);
     content.notebook.select(1);
-    content.notebook.setKind('command');
-    content.notebook.setSource('second');
+    content.notebook.setSource('!second');
     internals.runCell(false);
 
     content.dispose();
@@ -683,10 +726,34 @@ describe('AgentWorkspaceContent queue scheduling', () => {
   });
 });
 
-describe('AgentWorkspaceContent command history', () => {
+describe('AgentWorkspaceContent input history', () => {
   interface WorkspaceInternals {
     runCell(advance: boolean): void;
     refresh(): void;
+  }
+
+  async function attachWorkspaceContext(
+    content: AgentWorkspaceContent,
+    path: string
+  ): Promise<void> {
+    let text = serializeNotebook(content.notebook);
+    const context = {
+      path,
+      ready: Promise.resolve(),
+      isReady: true,
+      model: {
+        toString: () => text,
+        fromString: jest.fn((value: string) => {
+          text = value;
+        }),
+        contentChanged: {
+          connect: jest.fn()
+        }
+      },
+      save: jest.fn().mockResolvedValue(undefined)
+    } as unknown as DocumentRegistry.IContext<DocumentRegistry.ICodeModel>;
+    content.attachContext(context);
+    await Promise.resolve();
   }
 
   beforeEach(() => {
@@ -712,7 +779,19 @@ describe('AgentWorkspaceContent command history', () => {
     jest.restoreAllMocks();
   });
 
-  it('keeps command histories isolated by tab and out of serialization', () => {
+  it('shows unified status text without an AI or Command mode label', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as WorkspaceInternals;
+    const status = content.node.querySelector('.jp-AgentWorkspace-status');
+
+    expect(status?.textContent).toBe('Local tools');
+    content.notebook.setSource('!pwd');
+    internals.refresh();
+    expect(status?.textContent).not.toMatch(/AI|Command/);
+    content.dispose();
+  });
+
+  it('keeps shared input histories isolated by tab and out of serialization', () => {
     jest
       .spyOn(AgentSession.prototype, 'exec')
       .mockResolvedValue({ output: 'ok\n', returncode: 0, cwd: '/tmp' });
@@ -720,20 +799,155 @@ describe('AgentWorkspaceContent command history', () => {
     const second = new AgentWorkspaceContent(null);
     const firstInternals = first as unknown as WorkspaceInternals;
 
-    first.notebook.setKind('command');
-    first.notebook.setSource('pwd');
+    first.notebook.setSource('explain this repository');
+    firstInternals.runCell(false);
+    first.notebook.appendCell();
+    first.notebook.setSource('!pwd');
     firstInternals.runCell(false);
 
-    expect(first.commandHistory.values).toEqual(['pwd']);
-    expect(second.commandHistory.values).toEqual([]);
+    expect(first.inputHistory.values).toEqual([
+      'explain this repository',
+      '!pwd'
+    ]);
+    expect(second.inputHistory.values).toEqual([]);
 
     const restored = new AgentWorkspaceContent(null);
     restoreNotebook(restored.notebook, serializeNotebook(first.notebook));
-    expect(restored.commandHistory.values).toEqual([]);
+    expect(restored.inputHistory.values).toEqual([]);
 
     first.dispose();
     second.dispose();
     restored.dispose();
+  });
+
+  it('persists unified inputs by workspace path and restores shared history', async () => {
+    jest
+      .spyOn(AgentSession.prototype, 'exec')
+      .mockImplementation(() => new Promise(() => undefined));
+    const memory = new MemoryStorage();
+    const storage = new InputHistoryStorage(memory);
+    const path = 'work/session.agentnb';
+    const first = new AgentWorkspaceContent(null, undefined, storage);
+    const firstInternals = first as unknown as WorkspaceInternals;
+    await attachWorkspaceContext(first, path);
+
+    first.notebook.setSource('explain this repository');
+    firstInternals.runCell(false);
+    first.notebook.appendCell();
+    first.notebook.setSource('!pwd');
+    firstInternals.runCell(false);
+
+    expect(first.inputHistory.values).toEqual([
+      'explain this repository',
+      '!pwd'
+    ]);
+    expect(storage.load(path)).toEqual(['explain this repository', '!pwd']);
+    first.dispose();
+
+    const restored = new AgentWorkspaceContent(null, undefined, storage);
+    const restoredInternals = restored as unknown as WorkspaceInternals;
+    await attachWorkspaceContext(restored, path);
+    restoredInternals.refresh();
+
+    expect(restored.inputHistory.values).toEqual([
+      'explain this repository',
+      '!pwd'
+    ]);
+    const aiInput = restored.node.querySelector<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    );
+    if (!aiInput) return;
+    aiInput.setSelectionRange(0, 0);
+    aiInput.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'ArrowUp',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    expect(aiInput.value).toBe('!pwd');
+    aiInput.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'ArrowUp',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    expect(aiInput.value).toBe('explain this repository');
+    aiInput.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'ArrowDown',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    expect(aiInput.value).toBe('!pwd');
+    aiInput.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'ArrowDown',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    expect(aiInput.value).toBe('');
+
+    restored.notebook.insertBelow();
+    restoredInternals.refresh();
+    const inputs = restored.node.querySelectorAll<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    );
+    const newInput = inputs[restored.notebook.active];
+    newInput.setSelectionRange(0, 0);
+    newInput.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'ArrowUp',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    expect(newInput.value).toBe('!pwd');
+    restored.dispose();
+
+    const other = new AgentWorkspaceContent(null, undefined, storage);
+    await attachWorkspaceContext(other, 'work/other.agentnb');
+    expect(other.inputHistory.values).toEqual([]);
+    other.dispose();
+  });
+
+  it('ignores rejected, unsubmitted, and consecutive duplicate inputs', async () => {
+    jest
+      .spyOn(AgentSession.prototype, 'exec')
+      .mockImplementation(() => new Promise(() => undefined));
+    const memory = new MemoryStorage();
+    const setItem = jest.spyOn(memory, 'setItem');
+    const content = new AgentWorkspaceContent(
+      null,
+      undefined,
+      new InputHistoryStorage(memory)
+    );
+    const internals = content as unknown as WorkspaceInternals;
+    await attachWorkspaceContext(content, 'work/duplicates.agentnb');
+
+    content.notebook.setSource('!pwd');
+    internals.runCell(false);
+    expect(setItem).toHaveBeenCalledTimes(1);
+
+    content.notebook.appendCell();
+    content.notebook.setSource('unsubmitted draft');
+    expect(content.inputHistory.values).toEqual(['!pwd']);
+    expect(setItem).toHaveBeenCalledTimes(1);
+
+    content.notebook.setSource(' !pwd ');
+    internals.runCell(false);
+    expect(setItem).toHaveBeenCalledTimes(1);
+    expect(content.inputHistory.values).toEqual(['!pwd']);
+
+    content.notebook.appendCell();
+    content.notebook.setSource(' !  ');
+    internals.runCell(false);
+    expect(setItem).toHaveBeenCalledTimes(1);
+    expect(content.inputHistory.values).toEqual(['!pwd']);
+    content.dispose();
   });
 
   it('records a command when accepted and keeps it after a failed run', async () => {
@@ -743,14 +957,61 @@ describe('AgentWorkspaceContent command history', () => {
     const content = new AgentWorkspaceContent(null);
     const internals = content as unknown as WorkspaceInternals;
 
-    content.notebook.setKind('command');
-    content.notebook.setSource('false');
+    content.notebook.setSource('!false');
     internals.runCell(false);
-    expect(content.commandHistory.values).toEqual(['false']);
+    expect(content.inputHistory.values).toEqual(['!false']);
 
     await new Promise(resolve => setTimeout(resolve, 0));
-    expect(content.commandHistory.values).toEqual(['false']);
+    expect(content.inputHistory.values).toEqual(['!false']);
     content.dispose();
+  });
+
+  it('focuses the advanced input and recalls the command after Shift+Enter', () => {
+    jest
+      .spyOn(AgentSession.prototype, 'exec')
+      .mockImplementation(() => new Promise(() => undefined));
+    const content = new AgentWorkspaceContent(null);
+    document.body.append(content.node);
+    const firstInput = content.node.querySelector<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    );
+    if (!firstInput) return;
+
+    firstInput.value = '!pwd';
+    firstInput.dispatchEvent(new Event('input', { bubbles: true }));
+    firstInput.setSelectionRange(0, 0);
+    firstInput.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Enter',
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true
+      })
+    );
+
+    expect(content.notebook.active).toBe(1);
+    const inputs = content.node.querySelectorAll<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    );
+    const nextInput = inputs[content.notebook.active];
+    expect(nextInput.readOnly).toBe(false);
+    expect(document.activeElement).toBe(nextInput);
+    expect(content.notebook.current).toMatchObject({
+      kind: 'ai',
+      source: ''
+    });
+
+    nextInput.setSelectionRange(0, 0);
+    nextInput.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'ArrowUp',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    expect(nextInput.value).toBe('!pwd');
+    content.dispose();
+    content.node.remove();
   });
 
   it('records a queued command before it starts executing', () => {
@@ -763,23 +1024,102 @@ describe('AgentWorkspaceContent command history', () => {
     content.notebook.setSource('first AI request');
     internals.runCell(false);
     content.notebook.select(1);
-    content.notebook.setKind('command');
-    content.notebook.setSource('pwd');
+    content.notebook.setSource('!pwd');
     internals.runCell(false);
 
     expect(content.notebook.cells[1].status).toBe('queued');
-    expect(content.commandHistory.values).toEqual(['pwd']);
+    expect(content.inputHistory.values).toEqual(['first AI request', '!pwd']);
     content.dispose();
   });
 
-  it('does not add AI submissions to command history', () => {
+  it('adds AI submissions to shared history for unified-input recall', () => {
     const content = new AgentWorkspaceContent(null);
     const internals = content as unknown as WorkspaceInternals;
 
     content.notebook.setSource('explain this repository');
     internals.runCell(false);
 
-    expect(content.commandHistory.values).toEqual([]);
+    expect(content.inputHistory.values).toEqual(['explain this repository']);
+    content.notebook.advanceAfterRun();
+    internals.refresh();
+    const inputs = content.node.querySelectorAll<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    );
+    const input = inputs[content.notebook.active];
+    input.setSelectionRange(0, 0);
+    input.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'ArrowUp',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    expect(input.value).toBe('explain this repository');
+    content.dispose();
+  });
+
+  it('classifies remembered shell input and returns to AI after the marker is deleted', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as WorkspaceInternals;
+    content.inputHistory.add('!pwd');
+    internals.refresh();
+    const input = content.node.querySelector<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    );
+    if (!input) return;
+
+    input.setSelectionRange(0, 0);
+    input.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'ArrowUp',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+
+    expect(input.value).toBe('!pwd');
+    expect(content.notebook.enqueueRun()).toMatchObject({
+      kind: 'command',
+      source: '!pwd',
+      executionSource: 'pwd'
+    });
+
+    input.value = 'pwd';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+
+    expect(content.notebook.enqueueRun()).toMatchObject({
+      kind: 'ai',
+      source: 'pwd',
+      executionSource: 'pwd'
+    });
+    content.dispose();
+  });
+
+  it('restores a shell marker and returns to AI when that marker is deleted', () => {
+    const saved = new WorkspaceNotebook();
+    saved.setSource('!pwd');
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as WorkspaceInternals;
+    restoreNotebook(content.notebook, serializeNotebook(saved));
+    internals.refresh();
+    const input = content.node.querySelector<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    );
+    if (!input) return;
+
+    expect(input.value).toBe('!pwd');
+    expect(content.notebook.enqueueRun()).toMatchObject({
+      kind: 'command',
+      executionSource: 'pwd'
+    });
+
+    input.value = 'pwd';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+
+    expect(content.notebook.enqueueRun()).toMatchObject({
+      kind: 'ai',
+      executionSource: 'pwd'
+    });
     content.dispose();
   });
 
@@ -792,17 +1132,16 @@ describe('AgentWorkspaceContent command history', () => {
     const content = new AgentWorkspaceContent(null);
     const internals = content as unknown as WorkspaceInternals;
 
-    content.notebook.setKind('command');
-    content.notebook.setSource('sleep 10');
+    content.notebook.setSource('!sleep 10');
     internals.runCell(false);
     await new Promise(resolve => setTimeout(resolve, 0));
 
     expect(content.notebook.cells[0].status).toBe('interrupted');
-    expect(content.commandHistory.values).toEqual(['sleep 10']);
+    expect(content.inputHistory.values).toEqual(['!sleep 10']);
     content.dispose();
   });
 
-  it('recalls per-tab history in a new AI cell', () => {
+  it('recalls shared AI and Command history in new AI cells per tab', () => {
     jest
       .spyOn(AgentSession.prototype, 'exec')
       .mockResolvedValue({ output: 'ok\n', returncode: 0, cwd: '/tmp' });
@@ -811,11 +1150,12 @@ describe('AgentWorkspaceContent command history', () => {
     const firstInternals = first as unknown as WorkspaceInternals;
     const secondInternals = second as unknown as WorkspaceInternals;
 
-    first.notebook.setKind('command');
-    first.notebook.setSource('first command');
+    first.notebook.setSource('!first command');
     firstInternals.runCell(false);
-    first.notebook.select(1);
-    first.notebook.enterEdit();
+    first.notebook.appendCell();
+    first.notebook.setSource('first prompt');
+    firstInternals.runCell(false);
+    first.notebook.setSource('unsubmitted draft');
     firstInternals.refresh();
 
     const firstInputs = first.node.querySelectorAll<HTMLTextAreaElement>(
@@ -830,7 +1170,15 @@ describe('AgentWorkspaceContent command history', () => {
         cancelable: true
       })
     );
-    expect(firstInput.value).toBe('first command');
+    expect(firstInput.value).toBe('first prompt');
+    firstInput.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'ArrowUp',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    expect(firstInput.value).toBe('!first command');
     firstInput.dispatchEvent(
       new KeyboardEvent('keydown', {
         key: 'ArrowDown',
@@ -838,9 +1186,16 @@ describe('AgentWorkspaceContent command history', () => {
         cancelable: true
       })
     );
-    expect(firstInput.value).toBe('');
+    expect(firstInput.value).toBe('first prompt');
+    firstInput.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'ArrowDown',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    expect(firstInput.value).toBe('unsubmitted draft');
 
-    second.notebook.setKind('command');
     second.notebook.enterEdit();
     secondInternals.refresh();
     const secondInput = second.node.querySelector<HTMLTextAreaElement>(
@@ -857,8 +1212,7 @@ describe('AgentWorkspaceContent command history', () => {
     );
     expect(secondInput.value).toBe('');
 
-    first.setCellKind('ai');
-    first.notebook.setSource('prompt text');
+    first.insertBelow();
     firstInternals.refresh();
     const aiInputs = first.node.querySelectorAll<HTMLTextAreaElement>(
       '.jp-AgentWorkspace-cellInput'
@@ -872,15 +1226,7 @@ describe('AgentWorkspaceContent command history', () => {
         cancelable: true
       })
     );
-    expect(aiInput.value).toBe('first command');
-    aiInput.dispatchEvent(
-      new KeyboardEvent('keydown', {
-        key: 'ArrowDown',
-        bubbles: true,
-        cancelable: true
-      })
-    );
-    expect(aiInput.value).toBe('prompt text');
+    expect(aiInput.value).toBe('first prompt');
 
     first.dispose();
     second.dispose();

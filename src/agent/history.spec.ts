@@ -1,8 +1,8 @@
-import { CommandHistory } from './history';
+import { WorkspaceInputHistory } from './history';
 
-describe('CommandHistory', () => {
-  it('stores non-empty commands oldest to newest and collapses consecutive duplicates', () => {
-    const history = new CommandHistory();
+describe('WorkspaceInputHistory', () => {
+  it('stores non-empty inputs oldest to newest and collapses consecutive duplicates', () => {
+    const history = new WorkspaceInputHistory();
 
     expect(history.add('')).toBe(false);
     expect(history.add('   ')).toBe(false);
@@ -14,8 +14,22 @@ describe('CommandHistory', () => {
     expect(history.values).toEqual(['first', 'second', 'first']);
   });
 
+  it('replaces entries when restoring persisted history', () => {
+    const history = new WorkspaceInputHistory();
+    history.add('old');
+
+    history.restore([' first ', '', 'second', 'second']);
+
+    expect(history.values).toEqual(['first', 'second']);
+    expect(history.browsing).toBe(false);
+    expect(history.previous('draft')).toEqual({
+      source: 'second',
+      browsing: true
+    });
+  });
+
   it('navigates from the draft through newer to older entries', () => {
-    const history = new CommandHistory();
+    const history = new WorkspaceInputHistory();
     history.add('first');
     history.add('second');
     history.add('third');
@@ -39,7 +53,7 @@ describe('CommandHistory', () => {
   });
 
   it('restores the captured draft after moving past the newest entry', () => {
-    const history = new CommandHistory();
+    const history = new WorkspaceInputHistory();
     history.add('first');
     history.add('second');
 
@@ -61,7 +75,7 @@ describe('CommandHistory', () => {
   });
 
   it('resets browsing and captures a new draft on the next navigation', () => {
-    const history = new CommandHistory();
+    const history = new WorkspaceInputHistory();
     history.add('first');
     history.add('second');
 

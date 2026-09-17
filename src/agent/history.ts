@@ -3,7 +3,7 @@ export interface HistoryNavigation {
   browsing: boolean;
 }
 
-export class CommandHistory {
+export class WorkspaceInputHistory {
   private readonly entries: string[] = [];
   private cursor: number | null = null;
   private draft = '';
@@ -16,14 +16,20 @@ export class CommandHistory {
     return this.cursor !== null;
   }
 
+  restore(entries: readonly string[]): void {
+    this.entries.length = 0;
+    this.resetNavigation();
+    entries.forEach(entry => this.add(entry));
+  }
+
   add(source: string): boolean {
-    const command = source.trim();
-    if (!command) return false;
-    if (this.entries[this.entries.length - 1] === command) {
+    const input = source.trim();
+    if (!input) return false;
+    if (this.entries[this.entries.length - 1] === input) {
       this.resetNavigation();
       return false;
     }
-    this.entries.push(command);
+    this.entries.push(input);
     this.resetNavigation();
     return true;
   }
