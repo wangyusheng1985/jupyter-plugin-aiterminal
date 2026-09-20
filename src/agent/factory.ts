@@ -72,7 +72,8 @@ export class AgentWorkspaceWidgetFactory extends ABCWidgetFactory<
       cwd || undefined
     );
     const widget = new DocumentWidget({ content, context });
-    installAgentToolbar(widget.toolbar, content);
+    const disposeToolbar = installAgentToolbar(widget.toolbar, content);
+    widget.disposed.connect(() => disposeToolbar());
     content.attachContext(context);
     widget.id = `agent-workspace:${context.path}`;
     widget.title.icon = terminalIcon;

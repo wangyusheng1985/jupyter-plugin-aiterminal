@@ -1,3 +1,8 @@
+import {
+  renderMarkdown,
+  type IRenderMimeRegistry
+} from '@jupyterlab/rendermime';
+
 import type { ChatBlock } from './protocol';
 import {
   createTurn,
@@ -19,7 +24,8 @@ function handlers() {
     onToggleActivity: jest.fn(),
     onToggleEvidence: jest.fn(),
     onToggleOutcome: jest.fn(),
-    onRevealFailure: jest.fn()
+    onRevealFailure: jest.fn(),
+    onRetry: jest.fn()
   };
 }
 
@@ -71,6 +77,50 @@ describe('renderTurn', () => {
         ?.getAttribute('aria-expanded')
     ).toBe('false');
     expect(node.querySelector('.jp-AgentWorkspace-executionRecord')).toBeNull();
+  });
+
+  it('keeps representative Markdown semantics inside the scoped outcome', () => {
+    jest.mocked(renderMarkdown).mockImplementationOnce(options => {
+      options.host.innerHTML = `
+        <h2>Summary</h2>
+        <p>Introductory paragraph.</p>
+        <ul>
+          <li>
+            <p>Primary item</p>
+            <ul><li>Nested item</li></ul>
+          </li>
+        </ul>
+        <pre><code>const ready = true;</code></pre>
+        <table><tbody><tr><td>value</td></tr></tbody></table>
+      `;
+      return Promise.resolve();
+    });
+    const turn = completedTurn([
+      {
+        kind: 'text',
+        id: 'text-semantic',
+        text: '## Summary\n\n- Primary item'
+      }
+    ]);
+
+    const node = renderTurn(turn, {
+      rendermime: {} as IRenderMimeRegistry,
+      handlers: handlers()
+    });
+    const body = node.querySelector('.jp-AgentWorkspace-outcomeBody');
+
+    expect(body?.classList.contains('jp-AgentWorkspace-outcomeBody')).toBe(
+      true
+    );
+    expect(body?.classList.contains('jp-RenderedHTMLCommon')).toBe(true);
+    expect(body?.classList.contains('jp-RenderedMarkdown')).toBe(true);
+    expect(body?.querySelector('h2')?.textContent).toBe('Summary');
+    expect(body?.querySelector('li > p')?.textContent).toBe('Primary item');
+    expect(body?.querySelector('li > ul > li')?.textContent).toBe(
+      'Nested item'
+    );
+    expect(body?.querySelector('pre code')?.textContent).toContain('ready');
+    expect(body?.querySelector('table td')?.textContent).toBe('value');
   });
 
   it('summarizes available audit metrics and omits unavailable values', () => {
@@ -325,5 +375,44 @@ describe('renderTurn', () => {
       'run-1',
       'activity-tool-1'
     );
+  });
+
+  it('offers retry for failed or interrupted turns but not successful turns', () => {
+    const failedHandlers = handlers();
+    const failedBlocks: ChatBlock[] = [
+      toolBlock('tool-failed', { status: 'error', output: 'failed' })
+    ];
+    const failed = setTurnStatus(
+      createTurn('run-failed'),
+      'done',
+      failedBlocks
+    );
+    const failedNode = renderTurn(failed, { handlers: failedHandlers });
+    const retry = failedNode.querySelector<HTMLButtonElement>(
+      '.jp-AgentWorkspace-retryTurn'
+    );
+    expect(retry?.textContent).toBe('Retry as new turn');
+    retry?.click();
+    expect(failedHandlers.onRetry).toHaveBeenCalledWith('run-failed');
+
+    const interrupted = setTurnStatus(
+      createTurn('run-interrupted'),
+      'interrupted',
+      []
+    );
+    expect(
+      renderTurn(interrupted, { handlers: handlers() }).querySelector(
+        '.jp-AgentWorkspace-retryTurn'
+      )
+    ).not.toBeNull();
+
+    const successful = setTurnStatus(createTurn('run-success'), 'done', [
+      toolBlock('tool-success')
+    ]);
+    expect(
+      renderTurn(successful, { handlers: handlers() }).querySelector(
+        '.jp-AgentWorkspace-retryTurn'
+      )
+    ).toBeNull();
   });
 });

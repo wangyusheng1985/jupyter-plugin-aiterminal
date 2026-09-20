@@ -15,6 +15,7 @@ export interface TurnRenderHandlers {
   onToggleEvidence: (turnId: string, activityId: string) => void;
   onToggleOutcome: (turnId: string) => void;
   onRevealFailure: (turnId: string, activityId: string) => void;
+  onRetry: (turnId: string) => void;
 }
 
 export interface TurnRenderOptions {
@@ -41,7 +42,42 @@ export function renderTurn(
   if (turn.timeline.length) {
     root.append(renderAuditSummary(turn, options));
   }
+  if (isRetryableTurn(turn)) {
+    root.append(renderRetryControl(turn, options));
+  }
   return root;
+}
+
+function renderRetryControl(
+  turn: ChatTurn,
+  options: TurnRenderOptions
+): HTMLElement {
+  const region = document.createElement('div');
+  region.className = 'jp-AgentWorkspace-retryRegion';
+  const retry = document.createElement('button');
+  retry.type = 'button';
+  retry.className = 'jp-AgentWorkspace-turnControl jp-AgentWorkspace-retryTurn';
+  retry.dataset.turnControl = '';
+  retry.textContent = 'Retry as new turn';
+  retry.addEventListener('click', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    options.handlers.onRetry(turn.id);
+  });
+  retry.addEventListener('mousedown', event => {
+    event.preventDefault();
+    event.stopPropagation();
+  });
+  region.append(retry);
+  return region;
+}
+
+function isRetryableTurn(turn: ChatTurn): boolean {
+  return (
+    turn.status === 'interrupted' ||
+    turn.status === 'error' ||
+    turn.diagnostics.length > 0
+  );
 }
 
 export function turnSummary(turn: ChatTurn): string {

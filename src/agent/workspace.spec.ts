@@ -3,6 +3,7 @@ import type { DocumentRegistry } from '@jupyterlab/docregistry';
 import {
   AgentWorkspaceContent,
   CellView,
+  StatusBar,
   type CellHandlers,
   renderBlock,
   renderCellOutput,
@@ -18,6 +19,10 @@ import {
 import { WorkspaceNotebook, type WorkspaceCell } from './notebook';
 import { AgentSession } from './session';
 import { createTurn, setTurnStatus, toggleActivity, toggleTrace } from './turn';
+import {
+  workspaceUiState,
+  type WorkspaceUiState
+} from './workspace-interaction';
 
 jest.mock('@jupyterlab/cells', () => ({
   OutputPlaceholder: class {
@@ -134,7 +139,8 @@ describe('renderCellOutput', () => {
       status: 'idle',
       executionCount: null,
       outputCollapsed: false,
-      ...overrides
+      ...overrides,
+      agentContextGeneration: overrides.agentContextGeneration ?? null
     };
   }
 
@@ -294,7 +300,8 @@ describe('CellView output state', () => {
       status: 'idle',
       executionCount: null,
       outputCollapsed: false,
-      ...overrides
+      ...overrides,
+      agentContextGeneration: overrides.agentContextGeneration ?? null
     };
   }
 
@@ -502,7 +509,8 @@ describe('CellView input history', () => {
       status: 'idle',
       executionCount: null,
       outputCollapsed: false,
-      ...overrides
+      ...overrides,
+      agentContextGeneration: overrides.agentContextGeneration ?? null
     };
   }
 
@@ -1052,7 +1060,8 @@ describe('AgentWorkspaceContent input history', () => {
     const internals = content as unknown as WorkspaceInternals;
     const status = content.node.querySelector('.jp-AgentWorkspace-status');
 
-    expect(status?.textContent).toBe('Local tools');
+    expect(status?.textContent).toContain('Local tools');
+    expect(status?.textContent).toContain('Ready');
     content.notebook.setSource('!pwd');
     internals.refresh();
     expect(status?.textContent).not.toMatch(/AI|Command/);
@@ -1498,5 +1507,1538 @@ describe('AgentWorkspaceContent input history', () => {
 
     first.dispose();
     second.dispose();
+  });
+});
+
+describe('AgentWorkspaceContent page interaction', () => {
+  const acceptedSessionId = '123e4567-e89b-12d3-a456-426614174000';
+
+  interface PageInternals {
+    refresh(): void;
+    runCell(advance: boolean): void;
+    onSessionChange(): void;
+    persistNow(): void;
+    saveCoordinator: {
+      flush(): Promise<void>;
+      state: {
+        phase: string;
+        requestedRevision: number;
+        savedRevision: number;
+      };
+    };
+    notebookView: {
+      isOutputTailNearViewport(cellId: string): boolean;
+      isEditingAnotherCell(cellId: string): boolean;
+      revealOutputTail(cellId: string): void;
+    };
+  }
+
+  function promiseController(): {
+    promise: Promise<void>;
+    resolve(): void;
+    reject(error: unknown): void;
+  } {
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    return { promise, resolve, reject };
+  }
+
+  function attachSaveContext(
+    content: AgentWorkspaceContent,
+    save: jest.Mock<Promise<unknown>, []>,
+    initialText = serializeNotebook(content.notebook)
+  ): {
+    context: DocumentRegistry.IContext<DocumentRegistry.ICodeModel>;
+    fromString: jest.Mock<void, [string]>;
+    text(): string;
+  } {
+    let text = initialText;
+    const fromString = jest.fn<void, [string]>(value => {
+      text = value;
+    });
+    const context = {
+      path: 'save-state.agentnb',
+      ready: Promise.resolve(),
+      isReady: true,
+      model: {
+        toString: () => text,
+        fromString,
+        contentChanged: { connect: jest.fn() }
+      },
+      save
+    } as unknown as DocumentRegistry.IContext<DocumentRegistry.ICodeModel>;
+    content.attachContext(context);
+    return { context, fromString, text: () => text };
+  }
+
+  beforeEach(() => {
+    jest.spyOn(AgentSession.prototype, 'connect').mockImplementation(() => {});
+    jest.spyOn(AgentSession.prototype, 'close').mockImplementation(() => {});
+    jest.spyOn(AgentSession.prototype, 'sendUser').mockImplementation(function (
+      this: AgentSession
+    ): void {
+      this.running = true;
+      this.error = null;
+    });
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  function rect(top: number, height: number, width = 800): DOMRect {
+    return {
+      top,
+      bottom: top + height,
+      left: 0,
+      right: width,
+      width,
+      height,
+      x: 0,
+      y: top,
+      toJSON: () => ({})
+    } as DOMRect;
+  }
+
+  function historicalWorkspace(
+    content: AgentWorkspaceContent,
+    draftSource = '结果如何了？'
+  ): { historical: WorkspaceCell; draft: WorkspaceCell } {
+    const historical = content.notebook.current;
+    historical.source = '清理磁盘空间';
+    historical.status = 'done';
+    historical.executionCount = 1;
+    historical.blocks = [
+      {
+        kind: 'text',
+        id: 'history-outcome',
+        text: '清理任务仍在后台运行。'
+      },
+      {
+        kind: 'tool',
+        id: 'history-task',
+        name: 'Bash',
+        input: { command: 'destructive historical command' },
+        output:
+          'Command running in background with ID: task-1. Output is being written to: /tmp/task-1.output. You will be notified when it completes.',
+        status: 'done'
+      }
+    ];
+    const draft = content.notebook.appendCell();
+    draft.source = draftSource;
+    return { historical, draft };
+  }
+
+  function acceptActiveAgentRun(
+    content: AgentWorkspaceContent,
+    internals: PageInternals
+  ): string {
+    const requestId = content.notebook.activeRun?.id;
+    expect(requestId).toBeDefined();
+    content.session.sessionId = acceptedSessionId;
+    content.session.acceptedTurnId = requestId ?? null;
+    internals.onSessionChange();
+    return requestId ?? '';
+  }
+
+  it('composes one notebook scroller and a reserved navigator inside the body', () => {
+    const content = new AgentWorkspaceContent(null);
+    const body = content.node.querySelector('.jp-AgentWorkspace-body');
+
+    expect(body).not.toBeNull();
+    expect(body?.querySelectorAll('.jp-AgentWorkspace-notebook')).toHaveLength(
+      1
+    );
+    expect(body?.querySelectorAll('.jp-AgentWorkspace-navigator')).toHaveLength(
+      1
+    );
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-status')?.parentElement
+    ).toBe(content.node);
+    content.dispose();
+  });
+
+  it('renders fixed status regions for connection, cwd, and execution state', () => {
+    const onStartNewContext = jest.fn();
+    const onContinueFromHistory = jest.fn();
+    const onStartEmptyContext = jest.fn();
+    const onDismissContextChoice = jest.fn();
+    const onRevealFailure = jest.fn();
+    const onRevealInterrupted = jest.fn();
+    const onOpenHistory = jest.fn();
+    const onRetrySave = jest.fn();
+    const status = new StatusBar({
+      onStartNewContext,
+      onContinueFromHistory,
+      onStartEmptyContext,
+      onDismissContextChoice,
+      onRevealFailure,
+      onRevealInterrupted,
+      onOpenHistory,
+      onRetrySave
+    });
+    const overview = {
+      submittedCount: 2,
+      aiCount: 2,
+      commandCount: 0,
+      queuedCount: 0,
+      runningCount: 1,
+      interruptedCount: 1,
+      failureCount: 2,
+      firstFailureCellId: 'cell-1',
+      firstInterruptedCellId: 'cell-2',
+      summaryLabel: '2 turns · 1 interrupted · 2 failed'
+    };
+    status.sync(
+      {
+        connected: false,
+        error: 'offline',
+        cwd: '/a/very/long/workspace/path',
+        selectedCellId: 'cell-1',
+        activeRun: { id: 'run-1', cellId: 'cell-1' },
+        queueCount: 2,
+        contextState: 'unavailable',
+        interruptAvailable: true,
+        connectionLabel: 'Connection error',
+        executionLabel: 'Running cell-1 · Queue 2',
+        contextLabel: 'Context: Unavailable',
+        savePhase: 'error',
+        saveLabel: 'Not saved',
+        saveRetryAvailable: true
+      },
+      overview
+    );
+
+    expect(
+      status.node.querySelector('.jp-AgentWorkspace-statusConnection')
+        ?.textContent
+    ).toBe('Connection error');
+    expect(
+      status.node
+        .querySelector('.jp-AgentWorkspace-statusConnection')
+        ?.classList.contains('is-error')
+    ).toBe(true);
+    expect(
+      status.node.querySelector('.jp-AgentWorkspace-statusCwd')?.textContent
+    ).toBe('/a/very/long/workspace/path');
+    expect(
+      status.node.querySelector('.jp-AgentWorkspace-statusExecution')
+        ?.textContent
+    ).toBe('Running cell-1 · Queue 2');
+    expect(
+      status.node.querySelector('.jp-AgentWorkspace-statusContext')?.textContent
+    ).toBe('Context: Unavailable');
+    const saveStatus = status.node.querySelector(
+      '.jp-AgentWorkspace-statusSave'
+    );
+    expect(saveStatus?.textContent).toBe('Not savedRetry');
+    expect(saveStatus?.classList.contains('is-error')).toBe(true);
+    const retrySave = status.node.querySelector<HTMLButtonElement>(
+      '.jp-AgentWorkspace-retrySave'
+    );
+    expect(retrySave?.hidden).toBe(false);
+    expect(retrySave?.getAttribute('aria-label')).toBe(
+      'Retry saving workspace'
+    );
+    retrySave?.click();
+    retrySave?.click();
+    expect(onRetrySave).toHaveBeenCalledTimes(1);
+    document.body.append(status.node);
+    const context = status.node.querySelector<HTMLButtonElement>(
+      '.jp-AgentWorkspace-statusContext'
+    );
+    const savingState = workspaceUiState({
+      connected: false,
+      error: 'offline',
+      cwd: '/a/very/long/workspace/path',
+      selectedCellId: 'cell-1',
+      activeRun: { id: 'run-1', cellId: 'cell-1' },
+      queueCount: 2,
+      contextState: 'unavailable',
+      savePhase: 'saving'
+    });
+    context?.focus();
+    status.sync(savingState, overview);
+    expect(document.activeElement).toBe(context);
+    expect(
+      status.node.querySelector('.jp-AgentWorkspace-statusSaveText')
+        ?.textContent
+    ).toBe('Saving…');
+    expect(retrySave?.hidden).toBe(true);
+    status.sync(
+      workspaceUiState({ ...savingState, savePhase: 'saved' }),
+      overview
+    );
+    expect(
+      status.node.querySelector('.jp-AgentWorkspace-statusSaveText')
+        ?.textContent
+    ).toBe('Saved');
+    expect(document.activeElement).toBe(context);
+    status.node
+      .querySelector<HTMLButtonElement>('.jp-AgentWorkspace-statusOverview')
+      ?.click();
+    expect(onOpenHistory).toHaveBeenCalledTimes(1);
+    status.node
+      .querySelector<HTMLButtonElement>(
+        '.jp-AgentWorkspace-statusIssue.is-failed'
+      )
+      ?.click();
+    expect(onRevealFailure).toHaveBeenCalledWith('cell-1');
+    status.node
+      .querySelector<HTMLButtonElement>(
+        '.jp-AgentWorkspace-statusIssue.is-interrupted'
+      )
+      ?.click();
+    expect(onRevealInterrupted).toHaveBeenCalledWith('cell-2');
+    context?.click();
+    expect(
+      status.node.querySelector<HTMLElement>(
+        '.jp-AgentWorkspace-contextPopover'
+      )?.hidden
+    ).toBe(false);
+    status.node.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Escape',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    expect(
+      status.node.querySelector<HTMLElement>(
+        '.jp-AgentWorkspace-contextPopover'
+      )?.hidden
+    ).toBe(true);
+    context?.click();
+    expect(onStartNewContext).not.toHaveBeenCalled();
+    const reset = status.node.querySelector<HTMLButtonElement>(
+      '.jp-AgentWorkspace-resetContext'
+    );
+    expect(reset?.disabled).toBe(true);
+    if (reset) reset.disabled = false;
+    reset?.click();
+    expect(onStartNewContext).toHaveBeenCalledTimes(1);
+    status.dispose();
+    status.node.remove();
+  });
+
+  it('configures saved context before the first production connection', async () => {
+    const connect = jest.mocked(AgentSession.prototype.connect);
+    connect.mockClear();
+    const content = new AgentWorkspaceContent(null);
+    expect(connect).not.toHaveBeenCalled();
+    const id = '123e4567-e89b-12d3-a456-426614174000';
+    const context = {
+      path: 'resume.agentnb',
+      ready: Promise.resolve(),
+      isReady: true,
+      model: {
+        toString: () =>
+          JSON.stringify({
+            version: 3,
+            active: 0,
+            agentSessionId: id,
+            cells: []
+          }),
+        fromString: jest.fn(),
+        contentChanged: { connect: jest.fn() }
+      },
+      save: jest.fn().mockResolvedValue(undefined)
+    } as unknown as DocumentRegistry.IContext<DocumentRegistry.ICodeModel>;
+
+    content.attachContext(context);
+    await Promise.resolve();
+
+    expect(content.session.sessionId).toBe(id);
+    expect(connect).toHaveBeenCalledTimes(1);
+    content.dispose();
+  });
+
+  it('persists a confirmed session ID without storing runtime secrets', async () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    let text = serializeNotebook(content.notebook);
+    const fromString = jest.fn((value: string) => {
+      text = value;
+    });
+    const context = {
+      path: 'persist-session.agentnb',
+      ready: Promise.resolve(),
+      isReady: true,
+      model: {
+        toString: () => text,
+        fromString,
+        contentChanged: { connect: jest.fn() }
+      },
+      save: jest.fn().mockResolvedValue(undefined)
+    } as unknown as DocumentRegistry.IContext<DocumentRegistry.ICodeModel>;
+    content.attachContext(context);
+    await Promise.resolve();
+    const id = '123e4567-e89b-12d3-a456-426614174000';
+    content.session.sessionId = id;
+    content.session.contextState = 'live';
+
+    internals.onSessionChange();
+    internals.persistNow();
+
+    expect(JSON.parse(text).agentSessionId).toBe(id);
+    expect(text).not.toMatch(
+      /token|password|transcript|savePhase|requestedRevision|savedRevision|retrySave/i
+    );
+    content.notebook.current.output = 'output-only update';
+    internals.refresh();
+    expect(fromString).toHaveBeenCalledTimes(1);
+    content.dispose();
+  });
+
+  it('restores an idle external model as saved without writing it back', async () => {
+    const content = new AgentWorkspaceContent(null);
+    const external = new WorkspaceNotebook();
+    external.current.source = 'external authoritative state';
+    let text = serializeNotebook(content.notebook);
+    let contentChanged: {
+      slot: () => void;
+      thisArg: AgentWorkspaceContent;
+    } | null = null;
+    const fromString = jest.fn((value: string) => {
+      text = value;
+    });
+    const save = jest.fn().mockResolvedValue(undefined);
+    const context = {
+      path: 'external.agentnb',
+      ready: Promise.resolve(),
+      isReady: true,
+      model: {
+        toString: () => text,
+        fromString,
+        contentChanged: {
+          connect: jest.fn(
+            (slot: () => void, thisArg: AgentWorkspaceContent) => {
+              contentChanged = { slot, thisArg };
+            }
+          )
+        }
+      },
+      save
+    } as unknown as DocumentRegistry.IContext<DocumentRegistry.ICodeModel>;
+    content.attachContext(context);
+    await Promise.resolve();
+
+    text = serializeNotebook(external);
+    const change = contentChanged as {
+      slot: () => void;
+      thisArg: AgentWorkspaceContent;
+    } | null;
+    change?.slot.call(change.thisArg);
+
+    expect(content.notebook.current.source).toBe(
+      'external authoritative state'
+    );
+    expect(content.uiState.savePhase).toBe('saved');
+    expect(save).not.toHaveBeenCalled();
+    expect(fromString).not.toHaveBeenCalled();
+    content.dispose();
+  });
+
+  it('shows durable save truth and retries failure without moving focus', async () => {
+    const first = promiseController();
+    const second = promiseController();
+    const save = jest
+      .fn<Promise<unknown>, []>()
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise);
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    attachSaveContext(content, save);
+    await Promise.resolve();
+    document.body.append(content.node);
+    const editor = content.node.querySelector<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    );
+    editor?.focus();
+    content.notebook.current.source = 'durable draft';
+
+    internals.persistNow();
+
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-statusSaveText')
+        ?.textContent
+    ).toBe('Saving…');
+    expect(document.activeElement).toBe(editor);
+
+    first.reject(new Error('disk unavailable'));
+    await expect(internals.saveCoordinator.flush()).rejects.toThrow(
+      'disk unavailable'
+    );
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-statusSaveText')
+        ?.textContent
+    ).toBe('Not saved');
+    const retry = content.node.querySelector<HTMLButtonElement>(
+      '.jp-AgentWorkspace-retrySave'
+    );
+    expect(retry?.hidden).toBe(false);
+    expect(document.activeElement).toBe(editor);
+
+    retry?.click();
+    retry?.click();
+    expect(save).toHaveBeenCalledTimes(2);
+    expect(retry?.hidden).toBe(true);
+    second.resolve();
+    await internals.saveCoordinator.flush();
+
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-statusSaveText')
+        ?.textContent
+    ).toBe('Saved');
+    expect(document.activeElement).toBe(editor);
+    content.dispose();
+    content.node.remove();
+  });
+
+  it('coalesces workspace mutations made during an in-flight save', async () => {
+    const first = promiseController();
+    const second = promiseController();
+    const save = jest
+      .fn<Promise<unknown>, []>()
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise);
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    const attached = attachSaveContext(content, save);
+    await Promise.resolve();
+
+    content.notebook.current.source = 'first revision';
+    internals.persistNow();
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(attached.text()).cells[0].source).toBe('first revision');
+
+    content.notebook.current.source = 'latest revision';
+    internals.persistNow();
+    expect(save).toHaveBeenCalledTimes(1);
+
+    first.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(save).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(attached.text()).cells[0].source).toBe('latest revision');
+
+    second.resolve();
+    await internals.saveCoordinator.flush();
+    expect(internals.saveCoordinator.state).toMatchObject({
+      phase: 'saved',
+      requestedRevision: 2,
+      savedRevision: 2
+    });
+    content.dispose();
+  });
+
+  it('keeps AI execution usable while recovering from a save failure', async () => {
+    const save = jest
+      .fn<Promise<unknown>, []>()
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce(undefined);
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    attachSaveContext(content, save);
+    await Promise.resolve();
+    content.notebook.current.source = 'first unsaved draft';
+    internals.persistNow();
+    await expect(internals.saveCoordinator.flush()).rejects.toThrow('offline');
+    const sendUser = jest.spyOn(content.session, 'sendUser');
+
+    content.notebook.current.source = 'run while recovering';
+    internals.runCell(false);
+
+    expect(sendUser).toHaveBeenCalledWith(
+      'run while recovering',
+      expect.any(String)
+    );
+    expect(content.notebook.activeRun).not.toBeNull();
+    expect(internals.saveCoordinator.state.phase).toBe('pending');
+    await internals.saveCoordinator.flush();
+    expect(internals.saveCoordinator.state.phase).toBe('saved');
+    content.dispose();
+  });
+
+  it('drains the newest save before closing the Agent session', async () => {
+    const first = promiseController();
+    const second = promiseController();
+    const save = jest
+      .fn<Promise<unknown>, []>()
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise);
+    const close = jest.mocked(AgentSession.prototype.close);
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    attachSaveContext(content, save);
+    await Promise.resolve();
+
+    content.notebook.current.source = 'older revision';
+    internals.persistNow();
+    content.notebook.current.source = 'shutdown revision';
+    internals.persistNow();
+    const shutdown = content.shutdownOnce();
+    expect(content.shutdownOnce()).toBe(shutdown);
+    expect(close).not.toHaveBeenCalled();
+
+    first.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(save).toHaveBeenCalledTimes(2);
+    expect(close).not.toHaveBeenCalled();
+
+    second.resolve();
+    await shutdown;
+    expect(close).toHaveBeenCalledTimes(1);
+    content.dispose();
+  });
+
+  it('releases the Agent session when the final shutdown save fails', async () => {
+    const save = jest
+      .fn<Promise<unknown>, []>()
+      .mockRejectedValue(new Error('save failed'));
+    const close = jest.mocked(AgentSession.prototype.close);
+    const consoleError = jest.spyOn(console, 'error').mockImplementation();
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    attachSaveContext(content, save);
+    await Promise.resolve();
+    content.notebook.current.source = 'unsaved shutdown';
+    internals.persistNow();
+
+    await content.shutdownOnce();
+
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(internals.saveCoordinator.state.phase).toBe('error');
+    expect(consoleError).toHaveBeenCalledWith(
+      expect.stringContaining('not saved during shutdown')
+    );
+    content.dispose();
+  });
+
+  it('blocks unavailable AI work, keeps Command work usable, and resets safely', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    const exec = jest
+      .spyOn(content.session, 'exec')
+      .mockReturnValue(new Promise(() => undefined));
+    content.notebook.current.source = 'continue old work';
+    content.notebook.current.status = 'idle';
+    content.session.contextState = 'unavailable';
+    content.notebook.agentSessionId = '123e4567-e89b-12d3-a456-426614174000';
+    content.notebook.agentContextGeneration = 2;
+    const cellsBefore = content.notebook.cells.length;
+
+    internals.runCell(false);
+    expect(content.notebook.activeRun).toBeNull();
+    expect(content.notebook.cells).toHaveLength(cellsBefore);
+
+    content.notebook.current.source = '!pwd';
+    internals.runCell(false);
+    expect(exec).toHaveBeenCalledWith('pwd');
+
+    content.notebook.clearRuns();
+    internals.refresh();
+    content.node
+      .querySelector<HTMLButtonElement>('.jp-AgentWorkspace-statusContext')
+      ?.click();
+    content.node
+      .querySelector<HTMLButtonElement>('.jp-AgentWorkspace-resetContext')
+      ?.click();
+    expect(content.notebook.agentSessionId).toBeNull();
+    expect(content.notebook.agentContextGeneration).toBe(3);
+    expect(content.notebook.cells).toHaveLength(cellsBefore + 1);
+    expect(content.session.contextState).toBe('reset');
+    content.dispose();
+  });
+
+  it('gates uncovered AI history while keeping Command execution available', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    const { draft } = historicalWorkspace(content);
+    const sendUser = jest.spyOn(content.session, 'sendUser');
+    const exec = jest
+      .spyOn(content.session, 'exec')
+      .mockReturnValue(new Promise(() => undefined));
+    internals.refresh();
+
+    internals.runCell(false);
+
+    expect(content.notebook.activeRun).toBeNull();
+    expect(draft).toMatchObject({
+      source: '结果如何了？',
+      status: 'idle',
+      executionCount: null,
+      agentContextGeneration: null
+    });
+    expect(sendUser).not.toHaveBeenCalled();
+    expect(
+      content.node.querySelector<HTMLElement>(
+        '.jp-AgentWorkspace-historyChoice'
+      )?.hidden
+    ).toBe(false);
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-historyChoiceDescription')
+        ?.textContent
+    ).toContain('outside the current Agent context');
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-statusContext')
+        ?.textContent
+    ).toContain('1 outside');
+
+    const command = content.notebook.appendCell();
+    command.source = '!pwd';
+    internals.runCell(false);
+
+    expect(exec).toHaveBeenCalledWith('pwd');
+    expect(sendUser).not.toHaveBeenCalled();
+    expect(
+      content.node.querySelector<HTMLElement>(
+        '.jp-AgentWorkspace-historyChoice'
+      )?.hidden
+    ).toBe(false);
+    content.dispose();
+  });
+
+  it('gates restored version 4 coverage when its session link is missing', () => {
+    const source = new WorkspaceNotebook();
+    const bridged = source.current;
+    bridged.source = 'visible bridged history';
+    bridged.status = 'done';
+    bridged.executionCount = 1;
+    const native = source.insertBelow();
+    native.source = 'visible native history';
+    native.status = 'done';
+    native.executionCount = 2;
+    native.agentContextGeneration = 0;
+    const draft = source.insertBelow();
+    draft.source = '结果如何了？';
+    source.agentContextBridges = [{ generation: 0, cellIds: [bridged.id] }];
+    source.agentSessionId = null;
+
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    restoreNotebook(content.notebook, serializeNotebook(source));
+    const sendUser = jest.spyOn(content.session, 'sendUser');
+    internals.refresh();
+    internals.runCell(false);
+
+    expect(content.notebook.cells[1].agentContextGeneration).toBeNull();
+    expect(content.notebook.agentContextBridges).toEqual([]);
+    expect(content.notebook.activeRun).toBeNull();
+    expect(sendUser).not.toHaveBeenCalled();
+    expect(
+      content.node.querySelector<HTMLElement>(
+        '.jp-AgentWorkspace-historyChoice'
+      )?.hidden
+    ).toBe(false);
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-statusContext')
+        ?.textContent
+    ).toContain('2 outside');
+    content.dispose();
+  });
+
+  it('submits a bounded bridge exactly once and preserves visible source', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    const { historical, draft } = historicalWorkspace(content);
+    const sendUser = jest.spyOn(content.session, 'sendUser');
+    internals.refresh();
+    internals.runCell(false);
+    const continueButton = content.node.querySelector<HTMLButtonElement>(
+      '.jp-AgentWorkspace-contextChoice.is-primary'
+    );
+
+    continueButton?.click();
+
+    expect(sendUser).toHaveBeenCalledTimes(1);
+    expect(sendUser).toHaveBeenCalledWith(
+      '结果如何了？',
+      expect.any(String),
+      expect.objectContaining({
+        version: 1,
+        turns: [
+          expect.objectContaining({
+            cellId: historical.id,
+            source: '清理磁盘空间',
+            taskIds: ['task-1']
+          })
+        ],
+        tasks: [
+          expect.objectContaining({
+            taskId: 'task-1',
+            outputPath: '/tmp/task-1.output'
+          })
+        ]
+      })
+    );
+    expect(draft.source).toBe('结果如何了？');
+    expect(draft.agentContextGeneration).toBeNull();
+    expect(content.notebook.agentContextBridges).toEqual([]);
+    expect(continueButton?.disabled).toBe(true);
+    expect(continueButton?.textContent).toBe('Continuing…');
+    expect(
+      content.node
+        .querySelector('.jp-AgentWorkspace-historyChoice')
+        ?.getAttribute('aria-busy')
+    ).toBe('true');
+
+    continueButton?.click();
+    expect(sendUser).toHaveBeenCalledTimes(1);
+    content.node.querySelector('.jp-AgentWorkspace-status')?.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Escape',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    expect(
+      content.node.querySelector<HTMLElement>(
+        '.jp-AgentWorkspace-contextPopover'
+      )?.hidden
+    ).toBe(false);
+
+    acceptActiveAgentRun(content, internals);
+
+    expect(content.notebook.agentSessionId).toBe(acceptedSessionId);
+    expect(draft.agentContextGeneration).toBe(0);
+    expect(content.notebook.agentContextBridges).toEqual([
+      { generation: 0, cellIds: [historical.id] }
+    ]);
+    const reopened = new WorkspaceNotebook();
+    restoreNotebook(reopened, serializeNotebook(content.notebook));
+    expect(reopened.agentSessionId).toBe(acceptedSessionId);
+    expect(reopened.agentContextBridges).toEqual([
+      { generation: 0, cellIds: [historical.id] }
+    ]);
+    expect(
+      reopened.cells.find(cell => cell.id === draft.id)?.agentContextGeneration
+    ).toBe(0);
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-statusContext')
+        ?.textContent
+    ).toContain('1 bridged');
+    content.node
+      .querySelector<HTMLButtonElement>('.jp-AgentWorkspace-statusContext')
+      ?.click();
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-contextDescription')
+        ?.textContent
+    ).toContain('Coverage: 1 native, 1 bridged, 0 outside.');
+    content.dispose();
+  });
+
+  it('returns focus from the hidden acceptance control to the submitted Cell', async () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    historicalWorkspace(content);
+    document.body.append(content.node);
+    internals.refresh();
+    internals.runCell(false);
+    await Promise.resolve();
+    const continueButton = content.node.querySelector<HTMLButtonElement>(
+      '.jp-AgentWorkspace-contextChoice.is-primary'
+    );
+    expect(document.activeElement).toBe(continueButton);
+
+    continueButton?.click();
+    acceptActiveAgentRun(content, internals);
+    await Promise.resolve();
+
+    expect(document.activeElement).toBe(
+      content.node.querySelectorAll('.jp-AgentWorkspace-cellInput')[1]
+    );
+    expect(document.activeElement).not.toBe(continueButton);
+    content.dispose();
+    content.node.remove();
+  });
+
+  it('returns focus after pre-acceptance failure without stealing it from an advanced draft', async () => {
+    const failed = new AgentWorkspaceContent(null);
+    const failedInternals = failed as unknown as PageInternals;
+    historicalWorkspace(failed);
+    document.body.append(failed.node);
+    failedInternals.refresh();
+    failedInternals.runCell(false);
+    await Promise.resolve();
+    failed.node
+      .querySelector<HTMLButtonElement>(
+        '.jp-AgentWorkspace-contextChoice.is-primary'
+      )
+      ?.click();
+    failed.session.error = 'query rejected';
+    failed.session.running = false;
+    failedInternals.onSessionChange();
+    await Promise.resolve();
+    expect(document.activeElement).toBe(
+      failed.node.querySelectorAll('.jp-AgentWorkspace-cellInput')[1]
+    );
+    failed.dispose();
+    failed.node.remove();
+
+    const advanced = new AgentWorkspaceContent(null);
+    const advancedInternals = advanced as unknown as PageInternals;
+    const { draft } = historicalWorkspace(advanced);
+    document.body.append(advanced.node);
+    advancedInternals.refresh();
+    advancedInternals.runCell(true);
+    await Promise.resolve();
+    advanced.node
+      .querySelector<HTMLButtonElement>(
+        '.jp-AgentWorkspace-contextChoice.is-primary'
+      )
+      ?.click();
+    const nextDraft = advanced.notebook.current;
+    expect(nextDraft.id).not.toBe(draft.id);
+    const nextEditor = advanced.node.querySelectorAll<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    )[2];
+    expect(document.activeElement).toBe(nextEditor);
+
+    acceptActiveAgentRun(advanced, advancedInternals);
+    await Promise.resolve();
+
+    expect(document.activeElement).toBe(nextEditor);
+    advanced.dispose();
+    advanced.node.remove();
+  });
+
+  it('starts an explicit empty generation before submitting the draft', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    const { historical, draft } = historicalWorkspace(content);
+    content.notebook.agentSessionId = '123e4567-e89b-12d3-a456-426614174000';
+    content.session.sessionId = content.notebook.agentSessionId;
+    content.session.contextState = 'resumed';
+    const sendUser = jest.spyOn(content.session, 'sendUser');
+    internals.refresh();
+    internals.runCell(false);
+
+    const emptyButton = content.node.querySelector<HTMLButtonElement>(
+      '.jp-AgentWorkspace-contextChoice.is-secondary'
+    );
+    emptyButton?.click();
+
+    expect(content.notebook.agentSessionId).toBeNull();
+    expect(content.notebook.agentContextGeneration).toBe(1);
+    expect(content.notebook.agentContextBridges).toEqual([
+      { generation: 1, cellIds: [] }
+    ]);
+    expect(historical.agentContextGeneration).toBeNull();
+    expect(draft.agentContextGeneration).toBeNull();
+    expect(emptyButton?.disabled).toBe(true);
+    expect(emptyButton?.textContent).toBe('Starting…');
+    expect(sendUser).toHaveBeenCalledWith('结果如何了？', expect.any(String));
+
+    acceptActiveAgentRun(content, internals);
+
+    expect(historical.agentContextGeneration).toBeNull();
+    expect(draft.agentContextGeneration).toBe(1);
+    content.dispose();
+  });
+
+  it('does not commit bridge membership when the SDK rejects before acceptance', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    const { historical, draft } = historicalWorkspace(content);
+    historical.agentContextGeneration = 2;
+    content.notebook.agentContextGeneration = 2;
+    content.notebook.agentContextBridges = [
+      { generation: 1, cellIds: [historical.id] }
+    ];
+    content.session.contextState = 'unavailable';
+    content.notebook.agentSessionId = '123e4567-e89b-12d3-a456-426614174000';
+    internals.refresh();
+    internals.runCell(false);
+
+    content.node
+      .querySelector<HTMLButtonElement>(
+        '.jp-AgentWorkspace-contextChoice.is-primary'
+      )
+      ?.click();
+
+    expect(content.notebook.agentContextGeneration).toBe(3);
+    expect(draft.agentContextGeneration).toBeNull();
+    expect(content.notebook.agentContextBridges).toEqual([
+      { generation: 1, cellIds: [historical.id] }
+    ]);
+
+    content.session.error = 'query rejected';
+    content.session.running = false;
+    internals.onSessionChange();
+
+    expect(draft.agentContextGeneration).toBeNull();
+    expect(content.notebook.agentContextBridges).toEqual([
+      { generation: 1, cellIds: [historical.id] }
+    ]);
+    expect(historical.agentContextGeneration).toBe(2);
+    expect(draft.status).toBe('interrupted');
+    expect(
+      content.node.querySelector<HTMLElement>(
+        '.jp-AgentWorkspace-contextPopover'
+      )?.hidden
+    ).toBe(true);
+    content.dispose();
+  });
+
+  it('cancels a pending context choice when the draft changes or is deleted', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    historicalWorkspace(content);
+    const sendUser = jest.spyOn(content.session, 'sendUser');
+    document.body.append(content.node);
+    internals.refresh();
+    internals.runCell(false);
+    const editor = content.node.querySelectorAll<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    )[1];
+
+    editor.value = 'changed draft';
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+
+    expect(sendUser).not.toHaveBeenCalled();
+    expect(
+      content.node.querySelector<HTMLElement>(
+        '.jp-AgentWorkspace-contextPopover'
+      )?.hidden
+    ).toBe(true);
+
+    internals.runCell(false);
+    content.deleteActive();
+    expect(
+      content.node.querySelector<HTMLElement>(
+        '.jp-AgentWorkspace-contextPopover'
+      )?.hidden
+    ).toBe(true);
+    expect(sendUser).not.toHaveBeenCalled();
+    content.dispose();
+    content.node.remove();
+  });
+
+  it('restores draft focus when the context choice is dismissed with Escape', async () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    historicalWorkspace(content);
+    const sendUser = jest.spyOn(content.session, 'sendUser');
+    document.body.append(content.node);
+    internals.refresh();
+    internals.runCell(false);
+    await Promise.resolve();
+    expect(document.activeElement).toBe(
+      content.node.querySelector('.jp-AgentWorkspace-contextChoice.is-primary')
+    );
+
+    content.node.querySelector('.jp-AgentWorkspace-status')?.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Escape',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+
+    expect(sendUser).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(
+      content.node.querySelectorAll('.jp-AgentWorkspace-cellInput')[1]
+    );
+    content.dispose();
+    content.node.remove();
+  });
+
+  it('replaces unavailable context only after explicit bridge recovery', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    const { historical, draft } = historicalWorkspace(content);
+    const stale = '123e4567-e89b-12d3-a456-426614174000';
+    content.notebook.agentSessionId = stale;
+    content.notebook.agentContextGeneration = 2;
+    content.notebook.agentContextBridges = [{ generation: 2, cellIds: [] }];
+    historical.agentContextGeneration = 2;
+    content.session.sessionId = stale;
+    content.session.contextState = 'unavailable';
+    const originalBlocks = historical.blocks;
+    const sendUser = jest.spyOn(content.session, 'sendUser');
+    internals.refresh();
+
+    internals.runCell(false);
+    expect(content.notebook.agentSessionId).toBe(stale);
+    expect(sendUser).not.toHaveBeenCalled();
+    const recovery = content.node.querySelector(
+      '.jp-AgentWorkspace-historyChoiceDescription'
+    );
+    expect(recovery?.getAttribute('role')).toBe('status');
+    expect(recovery?.getAttribute('aria-live')).toBe('polite');
+    expect(recovery?.textContent).toContain(
+      'The saved Agent context could not be resumed.'
+    );
+    expect(recovery?.textContent).not.toContain(
+      'outside the current Agent context'
+    );
+    content.node
+      .querySelector<HTMLButtonElement>(
+        '.jp-AgentWorkspace-contextChoice.is-primary'
+      )
+      ?.click();
+
+    expect(content.notebook.agentSessionId).toBeNull();
+    expect(content.notebook.agentContextGeneration).toBe(3);
+    expect(content.notebook.agentContextBridges).toEqual([
+      { generation: 2, cellIds: [] }
+    ]);
+    expect(draft.agentContextGeneration).toBeNull();
+
+    acceptActiveAgentRun(content, internals);
+
+    expect(content.notebook.agentContextBridges).toEqual([
+      { generation: 2, cellIds: [] },
+      { generation: 3, cellIds: [historical.id] }
+    ]);
+    expect(draft.agentContextGeneration).toBe(3);
+    expect(historical.blocks).toBe(originalBlocks);
+    expect(draft.source).toBe('结果如何了？');
+    expect(sendUser).toHaveBeenCalledTimes(1);
+    content.dispose();
+  });
+
+  it('keeps keyed navigator entries and selects without entering edit mode', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    const first = content.notebook.current;
+    first.source = 'first prompt';
+    first.status = 'done';
+    first.executionCount = 1;
+    const second = content.notebook.appendCell();
+    second.source = '!second command';
+    second.kind = 'command';
+    second.status = 'done';
+    second.executionCount = 2;
+    content.notebook.select(0);
+    content.notebook.enterEdit();
+    internals.refresh();
+    const firstMarker = content.node.querySelector(
+      '.jp-AgentWorkspace-navigatorItem[data-cell-id="' + first.id + '"]'
+    );
+
+    second.output = 'stream-only change';
+    internals.refresh();
+    expect(
+      content.node.querySelector(
+        '.jp-AgentWorkspace-navigatorItem[data-cell-id="' + first.id + '"]'
+      )
+    ).toBe(firstMarker);
+
+    content.node
+      .querySelector<HTMLButtonElement>(
+        '.jp-AgentWorkspace-navigatorItem[data-cell-id="' + second.id + '"]'
+      )
+      ?.click();
+    expect(content.notebook.current.id).toBe(second.id);
+    expect(content.notebook.mode).toBe('command');
+    content.dispose();
+  });
+
+  it('prepares a failed retry as a new focused draft without executing it', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    document.body.append(content.node);
+    const source = content.notebook.current;
+    source.source = 'repair the failing step';
+    source.status = 'interrupted';
+    source.executionCount = 9;
+    source.blocks = [
+      {
+        kind: 'tool',
+        id: 'tool-failed',
+        name: 'Bash',
+        input: { command: 'false' },
+        output: 'failed',
+        status: 'error'
+      }
+    ];
+    source.turn = setTurnStatus(
+      createTurn('run-failed'),
+      'interrupted',
+      source.blocks
+    );
+    const originalTurn = source.turn;
+    internals.refresh();
+    const sendUser = jest.spyOn(content.session, 'sendUser');
+
+    content.node
+      .querySelector<HTMLButtonElement>('.jp-AgentWorkspace-retryTurn')
+      ?.click();
+
+    expect(content.notebook.cells).toHaveLength(2);
+    expect(content.notebook.active).toBe(1);
+    expect(content.notebook.mode).toBe('edit');
+    expect(content.notebook.current).toMatchObject({
+      source: 'repair the failing step',
+      status: 'idle',
+      executionCount: null,
+      blocks: [],
+      turn: null
+    });
+    expect(source.turn).toBe(originalTurn);
+    expect(source.status).toBe('interrupted');
+    expect(sendUser).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(
+      content.node.querySelectorAll('.jp-AgentWorkspace-cellInput')[1]
+    );
+    content.dispose();
+    content.node.remove();
+  });
+
+  it('tracks the viewport Cell without changing notebook selection or edit mode', () => {
+    const originalObserver = globalThis.IntersectionObserver;
+    const observerState: {
+      callback?: IntersectionObserverCallback;
+      observer?: IntersectionObserver;
+    } = {};
+    class FakeIntersectionObserver {
+      readonly root = null;
+      readonly rootMargin = '';
+      readonly thresholds = [0];
+      observe = jest.fn();
+      unobserve = jest.fn();
+      disconnect = jest.fn();
+      takeRecords = jest.fn(() => []);
+      constructor(next: IntersectionObserverCallback) {
+        observerState.callback = next;
+        observerState.observer = this as unknown as IntersectionObserver;
+      }
+    }
+    Object.defineProperty(globalThis, 'IntersectionObserver', {
+      configurable: true,
+      value: FakeIntersectionObserver
+    });
+
+    try {
+      const content = new AgentWorkspaceContent(null);
+      const internals = content as unknown as PageInternals;
+      const first = content.notebook.current;
+      first.source = 'first';
+      first.status = 'done';
+      first.executionCount = 1;
+      const second = content.notebook.appendCell();
+      second.source = 'second';
+      second.status = 'done';
+      second.executionCount = 2;
+      content.notebook.select(0);
+      content.notebook.enterEdit();
+      internals.refresh();
+      const notebook = content.node.querySelector<HTMLElement>(
+        '.jp-AgentWorkspace-notebook'
+      );
+      const firstNode = content.node.querySelector<HTMLElement>(
+        `.jp-AgentWorkspace-cell[data-cell-id="${first.id}"]`
+      );
+      const secondNode = content.node.querySelector<HTMLElement>(
+        `.jp-AgentWorkspace-cell[data-cell-id="${second.id}"]`
+      );
+      const callback = observerState.callback;
+      const observer = observerState.observer;
+      if (!notebook || !firstNode || !secondNode || !callback || !observer) {
+        throw new Error('viewport test setup failed');
+      }
+      jest
+        .spyOn(notebook, 'getBoundingClientRect')
+        .mockReturnValue(rect(0, 400));
+      jest
+        .spyOn(firstNode, 'getBoundingClientRect')
+        .mockReturnValue(rect(0, 180));
+      jest
+        .spyOn(secondNode, 'getBoundingClientRect')
+        .mockReturnValue(rect(180, 220));
+
+      callback(
+        [
+          { target: firstNode, isIntersecting: true },
+          { target: secondNode, isIntersecting: true }
+        ] as unknown as IntersectionObserverEntry[],
+        observer
+      );
+
+      expect(content.notebook.current.id).toBe(first.id);
+      expect(content.notebook.mode).toBe('edit');
+      expect(
+        content.node
+          .querySelector(
+            `.jp-AgentWorkspace-navigatorItem[data-cell-id="${second.id}"]`
+          )
+          ?.classList.contains('is-current')
+      ).toBe(true);
+      content.dispose();
+    } finally {
+      if (originalObserver) {
+        Object.defineProperty(globalThis, 'IntersectionObserver', {
+          configurable: true,
+          value: originalObserver
+        });
+      } else {
+        Reflect.deleteProperty(globalThis, 'IntersectionObserver');
+      }
+    }
+  });
+
+  it('uses an animation-frame scroll fallback when observers are unavailable', () => {
+    const originalObserver = globalThis.IntersectionObserver;
+    Reflect.deleteProperty(globalThis, 'IntersectionObserver');
+    const frames: FrameRequestCallback[] = [];
+    const frameSpy = jest
+      .spyOn(window, 'requestAnimationFrame')
+      .mockImplementation(callback => {
+        frames.push(callback);
+        return frames.length;
+      });
+    try {
+      const content = new AgentWorkspaceContent(null);
+      const internals = content as unknown as PageInternals;
+      const first = content.notebook.current;
+      first.source = 'first';
+      first.status = 'done';
+      first.executionCount = 1;
+      const second = content.notebook.appendCell();
+      second.source = 'second';
+      second.status = 'done';
+      second.executionCount = 2;
+      content.notebook.select(0);
+      internals.refresh();
+      const notebook = content.node.querySelector<HTMLElement>(
+        '.jp-AgentWorkspace-notebook'
+      );
+      const firstNode = content.node.querySelector<HTMLElement>(
+        `.jp-AgentWorkspace-cell[data-cell-id="${first.id}"]`
+      );
+      const secondNode = content.node.querySelector<HTMLElement>(
+        `.jp-AgentWorkspace-cell[data-cell-id="${second.id}"]`
+      );
+      if (!notebook || !firstNode || !secondNode) {
+        throw new Error('scroll fallback setup failed');
+      }
+      jest
+        .spyOn(notebook, 'getBoundingClientRect')
+        .mockReturnValue(rect(0, 400));
+      jest
+        .spyOn(firstNode, 'getBoundingClientRect')
+        .mockReturnValue(rect(-300, 320));
+      jest
+        .spyOn(secondNode, 'getBoundingClientRect')
+        .mockReturnValue(rect(20, 380));
+
+      notebook.dispatchEvent(new Event('scroll'));
+      frames.shift()?.(0);
+
+      expect(content.notebook.current.id).toBe(first.id);
+      expect(
+        content.node
+          .querySelector(
+            `.jp-AgentWorkspace-navigatorItem[data-cell-id="${second.id}"]`
+          )
+          ?.classList.contains('is-current')
+      ).toBe(true);
+      content.dispose();
+    } finally {
+      frameSpy.mockRestore();
+      if (originalObserver) {
+        Object.defineProperty(globalThis, 'IntersectionObserver', {
+          configurable: true,
+          value: originalObserver
+        });
+      }
+    }
+  });
+
+  it('reveals offscreen navigation targets with motion-preference behavior', () => {
+    const scrollIntoView = jest.mocked(HTMLElement.prototype.scrollIntoView);
+    scrollIntoView.mockClear();
+    const originalMatchMedia = window.matchMedia;
+    let reduced = false;
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      writable: true,
+      value: jest.fn().mockImplementation(() => ({ matches: reduced }))
+    });
+    try {
+      const content = new AgentWorkspaceContent(null);
+      const internals = content as unknown as PageInternals;
+      const first = content.notebook.current;
+      first.source = 'first';
+      first.status = 'done';
+      first.executionCount = 1;
+      const second = content.notebook.appendCell();
+      second.source = 'second';
+      second.status = 'done';
+      second.executionCount = 2;
+      content.notebook.select(0);
+      internals.refresh();
+      const notebook = content.node.querySelector<HTMLElement>(
+        '.jp-AgentWorkspace-notebook'
+      );
+      const secondNode = content.node.querySelector<HTMLElement>(
+        `.jp-AgentWorkspace-cell[data-cell-id="${second.id}"]`
+      );
+      if (!notebook || !secondNode) throw new Error('reveal setup failed');
+      jest
+        .spyOn(notebook, 'getBoundingClientRect')
+        .mockReturnValue(rect(0, 400));
+      jest
+        .spyOn(secondNode, 'getBoundingClientRect')
+        .mockReturnValue(rect(600, 120));
+
+      content.node
+        .querySelector<HTMLButtonElement>(
+          `.jp-AgentWorkspace-navigatorItem[data-cell-id="${second.id}"]`
+        )
+        ?.click();
+
+      expect(content.notebook.current.id).toBe(second.id);
+      expect(content.notebook.mode).toBe('command');
+      expect(scrollIntoView).toHaveBeenCalledWith({
+        block: 'center',
+        inline: 'nearest',
+        behavior: 'smooth'
+      });
+
+      scrollIntoView.mockClear();
+      content.notebook.select(0);
+      internals.refresh();
+      reduced = true;
+      content.node
+        .querySelector<HTMLButtonElement>(
+          `.jp-AgentWorkspace-navigatorItem[data-cell-id="${second.id}"]`
+        )
+        ?.click();
+      expect(scrollIntoView).toHaveBeenCalledWith({
+        block: 'center',
+        inline: 'nearest',
+        behavior: 'auto'
+      });
+      content.dispose();
+    } finally {
+      if (originalMatchMedia) {
+        Object.defineProperty(window, 'matchMedia', {
+          configurable: true,
+          writable: true,
+          value: originalMatchMedia
+        });
+      } else {
+        Reflect.deleteProperty(window, 'matchMedia');
+      }
+    }
+  });
+
+  it('emits coarse UI state without output-only notifications', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    const states: string[] = [];
+    const unsubscribe = content.subscribeUiState(state => {
+      states.push(`${state.connectionLabel}|${state.executionLabel}`);
+    });
+    const count = states.length;
+
+    content.notebook.current.output = 'new streamed text';
+    internals.refresh();
+    expect(states).toHaveLength(count);
+
+    content.session.connected = true;
+    content.session.execCwd = '/workspace';
+    internals.refresh();
+    expect(states[states.length - 1]).toBe('Connected|Ready');
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-statusCwd')?.textContent
+    ).toBe('/workspace');
+    unsubscribe();
+    content.dispose();
+  });
+
+  it('follows a near running tail, detaches on user movement, and returns', async () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    const nearTail = jest
+      .spyOn(internals.notebookView, 'isOutputTailNearViewport')
+      .mockReturnValue(true);
+    jest
+      .spyOn(internals.notebookView, 'isEditingAnotherCell')
+      .mockReturnValue(false);
+    const reveal = jest
+      .spyOn(internals.notebookView, 'revealOutputTail')
+      .mockImplementation(() => {});
+    content.notebook.setSource('stream an answer');
+    internals.runCell(false);
+    const runningId = content.notebook.activeRun?.cellId as string;
+
+    content.session.blocks = [
+      { kind: 'text', id: 'partial-1', text: 'partial answer' }
+    ];
+    internals.onSessionChange();
+    await Promise.resolve();
+    expect(reveal).toHaveBeenCalledWith(runningId);
+
+    nearTail.mockReturnValue(false);
+    const notebook = content.node.querySelector('.jp-AgentWorkspace-notebook');
+    notebook?.dispatchEvent(new Event('wheel'));
+    notebook?.dispatchEvent(new Event('scroll'));
+    const latest = content.node.querySelector<HTMLButtonElement>(
+      '.jp-AgentWorkspace-returnLatest'
+    );
+    expect(latest?.hidden).toBe(false);
+    latest?.click();
+    expect(reveal).toHaveBeenLastCalledWith(runningId);
+    expect(latest?.hidden).toBe(true);
+    content.dispose();
+  });
+
+  it('does not steal selection or editor focus when another Cell streams', () => {
+    const content = new AgentWorkspaceContent(null);
+    document.body.append(content.node);
+    const internals = content as unknown as PageInternals;
+    content.notebook.setSource('run in the first cell');
+    internals.runCell(false);
+    content.notebook.select(1);
+    content.notebook.enterEdit();
+    internals.refresh();
+    const editor = content.node.querySelectorAll<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    )[1];
+    editor.focus();
+    editor.value = 'draft in another cell';
+    editor.setSelectionRange(5, 5);
+    content.session.blocks = [
+      { kind: 'text', id: 'partial-2', text: 'new running output' }
+    ];
+
+    internals.onSessionChange();
+
+    expect(content.notebook.active).toBe(1);
+    expect(content.notebook.mode).toBe('edit');
+    expect(document.activeElement).toBe(editor);
+    expect(editor.selectionStart).toBe(5);
+    content.dispose();
+    content.node.remove();
+  });
+
+  it('publishes running state before any output event arrives', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as PageInternals;
+    const states: WorkspaceUiState[] = [];
+    const unsubscribe = content.subscribeUiState(state => states.push(state));
+    content.notebook.setSource('start immediately');
+
+    internals.runCell(false);
+
+    const current = states[states.length - 1];
+    expect(current.activeRun?.cellId).toBe(content.notebook.cells[0].id);
+    expect(current.interruptAvailable).toBe(true);
+    expect(current.executionLabel).toContain('Running');
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-navigatorItem.is-running')
+    ).not.toBeNull();
+    unsubscribe();
+    content.dispose();
   });
 });

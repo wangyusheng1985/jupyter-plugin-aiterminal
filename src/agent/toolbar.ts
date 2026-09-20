@@ -7,11 +7,15 @@ import {
 } from '@jupyterlab/ui-components';
 import { Widget } from '@lumino/widgets';
 
+import type { WorkspaceUiState } from './workspace-interaction';
+
 export interface AgentToolbarHost {
   insertAbove(): void;
   insertBelow(): void;
   runAndAdvance(): void;
   interrupt(): void;
+  readonly uiState: WorkspaceUiState;
+  subscribeUiState(listener: (state: WorkspaceUiState) => void): () => void;
 }
 
 export interface ToolbarHost {
@@ -22,7 +26,7 @@ export interface ToolbarHost {
 export function installAgentToolbar(
   toolbar: ToolbarHost,
   host: AgentToolbarHost
-): void {
+): () => void {
   toolbar.addClass('jp-NotebookPanel-toolbar');
   toolbar.addClass('jp-AgentWorkspace-toolbar');
   toolbar.addItem(
@@ -43,22 +47,25 @@ export function installAgentToolbar(
       onClick: () => host.insertBelow()
     })
   );
-  toolbar.addItem(
-    'run',
-    new ToolbarButton({
-      icon: runIcon,
-      tooltip: 'Run the selected cell and advance',
-      noFocusOnClick: true,
-      onClick: () => host.runAndAdvance()
-    })
-  );
-  toolbar.addItem(
-    'interrupt',
-    new ToolbarButton({
-      icon: stopIcon,
-      tooltip: 'Interrupt the running cell',
-      noFocusOnClick: true,
-      onClick: () => host.interrupt()
-    })
-  );
+  const separator = new Widget();
+  separator.addClass('jp-AgentWorkspace-toolbarSeparator');
+  separator.node.setAttribute('role', 'separator');
+  toolbar.addItem('execution-separator', separator);
+  const run = new ToolbarButton({
+    icon: runIcon,
+    tooltip: 'Run the selected cell and advance',
+    noFocusOnClick: true,
+    onClick: () => host.runAndAdvance()
+  });
+  toolbar.addItem('run', run);
+  const interrupt = new ToolbarButton({
+    icon: stopIcon,
+    tooltip: 'Interrupt the running cell',
+    noFocusOnClick: true,
+    onClick: () => host.interrupt()
+  });
+  toolbar.addItem('interrupt', interrupt);
+  return host.subscribeUiState(state => {
+    interrupt.enabled = state.interruptAvailable;
+  });
 }

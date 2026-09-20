@@ -5,6 +5,7 @@ from jupyter_aiterminal.agent import (
     AgentSession,
     _is_not_connected_error,
     format_sdk_error,
+    normalize_session_id,
     sdk_client_kwargs,
     sdk_environment,
 )
@@ -124,10 +125,35 @@ def test_sdk_client_kwargs_ignore_user_claude_settings(tmp_path, monkeypatch):
     assert kwargs["setting_sources"] == []
     assert kwargs["system_prompt"]["preset"] == "claude_code"
     assert "do not summarize" in kwargs["system_prompt"]["append"]
-    assert kwargs["extra_args"] == {"no-session-persistence": None}
+    assert "extra_args" not in kwargs
     assert kwargs["cli_path"] == str(claude)
     assert kwargs["env"]["ANTHROPIC_BASE_URL"] == "https://api.anthropic.com"
     assert "stderr" not in kwargs
+    fresh = sdk_client_kwargs(
+        {
+            "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+            "ANTHROPIC_API_KEY": "secret",
+            "ANTHROPIC_MODEL": "claude-opus-5",
+        },
+        "/tmp",
+        hook,
+        session_id="123e4567-e89b-12d3-a456-426614174000",
+    )
+    assert fresh["session_id"] == "123e4567-e89b-12d3-a456-426614174000"
+    assert "resume" not in fresh
+    resumed = sdk_client_kwargs(
+        {
+            "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+            "ANTHROPIC_API_KEY": "secret",
+            "ANTHROPIC_MODEL": "claude-opus-5",
+        },
+        "/tmp",
+        hook,
+        session_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        resume="123e4567-e89b-12d3-a456-426614174000",
+    )
+    assert resumed["resume"] == "123e4567-e89b-12d3-a456-426614174000"
+    assert "session_id" not in resumed
     captured: list[str] = []
     kwargs = sdk_client_kwargs(
         {
@@ -154,6 +180,83 @@ def test_format_sdk_error_includes_stderr():
         RuntimeError("Command failed with exit code 1"),
         ["API error: rate_limit_error"],
     )
+
+
+def test_session_id_normalization_is_uuid_only():
+    assert (
+        normalize_session_id("123E4567-E89B-12D3-A456-426614174000")
+        == "123e4567-e89b-12d3-a456-426614174000"
+    )
+    assert normalize_session_id("") is None
+    assert normalize_session_id("../123e4567-e89b-12d3-a456-426614174000") is None
+    assert normalize_session_id("x" * 200) is None
+    assert normalize_session_id(None) is None
+
+
+def test_ready_reports_new_and_resumed_context(monkeypatch):
+    created = []
+
+    class FakeClient:
+        async def connect(self):
+            pass
+
+    def factory(options):
+        created.append(options)
+        return FakeClient()
+
+    _configure_fake_sdk(monkeypatch, factory)
+
+    async def run():
+        new_events = []
+        new = AgentSession("/tmp", _emit_to(new_events))
+        await new.start()
+        resume_events = []
+        resumed = AgentSession(
+            "/tmp",
+            _emit_to(resume_events),
+            "123e4567-e89b-12d3-a456-426614174000",
+        )
+        await resumed.start()
+        return new, new_events, resumed, resume_events
+
+    new, new_events, resumed, resume_events = asyncio.run(run())
+    assert normalize_session_id(new.session_id) == new.session_id
+    assert new_events[-1] == {
+        "type": "ready",
+        "sessionId": new.session_id,
+        "contextState": "new",
+        "model": "claude-opus-5",
+        "cwd": "/tmp",
+    }
+    assert resume_events[-1]["sessionId"] == resumed.session_id
+    assert resume_events[-1]["contextState"] == "resumed"
+    assert created[0]["session_id"] == new.session_id
+    assert created[1]["resume"] == resumed.session_id
+
+
+def test_resume_connect_failure_is_distinct(monkeypatch):
+    events = []
+
+    class FakeClient:
+        async def connect(self):
+            raise RuntimeError("session not found")
+
+    _configure_fake_sdk(monkeypatch, lambda _options: FakeClient())
+
+    asyncio.run(
+        AgentSession(
+            "/tmp",
+            _emit_to(events),
+            "123e4567-e89b-12d3-a456-426614174000",
+        ).start()
+    )
+    assert events == [
+        {
+            "type": "error",
+            "code": "resume",
+            "message": "session not found",
+        }
+    ]
 
 
 def test_concurrent_starts_create_one_client(monkeypatch):
@@ -271,8 +374,16 @@ def test_query_scopes_events_to_active_turn(monkeypatch):
     async def run():
         session = AgentSession("/tmp", _emit_to(events))
         await session.query("hello", "run-7")
+        return session
 
-    asyncio.run(run())
+    session = asyncio.run(run())
+    assert [event for event in events if event["type"] == "accepted"] == [
+        {
+            "type": "accepted",
+            "sessionId": session.session_id,
+            "turnId": "run-7",
+        }
+    ]
     assert [event for event in events if event["type"] == "text"] == [
         {
             "type": "text",
@@ -281,6 +392,38 @@ def test_query_scopes_events_to_active_turn(monkeypatch):
             "turnId": "run-7",
         }
     ]
+
+
+def test_query_confirms_sdk_reported_session_identity(monkeypatch):
+    events = []
+    confirmed = "123e4567-e89b-12d3-a456-426614174000"
+
+    class FakeClient:
+        async def connect(self):
+            pass
+
+        async def query(self, _prompt):
+            pass
+
+        async def receive_response(self):
+            yield SimpleNamespace(
+                result="done",
+                is_error=False,
+                content=None,
+                session_id=confirmed,
+            )
+
+    _configure_fake_sdk(monkeypatch, lambda _options: FakeClient())
+
+    async def run():
+        session = AgentSession("/tmp", _emit_to(events))
+        await session.query("hello", "run-7")
+        return session
+
+    session = asyncio.run(run())
+    assert session.session_id == confirmed
+    assert events[-1]["sessionId"] == confirmed
+    assert events[-1]["turnId"] == "run-7"
 
 
 def test_close_during_start_does_not_publish_client(monkeypatch):
@@ -374,11 +517,15 @@ def test_query_reconnects_once_after_stale_client(monkeypatch):
         session.client = stale
         await session.query("hello")
         assert session.client is created[0]
+        return session
 
-    asyncio.run(run())
+    session = asyncio.run(run())
     assert stale.queries == ["hello"]
     assert stale.disconnects == 1
     assert created[0].queries == ["hello"]
+    assert [event for event in events if event["type"] == "accepted"] == [
+        {"type": "accepted", "sessionId": session.session_id}
+    ]
     assert not any(
         "Not connected. Call connect() first." in event.get("message", "")
         for event in events
@@ -409,6 +556,7 @@ def test_reconnect_failure_is_actionable(monkeypatch):
         assert session.client is None
 
     asyncio.run(run())
+    assert not any(event["type"] == "accepted" for event in events)
     assert events == [
         {
             "type": "error",
@@ -456,6 +604,7 @@ def test_query_does_not_retry_after_second_not_connected_error(monkeypatch):
     asyncio.run(run())
     assert len(created) == 1
     assert created[0].queries == ["hello"]
+    assert not any(event["type"] == "accepted" for event in events)
     assert events[-1] == {
         "type": "error",
         "code": "runtime",

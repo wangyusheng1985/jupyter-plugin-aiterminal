@@ -76,6 +76,7 @@ def test_result_message():
     message.usage = {"input_tokens": 10}
     message.errors = []
     message.permission_denials = []
+    message.session_id = "123e4567-e89b-12d3-a456-426614174000"
     assert events_from_message(message)[-1] == {
         "type": "result",
         "text": "10.9.34.98 is reachable.",
@@ -87,6 +88,7 @@ def test_result_message():
         "usage": {"input_tokens": 10},
         "errors": [],
         "permissionDenials": [],
+        "sessionId": "123e4567-e89b-12d3-a456-426614174000",
     }
 
 
@@ -102,6 +104,7 @@ def test_error_result_keeps_message():
     message.usage = None
     message.errors = ["failed"]
     message.permission_denials = []
+    message.session_id = None
     assert events_from_message(message)[-1] == {
         "type": "result",
         "text": "command failed",

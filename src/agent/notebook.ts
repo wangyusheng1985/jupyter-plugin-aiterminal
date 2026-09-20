@@ -1,4 +1,5 @@
 import type { ChatBlock, WorkspaceMode } from './protocol';
+import type { HistoryBridgeCapsule } from './history-bridge';
 import type { ChatTurn } from './turn';
 
 export type CellKind = WorkspaceMode;
@@ -12,6 +13,14 @@ export interface RunRequest {
   source: string;
   executionSource: string;
   advance: boolean;
+  historyBridge?: HistoryBridgeCapsule;
+  agentContextGeneration: number | null;
+  contextCommitted: boolean;
+}
+
+export interface AgentContextBridge {
+  generation: number;
+  cellIds: string[];
 }
 
 export interface WorkspaceCell {
@@ -24,6 +33,7 @@ export interface WorkspaceCell {
   status: CellStatus;
   executionCount: number | null;
   outputCollapsed: boolean;
+  agentContextGeneration: number | null;
 }
 
 let cellCounter = 0;
@@ -55,7 +65,8 @@ export function createWorkspaceCell(
     turn: null,
     status: 'idle',
     executionCount: null,
-    outputCollapsed: false
+    outputCollapsed: false,
+    agentContextGeneration: null
   };
 }
 
@@ -72,6 +83,9 @@ export class WorkspaceNotebook {
   cells: WorkspaceCell[] = [createWorkspaceCell('ai')];
   active = 0;
   mode: EditorMode = 'edit';
+  agentSessionId: string | null = null;
+  agentContextGeneration = 0;
+  agentContextBridges: AgentContextBridge[] = [];
   private runQueue: RunRequest[] = [];
   private activeRequest: RunRequest | null = null;
 
@@ -124,6 +138,16 @@ export class WorkspaceNotebook {
     return cell;
   }
 
+  prepareRetry(index = this.active): WorkspaceCell | null {
+    const source = this.cells[index];
+    if (!source || !source.source.trim()) return null;
+    const retry = createWorkspaceCell(source.kind, source.source);
+    this.cells.splice(index + 1, 0, retry);
+    this.active = index + 1;
+    this.mode = 'edit';
+    return retry;
+  }
+
   deleteActive(): boolean {
     if (this.empty) {
       return false;
@@ -165,7 +189,11 @@ export class WorkspaceNotebook {
     this.current.source = source;
   }
 
-  enqueueRun(index = this.active, advance = false): RunRequest | null {
+  enqueueRun(
+    index = this.active,
+    advance = false,
+    historyBridge?: HistoryBridgeCapsule
+  ): RunRequest | null {
     const cell = this.cells[index];
     const source = cell?.source.trim();
     if (!cell || !source) return null;
@@ -178,8 +206,13 @@ export class WorkspaceNotebook {
       kind,
       source,
       executionSource: executableSource,
-      advance
+      advance,
+      ...(historyBridge ? { historyBridge } : {}),
+      agentContextGeneration:
+        kind === 'ai' ? this.agentContextGeneration : null,
+      contextCommitted: kind !== 'ai'
     };
+    if (kind === 'command') cell.agentContextGeneration = null;
     this.runQueue.push(request);
     if (this.activeRequest?.cellId !== cell.id) {
       cell.status = 'queued';
@@ -256,6 +289,55 @@ export class WorkspaceNotebook {
         cell.status = 'interrupted';
       }
     });
+  }
+
+  startNewAgentContext(cellIds: string[] | null = []): number {
+    this.agentContextGeneration += 1;
+    this.agentSessionId = null;
+    if (cellIds !== null) {
+      this.agentContextBridges.push({
+        generation: this.agentContextGeneration,
+        cellIds: [...cellIds]
+      });
+    }
+    return this.agentContextGeneration;
+  }
+
+  setAgentContextBridge(
+    cellIds: string[],
+    generation = this.agentContextGeneration
+  ): void {
+    this.agentContextBridges = this.agentContextBridges.filter(
+      bridge => bridge.generation !== generation
+    );
+    this.agentContextBridges.push({
+      generation,
+      cellIds: [...cellIds]
+    });
+  }
+
+  commitRunContext(requestId: string): boolean {
+    const request = this.activeRequest;
+    if (
+      !request ||
+      request.id !== requestId ||
+      request.kind !== 'ai' ||
+      request.contextCommitted ||
+      request.agentContextGeneration === null
+    ) {
+      return false;
+    }
+    const cell = this.cells.find(candidate => candidate.id === request.cellId);
+    if (!cell) return false;
+    cell.agentContextGeneration = request.agentContextGeneration;
+    if (request.historyBridge) {
+      this.setAgentContextBridge(
+        request.historyBridge.turns.map(turn => turn.cellId),
+        request.agentContextGeneration
+      );
+    }
+    request.contextCommitted = true;
+    return true;
   }
 
   cancelQueuedRuns(cellId: string): void {

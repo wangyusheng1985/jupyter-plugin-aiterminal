@@ -1,11 +1,14 @@
 export const AGENT_WS_PATH = 'aiterminal/agent';
 
 export type WorkspaceMode = 'ai' | 'command';
+export type AgentContextState =
+  'connecting' | 'new' | 'live' | 'resumed' | 'unavailable' | 'reset';
 
 export interface AgentUserMessage {
   type: 'user';
   turnId?: string;
   text: string;
+  historyBridge?: import('./history-bridge').HistoryBridgeCapsule;
 }
 
 export interface AgentInterruptMessage {
@@ -30,14 +33,21 @@ export type AgentClientMessage =
 export interface AgentReadyEvent {
   type: 'ready';
   sessionId: string;
+  contextState?: 'new' | 'resumed';
   model: string;
   cwd: string;
+}
+
+export interface AgentAcceptedEvent {
+  type: 'accepted';
+  turnId?: string;
+  sessionId: string;
 }
 
 export interface AgentErrorEvent {
   type: 'error';
   turnId?: string;
-  code: 'config' | 'runtime' | 'denied';
+  code: 'config' | 'runtime' | 'denied' | 'resume' | 'context';
   message: string;
 }
 
@@ -103,6 +113,7 @@ export interface AgentResultEvent {
   usage?: Record<string, unknown> | null;
   errors?: string[];
   permissionDenials?: unknown[];
+  sessionId?: string;
 }
 
 export interface AgentExecOutputEvent {
@@ -124,6 +135,7 @@ export interface AgentExecErrorEvent {
 
 export type AgentServerEvent =
   | AgentReadyEvent
+  | AgentAcceptedEvent
   | AgentErrorEvent
   | AgentTextEvent
   | AgentThinkingEvent
@@ -295,6 +307,7 @@ export function applyServerEvent(
           ]
         : blocks;
     case 'ready':
+    case 'accepted':
     case 'exec_output':
     case 'exec_done':
     case 'exec_error':

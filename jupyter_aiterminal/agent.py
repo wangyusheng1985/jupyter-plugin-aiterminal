@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -46,10 +47,21 @@ def _is_not_connected_error(exc: BaseException) -> bool:
     )
 
 
+def normalize_session_id(value: object) -> str | None:
+    if not isinstance(value, str) or len(value) != 36:
+        return None
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, AttributeError):
+        return None
+
+
 class AgentSession:
-    def __init__(self, cwd: str, emit: Emit):
+    def __init__(self, cwd: str, emit: Emit, resume_session_id: str | None = None):
         self.cwd = cwd
         self.emit = emit
+        self.session_id = resume_session_id or str(uuid.uuid4())
+        self._resume_requested = resume_session_id is not None
         self.client: Any | None = None
         self.model = ""
         self._running = False
@@ -91,7 +103,12 @@ class AgentSession:
         self._cli_stderr = []
         options = _build_options(
             **sdk_client_kwargs(
-                config, self.cwd, self._pre_tool_use, self._cli_stderr
+                config,
+                self.cwd,
+                self._pre_tool_use,
+                self._cli_stderr,
+                session_id=self.session_id,
+                resume=self.session_id if self._resume_requested else None,
             )
         )
         client = None
@@ -102,7 +119,7 @@ class AgentSession:
             await self._emit_event(
                 {
                     "type": "error",
-                    "code": "runtime",
+                    "code": "resume" if self._resume_requested else "runtime",
                     "message": format_sdk_error(exc, self._cli_stderr),
                 }
             )
@@ -116,7 +133,8 @@ class AgentSession:
         await self._emit_event(
             {
                 "type": "ready",
-                "sessionId": "default",
+                "sessionId": self.session_id,
+                "contextState": "resumed" if self._resume_requested else "new",
                 "model": self.model,
                 "cwd": self.cwd,
             }
@@ -156,7 +174,16 @@ class AgentSession:
                 if client is None:
                     return
                 await client.query(prompt)
+            await self._emit_event(
+                {"type": "accepted", "sessionId": self.session_id}
+            )
             async for message in client.receive_response():
+                reported_session_id = normalize_session_id(
+                    getattr(message, "session_id", None)
+                )
+                if reported_session_id:
+                    self.session_id = reported_session_id
+                    self._resume_requested = True
                 for event in events_from_message(
                     message,
                     turn_id=turn_id,
@@ -172,7 +199,7 @@ class AgentSession:
             await self._emit_event(
                 {
                     "type": "error",
-                    "code": "runtime",
+                    "code": "resume" if self._resume_requested else "runtime",
                     "message": message,
                 }
             )
@@ -302,6 +329,9 @@ def sdk_client_kwargs(
     cwd: str,
     pre_tool_use,
     stderr_lines: list[str] | None = None,
+    *,
+    session_id: str | None = None,
+    resume: str | None = None,
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "allowed_tools": ALLOWED_TOOLS,
@@ -316,13 +346,16 @@ def sdk_client_kwargs(
         "env": sdk_environment(config),
         # Ignore ~/.claude/settings.json so Jupyter Settings are the only source.
         "setting_sources": [],
-        "extra_args": {"no-session-persistence": None},
         "hooks": {
             "PreToolUse": [HookMatcher(matcher="Bash", hooks=[pre_tool_use])]
             if HookMatcher is not None
             else []
         },
     }
+    if resume:
+        kwargs["resume"] = resume
+    elif session_id:
+        kwargs["session_id"] = session_id
     cli_path = resolve_cli_path()
     if cli_path:
         kwargs["cli_path"] = cli_path
@@ -458,6 +491,15 @@ def events_from_message(
                 "errors": _optional_string_list(message, "errors"),
                 "permissionDenials": _optional_list(
                     message, "permission_denials"
+                ),
+                **(
+                    {"sessionId": session_id}
+                    if (
+                        session_id := normalize_session_id(
+                            getattr(message, "session_id", None)
+                        )
+                    )
+                    else {}
                 ),
             }
         )

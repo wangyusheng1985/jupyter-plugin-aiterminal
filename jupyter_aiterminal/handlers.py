@@ -10,7 +10,8 @@ from jupyter_server.utils import url_path_join
 from tornado import web, websocket
 from tornado.ioloop import IOLoop
 
-from .agent import AgentSession
+from .agent import AgentSession, normalize_session_id
+from .history_bridge import compose_bridged_prompt, validate_history_bridge
 from .shell import PersistentShell
 
 
@@ -40,6 +41,7 @@ class AgentWebSocketHandler(JupyterHandler, websocket.WebSocketHandler):
 
     def open(self, *args, **kwargs):
         requested = self.get_query_argument("cwd", default="")
+        requested_session = self.get_query_argument("sessionId", default="")
         cwd = _resolve_workspace_cwd(self.cwd, requested)
         if cwd is None:
             IOLoop.current().spawn_callback(
@@ -51,7 +53,19 @@ class AgentWebSocketHandler(JupyterHandler, websocket.WebSocketHandler):
                 },
             )
             return
-        self.session = AgentSession(cwd, self.emit)
+        try:
+            resume_session_id = _parse_resume_session_id(requested_session)
+        except ValueError:
+            IOLoop.current().spawn_callback(
+                self.emit,
+                {
+                    "type": "error",
+                    "code": "resume",
+                    "message": "Saved Agent context identifier is invalid.",
+                },
+            )
+            return
+        self.session = AgentSession(cwd, self.emit, resume_session_id)
         self.shell = PersistentShell(cwd)
         IOLoop.current().spawn_callback(self.session.start)
         IOLoop.current().spawn_callback(self._start_shell)
@@ -80,10 +94,26 @@ class AgentWebSocketHandler(JupyterHandler, websocket.WebSocketHandler):
         if kind == "user":
             if self.session is None:
                 return
+            turn_id = str(payload.get("turnId", "")) or None
+            prompt = str(payload.get("text", ""))
+            if "historyBridge" in payload:
+                try:
+                    bridge = validate_history_bridge(payload.get("historyBridge"))
+                    prompt = compose_bridged_prompt(prompt, bridge)
+                except ValueError as exc:
+                    event = {
+                        "type": "error",
+                        "code": "context",
+                        "message": str(exc),
+                    }
+                    if turn_id:
+                        event["turnId"] = turn_id
+                    IOLoop.current().spawn_callback(self.emit, event)
+                    return
             IOLoop.current().spawn_callback(
                 self.session.query,
-                str(payload.get("text", "")),
-                str(payload.get("turnId", "")) or None,
+                prompt,
+                turn_id,
             )
         elif kind == "interrupt":
             if self.session is None:
@@ -179,3 +209,12 @@ def _resolve_workspace_cwd(root: str, requested: str) -> str | None:
     if not inside_root or not os.path.isdir(candidate):
         return None
     return candidate
+
+
+def _parse_resume_session_id(requested: str) -> str | None:
+    if not requested:
+        return None
+    normalized = normalize_session_id(requested)
+    if normalized is None:
+        raise ValueError("invalid Agent session identifier")
+    return normalized

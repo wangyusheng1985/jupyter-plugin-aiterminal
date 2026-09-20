@@ -153,6 +153,7 @@ export function applyTurnEvent(
       }
       break;
     case 'ready':
+    case 'accepted':
     case 'exec_output':
     case 'exec_done':
     case 'exec_error':

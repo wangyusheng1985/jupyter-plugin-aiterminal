@@ -1,5 +1,6 @@
 import {
   AGENT_WORKSPACE_VERSION,
+  normalizeAgentSessionId,
   parseWorkspaceSnapshot,
   restoreNotebook,
   serializeNotebook
@@ -7,7 +8,357 @@ import {
 import { WorkspaceNotebook } from './notebook';
 import { createTurn, setTurnStatus, toggleOutcome, toggleTrace } from './turn';
 
+function contextCell(
+  id: string,
+  agentContextGeneration: number | null,
+  kind: 'ai' | 'command' = 'ai'
+): Record<string, unknown> {
+  return {
+    id,
+    kind,
+    source: kind === 'command' ? '!pwd' : `${id} question`,
+    output: '',
+    blocks: [],
+    turn: null,
+    status: 'done',
+    executionCount: 1,
+    outputCollapsed: false,
+    agentContextGeneration
+  };
+}
+
 describe('Agent Workspace document', () => {
+  it('round-trips a version 4 Agent session identity at the document root', () => {
+    const notebook = new WorkspaceNotebook();
+    notebook.agentSessionId = '123e4567-e89b-12d3-a456-426614174000';
+
+    const text = serializeNotebook(notebook);
+    const serialized = JSON.parse(text) as Record<string, unknown>;
+    const restored = new WorkspaceNotebook();
+    restoreNotebook(restored, text);
+
+    expect(serialized.version).toBe(AGENT_WORKSPACE_VERSION);
+    expect(serialized.agentSessionId).toBe(
+      '123e4567-e89b-12d3-a456-426614174000'
+    );
+    expect(JSON.stringify(serialized)).not.toMatch(
+      /token|password|transcript/i
+    );
+    expect(restored.agentSessionId).toBe(
+      '123e4567-e89b-12d3-a456-426614174000'
+    );
+    expect(restored.agentContextGeneration).toBe(0);
+    expect(restored.agentContextBridges).toEqual([]);
+  });
+
+  it('migrates version 1, 2, and unlinked 3 workspaces without inventing context', () => {
+    for (const version of [1, 2, 3]) {
+      const restored = new WorkspaceNotebook();
+      restoreNotebook(
+        restored,
+        JSON.stringify({
+          version,
+          active: 0,
+          cells: [
+            {
+              id: `legacy-${version}`,
+              kind: 'ai',
+              source: 'kept',
+              output: '',
+              blocks: [{ kind: 'text', id: 'text-1', text: 'evidence' }],
+              status: 'done',
+              executionCount: 1,
+              outputCollapsed: true
+            }
+          ]
+        })
+      );
+      expect(restored.agentSessionId).toBeNull();
+      expect(restored.agentContextGeneration).toBe(0);
+      expect(restored.agentContextBridges).toEqual([]);
+      expect(restored.cells[0]).toMatchObject({
+        source: 'kept',
+        outputCollapsed: true,
+        agentContextGeneration: null
+      });
+      expect(restored.cells[0].blocks[0]).toMatchObject({ text: 'evidence' });
+    }
+  });
+
+  it('round-trips native generations and bridged Cell membership', () => {
+    const notebook = new WorkspaceNotebook();
+    const historical = notebook.current;
+    historical.source = 'historical question';
+    historical.status = 'done';
+    historical.executionCount = 4;
+    historical.blocks = [
+      { kind: 'text', id: 'historical-text', text: 'historical outcome' }
+    ];
+    historical.outputCollapsed = true;
+
+    const native = notebook.insertBelow();
+    native.source = 'current question';
+    native.status = 'done';
+    native.executionCount = 5;
+    native.blocks = [
+      { kind: 'text', id: 'current-text', text: 'current outcome' }
+    ];
+    native.agentContextGeneration = 2;
+    notebook.agentContextGeneration = 2;
+    notebook.agentContextBridges = [
+      { generation: 2, cellIds: [historical.id] }
+    ];
+    notebook.agentSessionId = '123e4567-e89b-12d3-a456-426614174000';
+
+    const restored = new WorkspaceNotebook();
+    restoreNotebook(restored, serializeNotebook(notebook));
+
+    expect(restored.agentContextGeneration).toBe(2);
+    expect(restored.agentContextBridges).toEqual([
+      { generation: 2, cellIds: [historical.id] }
+    ]);
+    expect(restored.cells[0]).toMatchObject({
+      id: historical.id,
+      source: 'historical question',
+      executionCount: 4,
+      outputCollapsed: true,
+      agentContextGeneration: null
+    });
+    expect(restored.cells[0].blocks).toEqual(historical.blocks);
+    expect(restored.cells[1]).toMatchObject({
+      id: native.id,
+      source: 'current question',
+      executionCount: 5,
+      agentContextGeneration: 2
+    });
+    expect(restored.cells[1].blocks).toEqual(native.blocks);
+  });
+
+  it('reopens a replacement context without rewriting earlier generations', () => {
+    const notebook = new WorkspaceNotebook();
+    const bridged = notebook.current;
+    bridged.source = 'bridged history';
+    bridged.status = 'done';
+    bridged.executionCount = 2;
+    bridged.blocks = [
+      { kind: 'text', id: 'bridged-text', text: 'bridged evidence' }
+    ];
+    const earlier = notebook.insertBelow();
+    earlier.source = 'earlier work';
+    earlier.status = 'done';
+    earlier.executionCount = 3;
+    earlier.agentContextGeneration = 1;
+    earlier.blocks = [
+      { kind: 'text', id: 'earlier-text', text: 'earlier evidence' }
+    ];
+    notebook.agentContextGeneration = 1;
+    notebook.agentContextBridges = [{ generation: 1, cellIds: [bridged.id] }];
+
+    notebook.startNewAgentContext();
+    const current = notebook.insertBelow();
+    current.source = 'new context work';
+    const request = notebook.enqueueRun();
+    notebook.promoteNextRun();
+    expect(notebook.commitRunContext(request?.id ?? '')).toBe(true);
+    notebook.agentSessionId = '123e4567-e89b-12d3-a456-426614174000';
+
+    const restored = new WorkspaceNotebook();
+    restoreNotebook(restored, serializeNotebook(notebook));
+
+    expect(restored.agentContextGeneration).toBe(2);
+    expect(restored.agentContextBridges).toEqual([
+      { generation: 1, cellIds: [bridged.id] },
+      { generation: 2, cellIds: [] }
+    ]);
+    expect(restored.cells[0]).toMatchObject({
+      source: 'bridged history',
+      status: 'done',
+      executionCount: 2,
+      agentContextGeneration: null,
+      blocks: [{ id: 'bridged-text', text: 'bridged evidence' }]
+    });
+    expect(restored.cells[1]).toMatchObject({
+      source: 'earlier work',
+      status: 'done',
+      executionCount: 3,
+      agentContextGeneration: 1,
+      blocks: [{ id: 'earlier-text', text: 'earlier evidence' }]
+    });
+    expect(restored.cells[2]).toMatchObject({
+      source: 'new context work',
+      agentContextGeneration: 2
+    });
+  });
+
+  it('migrates a linked version 3 workspace conservatively', () => {
+    const snapshot = parseWorkspaceSnapshot(
+      JSON.stringify({
+        version: 3,
+        active: 3,
+        agentSessionId: '123e4567-e89b-12d3-a456-426614174000',
+        cells: [
+          {
+            id: 'older-ai',
+            kind: 'ai',
+            source: 'older',
+            blocks: [{ kind: 'text', id: 'older-text', text: 'older result' }],
+            status: 'done',
+            executionCount: 1
+          },
+          {
+            id: 'interrupted-ai',
+            kind: 'ai',
+            source: 'interrupted',
+            blocks: [],
+            status: 'interrupted',
+            executionCount: 2
+          },
+          {
+            id: 'command',
+            kind: 'command',
+            source: '!pwd',
+            blocks: [],
+            status: 'done',
+            executionCount: 3
+          },
+          {
+            id: 'newest-ai',
+            kind: 'ai',
+            source: 'newest',
+            blocks: [
+              { kind: 'text', id: 'newest-text', text: 'newest result' }
+            ],
+            status: 'done',
+            executionCount: 4
+          }
+        ]
+      })
+    );
+
+    expect(snapshot.agentContextGeneration).toBe(0);
+    expect(snapshot.agentContextBridges).toEqual([]);
+    expect(
+      snapshot.cells.map(cell => [cell.id, cell.agentContextGeneration])
+    ).toEqual([
+      ['older-ai', null],
+      ['interrupted-ai', null],
+      ['command', null],
+      ['newest-ai', 0]
+    ]);
+  });
+
+  it('normalizes malformed context generations and bridge records', () => {
+    const snapshot = parseWorkspaceSnapshot(
+      JSON.stringify({
+        version: 4,
+        active: 0,
+        agentSessionId: '123e4567-e89b-12d3-a456-426614174000',
+        agentContextGeneration: 2,
+        agentContextBridges: [
+          {
+            generation: 2,
+            cellIds: [
+              'outside-b',
+              'native',
+              'command',
+              'unknown',
+              'outside-a',
+              'outside-a',
+              'idle'
+            ]
+          },
+          { generation: 2, cellIds: ['outside-a'] },
+          { generation: 3, cellIds: ['outside-a'] },
+          { generation: -1, cellIds: ['outside-a'] },
+          { generation: 1, cellIds: 'not-an-array' },
+          null
+        ],
+        cells: [
+          contextCell('outside-a', null),
+          contextCell('outside-b', -1),
+          contextCell('native', 2),
+          contextCell('future', 3),
+          contextCell('command', 1, 'command'),
+          { ...contextCell('idle', null), status: 'idle' }
+        ]
+      })
+    );
+
+    expect(snapshot.agentContextBridges).toEqual([
+      { generation: 2, cellIds: ['outside-a', 'outside-b'] }
+    ]);
+    expect(
+      snapshot.cells.map(cell => [cell.id, cell.agentContextGeneration])
+    ).toEqual([
+      ['outside-a', null],
+      ['outside-b', null],
+      ['native', 2],
+      ['future', null],
+      ['command', null],
+      ['idle', null]
+    ]);
+  });
+
+  it('treats unlinked current version 4 coverage as uncovered', () => {
+    const unlinkedBridge = parseWorkspaceSnapshot(
+      JSON.stringify({
+        version: 4,
+        active: 2,
+        agentContextGeneration: 2,
+        agentContextBridges: [
+          { generation: 1, cellIds: ['older-bridged'] },
+          { generation: 2, cellIds: ['current-bridged'] }
+        ],
+        cells: [
+          contextCell('older-bridged', null),
+          contextCell('current-bridged', null),
+          contextCell('current-native', 2)
+        ]
+      })
+    );
+
+    expect(unlinkedBridge.agentSessionId).toBeNull();
+    expect(unlinkedBridge.agentContextBridges).toEqual([
+      { generation: 1, cellIds: ['older-bridged'] }
+    ]);
+    expect(
+      unlinkedBridge.cells.map(cell => [cell.id, cell.agentContextGeneration])
+    ).toEqual([
+      ['older-bridged', null],
+      ['current-bridged', null],
+      ['current-native', null]
+    ]);
+
+    const explicitEmpty = parseWorkspaceSnapshot(
+      JSON.stringify({
+        version: 4,
+        active: 1,
+        agentSessionId: 'invalid',
+        agentContextGeneration: 3,
+        agentContextBridges: [{ generation: 3, cellIds: [] }],
+        cells: [contextCell('outside', null), contextCell('unlinked-native', 3)]
+      })
+    );
+
+    expect(explicitEmpty.agentContextBridges).toEqual([
+      { generation: 3, cellIds: [] }
+    ]);
+    expect(explicitEmpty.cells[1].agentContextGeneration).toBeNull();
+  });
+
+  it('accepts only normalized UUID session identities', () => {
+    expect(
+      normalizeAgentSessionId('123E4567-E89B-12D3-A456-426614174000')
+    ).toBe('123e4567-e89b-12d3-a456-426614174000');
+    expect(normalizeAgentSessionId('')).toBeNull();
+    expect(normalizeAgentSessionId('not-a-session')).toBeNull();
+    expect(
+      normalizeAgentSessionId('../123e4567-e89b-12d3-a456-426614174000')
+    ).toBeNull();
+    expect(normalizeAgentSessionId('x'.repeat(200))).toBeNull();
+    expect(normalizeAgentSessionId(42)).toBeNull();
+  });
+
   it('round-trips mixed cells including outputs and collapse', () => {
     const notebook = new WorkspaceNotebook();
     notebook.setSource('list files');

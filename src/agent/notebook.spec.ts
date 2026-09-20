@@ -21,6 +21,40 @@ describe('WorkspaceNotebook', () => {
     expect(notebook.active).toBe(0);
   });
 
+  it('prepares a clean retry draft without copying result evidence', () => {
+    const notebook = new WorkspaceNotebook();
+    const source = notebook.current;
+    source.kind = 'ai';
+    source.source = 'retry this task';
+    source.status = 'interrupted';
+    source.executionCount = 7;
+    source.output = 'partial';
+    source.outputCollapsed = true;
+    source.blocks = [{ kind: 'text', id: 'text-1', text: 'evidence' }];
+    source.turn = createTurn('run-source');
+
+    const retry = notebook.prepareRetry(0);
+
+    expect(retry).toMatchObject({
+      kind: 'ai',
+      source: 'retry this task',
+      status: 'idle',
+      executionCount: null,
+      output: '',
+      outputCollapsed: false,
+      blocks: [],
+      turn: null
+    });
+    expect(notebook.active).toBe(1);
+    expect(notebook.mode).toBe('edit');
+    expect(source).toMatchObject({
+      status: 'interrupted',
+      executionCount: 7,
+      output: 'partial',
+      outputCollapsed: true
+    });
+  });
+
   it('classifies ordinary, marked, whitespace-prefixed, and marker-only input', () => {
     const notebook = new WorkspaceNotebook();
     notebook.setSource('list files');
@@ -49,6 +83,55 @@ describe('WorkspaceNotebook', () => {
 
     notebook.setSource('  !  ');
     expect(notebook.enqueueRun()).toBeNull();
+  });
+
+  it('assigns AI work to the active generation only after acceptance', () => {
+    const notebook = new WorkspaceNotebook();
+    notebook.agentContextGeneration = 3;
+    notebook.setSource('continue with context');
+
+    const request = notebook.enqueueRun();
+    expect(request).toMatchObject({ kind: 'ai' });
+    notebook.promoteNextRun();
+    expect(notebook.current.agentContextGeneration).toBeNull();
+
+    expect(notebook.commitRunContext(request?.id ?? '')).toBe(true);
+    expect(notebook.current.agentContextGeneration).toBe(3);
+    expect(notebook.commitRunContext(request?.id ?? '')).toBe(false);
+
+    notebook.clearRuns();
+    notebook.setSource('!pwd');
+    expect(notebook.enqueueRun()).toMatchObject({ kind: 'command' });
+    expect(notebook.current.agentContextGeneration).toBeNull();
+  });
+
+  it('starts a new context generation without rewriting historical evidence', () => {
+    const notebook = new WorkspaceNotebook();
+    const historical = notebook.current;
+    historical.source = 'historical';
+    historical.status = 'done';
+    historical.blocks = [
+      { kind: 'text', id: 'historical-text', text: 'preserved evidence' }
+    ];
+    historical.agentContextGeneration = 1;
+    notebook.agentContextGeneration = 1;
+    notebook.agentContextBridges = [{ generation: 1, cellIds: ['older-cell'] }];
+    notebook.agentSessionId = '123e4567-e89b-12d3-a456-426614174000';
+
+    expect(notebook.startNewAgentContext()).toBe(2);
+
+    expect(notebook.agentSessionId).toBeNull();
+    expect(notebook.agentContextBridges).toEqual([
+      { generation: 1, cellIds: ['older-cell'] },
+      { generation: 2, cellIds: [] }
+    ]);
+    expect(historical).toMatchObject({
+      source: 'historical',
+      agentContextGeneration: 1,
+      blocks: [
+        { kind: 'text', id: 'historical-text', text: 'preserved evidence' }
+      ]
+    });
   });
 
   it('advances after a command run by creating a unified AI input', () => {

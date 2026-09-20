@@ -7,16 +7,24 @@ import {
   type AgentClientMessage,
   type AgentExecDoneEvent,
   type AgentServerEvent,
+  type AgentContextState,
   type ChatBlock
 } from './protocol';
 import { applyTurnEvent, createTurn, type ChatTurn } from './turn';
+import type { HistoryBridgeCapsule } from './history-bridge';
 
 export function agentSocketUrl(
   settings: ServerConnection.ISettings = ServerConnection.makeSettings(),
-  cwd?: string
+  cwd?: string,
+  sessionId?: string | null
 ): string {
   let url = URLExt.join(settings.wsUrl, AGENT_WS_PATH);
   if (cwd) url += `?cwd=${encodeURIComponent(cwd)}`;
+  if (sessionId) {
+    url += `${url.includes('?') ? '&' : '?'}sessionId=${encodeURIComponent(
+      sessionId
+    )}`;
+  }
   if (settings.appendToken && settings.token) {
     const token = URLExt.objectToQueryString({ token: settings.token });
     url += `${url.includes('?') ? '&' : ''}${token.replace(/^\?/, '')}`;
@@ -37,8 +45,11 @@ export class AgentSession {
   error: string | null = null;
   running = false;
   activeTurnId: string | null = null;
+  acceptedTurnId: string | null = null;
   execCwd: string | null = null;
   execOutput = '';
+  sessionId: string | null;
+  contextState: AgentContextState = 'connecting';
   private socket: WebSocket | null = null;
   private pending: AgentClientMessage[] = [];
   private readonly listeners = new Set<() => void>();
@@ -49,8 +60,19 @@ export class AgentSession {
 
   constructor(
     private readonly settings: ServerConnection.ISettings = ServerConnection.makeSettings(),
-    private readonly cwd?: string
-  ) {}
+    private readonly cwd?: string,
+    sessionId: string | null = null
+  ) {
+    this.sessionId = sessionId;
+  }
+
+  configureContext(sessionId: string | null): void {
+    if (this.socket) {
+      throw new Error('Agent context must be configured before connecting.');
+    }
+    this.sessionId = sessionId;
+    this.contextState = 'connecting';
+  }
 
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener);
@@ -59,8 +81,11 @@ export class AgentSession {
 
   connect(): void {
     if (this.socket) return;
+    if (this.contextState !== 'reset') {
+      this.contextState = 'connecting';
+    }
     const socket = new this.settings.WebSocket(
-      agentSocketUrl(this.settings, this.cwd)
+      agentSocketUrl(this.settings, this.cwd, this.sessionId)
     );
     this.socket = socket;
     socket.onopen = () => {
@@ -88,11 +113,24 @@ export class AgentSession {
       if (payload.type === 'error') {
         this.error = payload.message;
         this.running = false;
+        if (payload.code === 'resume') {
+          this.contextState = 'unavailable';
+        }
       }
       if (payload.type === 'result') {
         this.running = false;
+        if (payload.sessionId) this.sessionId = payload.sessionId;
+        this.contextState = 'live';
+      }
+      if (payload.type === 'accepted') {
+        this.acceptedTurnId = payload.turnId ?? this.activeTurnId;
+        this.sessionId = payload.sessionId;
       }
       if (payload.type === 'ready') {
+        const requestedResume = Boolean(this.sessionId);
+        this.sessionId = payload.sessionId;
+        this.contextState =
+          payload.contextState ?? (requestedResume ? 'resumed' : 'new');
         this.execCwd = payload.cwd;
       }
       this.handleExecEvent(payload);
@@ -113,15 +151,31 @@ export class AgentSession {
     };
   }
 
-  sendUser(text: string, turnId = nextTurnId()): void {
+  sendUser(
+    text: string,
+    turnId = nextTurnId(),
+    historyBridge?: HistoryBridgeCapsule
+  ): void {
     const trimmed = text.trim();
     if (!trimmed) return;
+    if (this.contextState === 'unavailable') {
+      this.error =
+        'Saved Agent context is unavailable. Start a new context before continuing.';
+      this.notify();
+      return;
+    }
     this.blocks = [];
     this.turn = createTurn(turnId);
     this.error = null;
     this.running = true;
     this.activeTurnId = turnId;
-    this.send({ type: 'user', turnId, text: trimmed });
+    this.acceptedTurnId = null;
+    this.send({
+      type: 'user',
+      turnId,
+      text: trimmed,
+      ...(historyBridge ? { historyBridge } : {})
+    });
     this.notify();
   }
 
@@ -147,7 +201,30 @@ export class AgentSession {
     this.socket = null;
     this.connected = false;
     this.running = false;
+    this.activeTurnId = null;
+    this.acceptedTurnId = null;
     this.rejectExec(new Error('Agent session closed.'));
+  }
+
+  resetContext(): void {
+    const socket = this.socket;
+    if (socket) {
+      socket.onclose = null;
+      socket.close();
+    }
+    this.socket = null;
+    this.pending = [];
+    this.blocks = [];
+    this.turn = null;
+    this.connected = false;
+    this.error = null;
+    this.running = false;
+    this.activeTurnId = null;
+    this.acceptedTurnId = null;
+    this.sessionId = null;
+    this.contextState = 'reset';
+    this.connect();
+    this.notify();
   }
 
   private handleExecEvent(payload: AgentServerEvent): void {
