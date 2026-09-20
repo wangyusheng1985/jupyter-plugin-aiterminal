@@ -78,10 +78,13 @@ jest.mock('@jupyterlab/services', () => ({
 
 import {
   AGENT_COMMAND_ID,
+  AGENT_FILE_BROWSER_COMMAND_ID,
   AGENT_RESTORE_COMMAND_ID,
+  FILE_BROWSER_CONTENT_SELECTOR,
   PLUGIN_ID,
   ShutdownCoordinator,
-  activate
+  activate,
+  resolveFileBrowserCreationPath
 } from './index';
 
 describe('jupyter-aiterminal launcher', () => {
@@ -121,6 +124,7 @@ describe('jupyter-aiterminal launcher', () => {
     expect(PLUGIN_ID).toBe('jupyter-aiterminal:plugin');
     expect(AGENT_COMMAND_ID).toBe('aiterminal:open');
     expect(commands.hasCommand(AGENT_COMMAND_ID)).toBe(true);
+    expect(commands.hasCommand(AGENT_FILE_BROWSER_COMMAND_ID)).toBe(false);
     expect(commands.hasCommand('classic-ssh:open')).toBe(false);
     expect(commands.hasCommand('classic-ssh:openAgentWorkspace')).toBe(false);
     expect(launcherAdd).toHaveBeenCalledTimes(1);
@@ -131,12 +135,249 @@ describe('jupyter-aiterminal launcher', () => {
     });
   });
 
+  it('resolves the file browser creation directory from the clicked model', () => {
+    const current = { path: 'work' };
+    const modelForClick = jest.fn();
+    const fileBrowser = { model: current, modelForClick };
+    const event = new MouseEvent('contextmenu');
+
+    modelForClick.mockReturnValue({
+      type: 'directory',
+      path: 'work/project'
+    });
+    expect(resolveFileBrowserCreationPath(fileBrowser as never, event)).toBe(
+      'work/project'
+    );
+
+    modelForClick.mockReturnValue({ type: 'file', path: 'work/readme.md' });
+    expect(resolveFileBrowserCreationPath(fileBrowser as never, event)).toBe(
+      'work'
+    );
+
+    modelForClick.mockReturnValue(undefined);
+    expect(resolveFileBrowserCreationPath(fileBrowser as never, event)).toBe(
+      'work'
+    );
+
+    current.path = '';
+    expect(resolveFileBrowserCreationPath(fileBrowser as never, event)).toBe(
+      ''
+    );
+  });
+
+  it('registers AI Terminal in the default file browser context menu', () => {
+    const commands = new CommandRegistry();
+    const contextMenuAdd = jest.fn();
+    const translator = { load: () => ({ __: (value: string) => value }) };
+    const fileBrowser = {
+      model: { path: 'work' },
+      modelForClick: jest.fn(),
+      node: document.createElement('div')
+    };
+    const docManager = {
+      registry: {
+        addFileType: jest.fn(),
+        addModelFactory: jest.fn(),
+        addWidgetFactory: jest.fn()
+      },
+      open: jest.fn(),
+      openOrReveal: jest.fn(),
+      newUntitled: jest.fn()
+    };
+
+    activate(
+      {
+        commands,
+        shell: {},
+        contextMenu: { addItem: contextMenuAdd }
+      } as never,
+      { add: jest.fn() } as never,
+      translator as never,
+      {} as never,
+      docManager as never,
+      null,
+      fileBrowser as never
+    );
+
+    expect(AGENT_FILE_BROWSER_COMMAND_ID).toBe(
+      'aiterminal:new-from-file-browser'
+    );
+    expect(commands.hasCommand(AGENT_FILE_BROWSER_COMMAND_ID)).toBe(true);
+    expect(commands.label(AGENT_FILE_BROWSER_COMMAND_ID)).toBe('AI Terminal');
+    expect(commands.caption(AGENT_FILE_BROWSER_COMMAND_ID)).toBe(
+      'Create an AI Terminal workspace in this folder'
+    );
+    expect(commands.icon(AGENT_FILE_BROWSER_COMMAND_ID)).toEqual({});
+    expect(contextMenuAdd).toHaveBeenCalledWith({
+      command: AGENT_FILE_BROWSER_COMMAND_ID,
+      selector: FILE_BROWSER_CONTENT_SELECTOR,
+      rank: 20
+    });
+  });
+
+  it('captures the latest clicked directory and consumes it once', async () => {
+    const commands = new CommandRegistry();
+    const translator = { load: () => ({ __: (value: string) => value }) };
+    const shell = { activateById: jest.fn() };
+    const content = document.createElement('ul');
+    content.className = FILE_BROWSER_CONTENT_SELECTOR.slice(1);
+    const item = document.createElement('li');
+    content.appendChild(item);
+    const node = document.createElement('div');
+    node.appendChild(content);
+    const browserModel = { path: 'work' };
+    const modelForClick = jest
+      .fn()
+      .mockReturnValueOnce({ type: 'directory', path: 'work/first' })
+      .mockReturnValueOnce({ type: 'directory', path: 'work/second' });
+    const selectedItems = jest.fn();
+    const fileBrowser = {
+      model: browserModel,
+      modelForClick,
+      selectedItems,
+      node
+    };
+    const widgets = [
+      { id: 'agent-workspace:work/second/Untitled1.agentnb' },
+      { id: 'agent-workspace:current/Untitled.agentnb' }
+    ];
+    const docManager = {
+      registry: {
+        addFileType: jest.fn(),
+        addModelFactory: jest.fn(),
+        addWidgetFactory: jest.fn()
+      },
+      open: jest
+        .fn()
+        .mockReturnValueOnce(widgets[0])
+        .mockReturnValueOnce(widgets[1]),
+      openOrReveal: jest.fn(),
+      newUntitled: jest
+        .fn()
+        .mockResolvedValueOnce({ path: 'work/second/Untitled1.agentnb' })
+        .mockResolvedValueOnce({ path: 'current/Untitled.agentnb' })
+    };
+
+    activate(
+      {
+        commands,
+        shell,
+        contextMenu: { addItem: jest.fn() }
+      } as never,
+      { add: jest.fn() } as never,
+      translator as never,
+      {} as never,
+      docManager as never,
+      null,
+      fileBrowser as never
+    );
+
+    item.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true }));
+    item.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true }));
+    await commands.execute(AGENT_FILE_BROWSER_COMMAND_ID);
+    expect(docManager.newUntitled).toHaveBeenNthCalledWith(1, {
+      type: 'file',
+      ext: '.agentnb',
+      path: 'work/second'
+    });
+    expect(docManager.open).toHaveBeenNthCalledWith(
+      1,
+      'work/second/Untitled1.agentnb',
+      'Agent Workspace'
+    );
+    expect(shell.activateById).toHaveBeenNthCalledWith(1, widgets[0].id);
+    expect(selectedItems).not.toHaveBeenCalled();
+    expect(docManager.openOrReveal).not.toHaveBeenCalled();
+
+    browserModel.path = 'current';
+    await commands.execute(AGENT_FILE_BROWSER_COMMAND_ID);
+    expect(docManager.newUntitled).toHaveBeenNthCalledWith(2, {
+      type: 'file',
+      ext: '.agentnb',
+      path: 'current'
+    });
+    expect(shell.activateById).toHaveBeenNthCalledWith(2, widgets[1].id);
+  });
+
+  it('uses the invocation-time current directory for files and blank space', async () => {
+    const commands = new CommandRegistry();
+    const translator = { load: () => ({ __: (value: string) => value }) };
+    const shell = { activateById: jest.fn() };
+    const content = document.createElement('ul');
+    content.className = FILE_BROWSER_CONTENT_SELECTOR.slice(1);
+    const fileItem = document.createElement('li');
+    content.appendChild(fileItem);
+    const node = document.createElement('div');
+    node.appendChild(content);
+    const browserModel = { path: 'work' };
+    const modelForClick = jest
+      .fn()
+      .mockReturnValueOnce({ type: 'file', path: 'work/readme.md' })
+      .mockReturnValueOnce(undefined);
+    const fileBrowser = { model: browserModel, modelForClick, node };
+    const docManager = {
+      registry: {
+        addFileType: jest.fn(),
+        addModelFactory: jest.fn(),
+        addWidgetFactory: jest.fn()
+      },
+      open: jest
+        .fn()
+        .mockReturnValueOnce({ id: 'agent-workspace:work/Untitled.agentnb' })
+        .mockReturnValueOnce({ id: 'agent-workspace:Untitled1.agentnb' }),
+      openOrReveal: jest.fn(),
+      newUntitled: jest
+        .fn()
+        .mockResolvedValueOnce({ path: 'work/Untitled.agentnb' })
+        .mockResolvedValueOnce({ path: 'Untitled1.agentnb' })
+    };
+
+    activate(
+      {
+        commands,
+        shell,
+        contextMenu: { addItem: jest.fn() }
+      } as never,
+      { add: jest.fn() } as never,
+      translator as never,
+      {} as never,
+      docManager as never,
+      null,
+      fileBrowser as never
+    );
+
+    fileItem.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true }));
+    browserModel.path = 'changed-after-menu-open';
+    await commands.execute(AGENT_FILE_BROWSER_COMMAND_ID);
+    expect(docManager.newUntitled).toHaveBeenNthCalledWith(1, {
+      type: 'file',
+      ext: '.agentnb',
+      path: 'work'
+    });
+
+    browserModel.path = '';
+    content.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true }));
+    await commands.execute(AGENT_FILE_BROWSER_COMMAND_ID);
+    expect(docManager.newUntitled).toHaveBeenNthCalledWith(2, {
+      type: 'file',
+      ext: '.agentnb',
+      path: ''
+    });
+    expect(docManager.open).toHaveBeenNthCalledWith(
+      2,
+      'Untitled1.agentnb',
+      'Agent Workspace'
+    );
+    expect(shell.activateById).toHaveBeenCalledTimes(2);
+  });
+
   it('opens an untitled Agent Workspace document', async () => {
     const commands = new CommandRegistry();
     const translator = { load: () => ({ __: (value: string) => value }) };
     const app = {
       commands,
-      shell: { activateById: jest.fn() }
+      shell: { activateById: jest.fn() },
+      contextMenu: { addItem: jest.fn() }
     };
     const widget = { id: 'agent-workspace:Untitled.agentnb' };
     const docManager = {
@@ -317,7 +558,8 @@ describe('jupyter-aiterminal launcher', () => {
     const widget = { id: 'agent-workspace:work/Untitled.agentnb' };
     const app = {
       commands,
-      shell: { activateById: jest.fn() }
+      shell: { activateById: jest.fn() },
+      contextMenu: { addItem: jest.fn() }
     };
     const docManager = {
       registry: {
@@ -331,7 +573,11 @@ describe('jupyter-aiterminal launcher', () => {
       createNew: jest.fn(),
       newUntitled: jest.fn(async () => ({ path: 'work/Untitled.agentnb' }))
     };
-    const fileBrowser = { model: { path: 'work' } };
+    const fileBrowser = {
+      model: { path: 'work' },
+      modelForClick: jest.fn(),
+      node: document.createElement('div')
+    };
 
     activate(
       app as never,

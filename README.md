@@ -79,8 +79,10 @@ The token is stored in JupyterLab user settings on the server (`~/.jupyter/lab/u
 
 ## Use
 
-1. Open the Launcher → **Other** → **AI Terminal**.
-2. A `.agentnb` file is created in the current file-browser directory.
+1. Create an AI Terminal workspace with either entry point:
+   - Open the Launcher → **Other** → **AI Terminal** to create it in the current file-browser directory.
+   - In the left file browser, right-click a folder and choose **AI Terminal** to create it inside that folder. Right-clicking a file or blank listing space creates it in the current directory.
+2. A collision-safe `Untitled.agentnb` file is created and opened automatically.
 3. Type in a cell. Double-click the prompt (or use the toolbar) to switch **AI** / **Command**.
 4. Run with Shift+Enter (run and advance) or the toolbar Run button.
 5. Select text in a cell to show a copy icon at the pointer; click it to copy. `Cmd/Ctrl+C` / `V` / `X` / `A` work as usual. In command mode, `dd` deletes the cell.
