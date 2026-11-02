@@ -1,14 +1,14 @@
 # jupyter-aiterminal
 
-AI Terminal for JupyterLab. Mixed **AI** and **Command** cells in a notebook-like workspace, saved as `.agentnb` files.
-
-> **Development status:** this branch is migrating the agent backend to the DeepSeek Harness (DSH) ACP runtime. The migration is under active development and has not shipped or been fully verified. Treat the DSH instructions below as the target behaviour for this branch, not as a released migration.
+AI Terminal for JupyterLab. Mixed **AI** and **Command** cells in a notebook-like workspace, saved as `.agentnb` files, powered by the **DeepSeek Harness (DSH)** Agent Client Protocol (ACP) runtime.
 
 ## What it does
 
-- **AI cells** run a DSH agent over the Agent Client Protocol (ACP v1) on the Jupyter server. The agent can read, write, and edit files and run shell commands in the workspace, and its Markdown reply is rendered.
-- **Command cells** run non-interactive bash with a persistent cwd and streaming output.
-- New workspaces appear in the file browser as `Untitled.agentnb`. Content autosaves. Closing the tab closes the document; a full Jupyter refresh only restores tabs that were still open.
+- **AI cells** run an autonomous AI Agent powered by DSH over the Agent Client Protocol (ACP v1) on the Jupyter server. The agent reads, writes, and edits files, runs shell commands in the workspace, and renders streaming Markdown responses with collapsable execution traces.
+- **Command cells** run non-interactive bash with a persistent working directory and streaming output.
+- **In-cell shell execution**: type `!<command>` (e.g. `!git status`, `!ls -lh`) in any cell to run shell commands directly without switching modes.
+- **Isolated execution counters**: each notebook document tracks its own execution count starting from `[1]:`, completely isolated across tabs and documents.
+- New workspaces appear in the file browser as `Untitled.agentnb`. Content autosaves continuously. Closing the tab closes the document; a full Jupyter refresh restores opened tabs.
 
 It does **not** include a classic SSH terminal or interactive TUI (vim / ssh / full-screen apps).
 
@@ -18,14 +18,14 @@ AI cells use **DeepSeek Harness (DSH)** through ACP v1 over stdio. The extension
 
 - No Python SDK facade is required.
 - No Node.js, npm, or globally installed `dsh` CLI is required on the server.
-- No tool or package is installed automatically at runtime.
+- No external packages are installed automatically at runtime.
 
 ## Security warning
 
 **Command cells and AI tool calls can run arbitrary commands as the Jupyter server user.** Treat access to this extension as equivalent to a shell on that machine.
 
-- DSH tool calls are checked by the runtime's workspace policy. A permission request is surfaced to the UI and must be approved for that request; denial, cancellation, timeout, or disconnect returns the ACP `cancelled` outcome, never an implicit approval.
-- Command cells execute arbitrary bash in a long-lived shell, as the user running Jupyter.
+- DSH tool calls run with automated server-side approvals within the workspace sandbox, and all actions, file modifications, and bash outputs are logged transparently within the execution record inside the cell.
+- Command cells execute arbitrary bash in a long-lived shell as the user running Jupyter.
 - Any user who can authenticate to the Jupyter server can reach this extension.
 
 Recommended precautions:
@@ -92,11 +92,16 @@ The token is stored in JupyterLab user settings on the server (`~/.jupyter/lab/u
    - Open the Launcher → **Other** → **AI Terminal** to create it in the current file-browser directory.
    - In the left file browser, right-click a folder and choose **AI Terminal** to create it inside that folder. Right-clicking a file or blank listing space creates it in the current directory.
 2. A collision-safe `Untitled.agentnb` file is created and opened automatically.
-3. Type in a cell. Double-click the prompt (or use the toolbar) to switch **AI** / **Command**.
-4. Run with Shift+Enter (run and advance) or the toolbar Run button.
-5. Select text in a cell to show a copy icon at the pointer; click it to copy. `Cmd/Ctrl+C` / `V` / `X` / `A` work as usual. In command mode, `dd` deletes the cell.
+3. Type in a cell:
+   - For **AI Agent tasks**: type your prompt or question in plain language.
+   - For **Shell commands**: type `!<command>` (e.g., `!pytest` or `!ls -lh`) directly in the cell, or double-click the prompt / use the toolbar dropdown to explicitly switch to Command mode.
+   - The cell input area expands dynamically to fit multiline input.
+4. Run with `Shift+Enter` (run and advance) or `Ctrl/Cmd+Enter` (run in place).
+5. Review results:
+   - Execution records can be expanded/collapsed without jumping your viewport.
+   - Select text in a cell to display a floating copy button; standard shortcuts (`Cmd/Ctrl+C`, `Cmd/Ctrl+V`) work as expected. In command mode, `dd` deletes the cell.
 
-Command cells share one bash session per tab, so `cd` persists. AI cells use the server-side DSH runtime, not that bash session.
+Command cells share one bash session per tab, so `cd` persists. AI cells use the server-side DSH runtime with full workspace awareness.
 
 ## Deploy
 
@@ -108,11 +113,11 @@ Command cells share one bash session per tab, so `cd` persists. AI cells use the
 
 ```bash
 jlpm install
-jlpm test
-jlpm typecheck
-jlpm eslint
-pytest
-python -m build
+jlpm lint         # ESLint and Prettier check
+jlpm typecheck    # TypeScript compiler check
+jlpm test         # Jest frontend unit tests
+pytest            # Python backend tests
+python -m build   # Build distribution packages
 ```
 
 ## License
