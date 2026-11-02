@@ -1,6 +1,6 @@
 {
   "name": "jupyter-aiterminal",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "AI Terminal (Agent Workspace) for JupyterLab.",
   "keywords": [
     "jupyter",
