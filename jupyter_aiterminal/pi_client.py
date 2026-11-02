@@ -275,6 +275,12 @@ class PiRpcClient:
             "--no-prompt-templates",
             "--no-themes",
         ]
+        if self.session_id:
+            import re
+            # Prevent path traversal or shell injection in session_id
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", self.session_id):
+                raise PiProcessError(f"Invalid session id format: {self.session_id!r}")
+
         bridge_ext = pi_agent_dir() / "extensions" / "bridge_policy.ts"
         # Fail closed: never start RPC without the pre-execution policy extension.
         if not bridge_ext.is_file() or bridge_ext.stat().st_size == 0:
@@ -287,11 +293,6 @@ class PiRpcClient:
             args.extend(["--append-system-prompt", self.append_system_prompt])
 
         if self.session_id:
-            import re
-            # Prevent path traversal or shell injection in session_id
-            if not re.fullmatch(r"[A-Za-z0-9._-]+", self.session_id):
-                raise PiProcessError(f"Invalid session id format: {self.session_id!r}")
-
             if self.resume:
                 # Disallow cross-directory session hijacking or fallback to continueRecent.
                 # Must point to an existing session for this exact cwd or resolve to exact session file.
