@@ -1,4 +1,4 @@
-import { restoreCounters, WorkspaceNotebook } from './notebook';
+import { WorkspaceNotebook } from './notebook';
 import { createTurn, toggleOutcome, toggleTrace } from './turn';
 
 describe('WorkspaceNotebook', () => {
@@ -85,6 +85,115 @@ describe('WorkspaceNotebook', () => {
     expect(notebook.enqueueRun()).toBeNull();
   });
 
+  it('respects explicit shell mode without requiring exclamation mark', () => {
+    const notebook = new WorkspaceNotebook();
+    notebook.setDraftKind('command');
+    notebook.setSource('git status');
+
+    const request = notebook.enqueueRun();
+    expect(request).toMatchObject({
+      kind: 'command',
+      source: 'git status',
+      executionSource: 'git status'
+    });
+
+    // Does not accidentally strip the first character of command
+    notebook.insertBelow();
+    notebook.setDraftKind('command');
+    notebook.setSource('echo hello');
+    const echoRequest = notebook.enqueueRun();
+    expect(echoRequest).toMatchObject({
+      kind: 'command',
+      source: 'echo hello',
+      executionSource: 'echo hello'
+    });
+
+    // Bang shortcut still works and strips bang
+    notebook.insertBelow();
+    notebook.setDraftKind('command');
+    notebook.setSource('!pwd');
+    const bangRequest = notebook.enqueueRun();
+    expect(bangRequest).toMatchObject({
+      kind: 'command',
+      source: '!pwd',
+      executionSource: 'pwd'
+    });
+  });
+
+  it('preserves queued run mode snapshot and rejects toggling kind on queued cell', () => {
+    const notebook = new WorkspaceNotebook();
+    notebook.setDraftKind('command');
+    notebook.setSource('echo first');
+    const queued = notebook.enqueueRun();
+    expect(queued).toMatchObject({
+      kind: 'command',
+      source: 'echo first',
+      executionSource: 'echo first'
+    });
+
+    // Toggle draft kind after enqueueing should be rejected because cell is queued
+    expect(notebook.current.status).toBe('queued');
+    const rejected = notebook.setDraftKind('ai');
+    expect(rejected).toBeNull();
+    expect(notebook.current.kind).toBe('command');
+    expect(notebook.queuedRuns[0]).toMatchObject({
+      kind: 'command',
+      source: 'echo first',
+      executionSource: 'echo first'
+    });
+
+    // New run in AI mode
+    notebook.insertBelow();
+    notebook.setSource('summarize progress');
+    const aiQueued = notebook.enqueueRun();
+    expect(aiQueued).toMatchObject({
+      kind: 'ai',
+      source: 'summarize progress',
+      executionSource: 'summarize progress'
+    });
+  });
+
+  it('rejects setDraftKind on invalid index or non-draft cells (done/interrupted/running/queued/idle with executionCount)', () => {
+    const notebook = new WorkspaceNotebook();
+    // Invalid index
+    expect(notebook.setDraftKind('command', -1)).toBeNull();
+    expect(notebook.setDraftKind('command', 99)).toBeNull();
+
+    // Valid editable draft
+    expect(notebook.current.status).toBe('idle');
+    expect(notebook.current.executionCount).toBeNull();
+    expect(notebook.setDraftKind('command')).not.toBeNull();
+    expect(notebook.current.kind).toBe('command');
+    expect(notebook.setDraftKind('ai')).not.toBeNull();
+    expect(notebook.current.kind).toBe('ai');
+
+    // running status
+    notebook.current.status = 'running';
+    expect(notebook.setDraftKind('command')).toBeNull();
+    expect(notebook.current.kind).toBe('ai');
+
+    // done status
+    notebook.current.status = 'done';
+    expect(notebook.setDraftKind('command')).toBeNull();
+    expect(notebook.current.kind).toBe('ai');
+
+    // interrupted status
+    notebook.current.status = 'interrupted';
+    expect(notebook.setDraftKind('command')).toBeNull();
+    expect(notebook.current.kind).toBe('ai');
+
+    // queued status
+    notebook.current.status = 'queued';
+    expect(notebook.setDraftKind('command')).toBeNull();
+    expect(notebook.current.kind).toBe('ai');
+
+    // status is idle but already has execution history (e.g. executionCount !== null)
+    notebook.current.status = 'idle';
+    notebook.current.executionCount = 1;
+    expect(notebook.setDraftKind('command')).toBeNull();
+    expect(notebook.current.kind).toBe('ai');
+  });
+
   it('assigns AI work to the active generation only after acceptance', () => {
     const notebook = new WorkspaceNotebook();
     notebook.agentContextGeneration = 3;
@@ -165,10 +274,10 @@ describe('WorkspaceNotebook', () => {
     const notebook = new WorkspaceNotebook();
     notebook.cells[0].id = 'cell-9';
     notebook.cells[0].executionCount = 4;
-    restoreCounters(notebook.cells);
+    notebook.restoreCounters();
     notebook.insertBelow();
     expect(notebook.cells[1].id).not.toBe('cell-9');
-    expect(notebook.cells[1].id.startsWith('cell-')).toBe(true);
+    expect(notebook.cells[1].id).toBe('cell-10');
   });
 
   it('deletes the active cell and selects the next one', () => {
@@ -365,5 +474,31 @@ describe('WorkspaceNotebook', () => {
 
     expect(notebook.current.turn).toBeNull();
     expect(notebook.current.status).toBe('running');
+  });
+
+  it('isolates execution counters across distinct WorkspaceNotebook instances', () => {
+    const firstNotebook = new WorkspaceNotebook();
+    firstNotebook.setSource('first cell run 1');
+    const firstRequest = firstNotebook.enqueueRun();
+    firstNotebook.promoteNextRun();
+    expect(firstNotebook.cells[0].executionCount).toBe(1);
+    firstNotebook.finishRun(firstRequest?.id ?? '', 'done');
+
+    // Simulate runs up to 18 in the first notebook
+    firstNotebook.cells[0].executionCount = 18;
+    firstNotebook.restoreCounters();
+    firstNotebook.insertBelow();
+    firstNotebook.setSource('first cell run 19');
+    firstNotebook.enqueueRun();
+    firstNotebook.promoteNextRun();
+    expect(firstNotebook.cells[1].executionCount).toBe(19);
+
+    // A brand new notebook document must strictly start its executionCount at 1
+    const freshNotebook = new WorkspaceNotebook();
+    expect(freshNotebook.cells[0].executionCount).toBeNull();
+    freshNotebook.setSource('fresh notebook first command');
+    freshNotebook.enqueueRun();
+    freshNotebook.promoteNextRun();
+    expect(freshNotebook.cells[0].executionCount).toBe(1);
   });
 });

@@ -416,3 +416,195 @@ describe('renderTurn', () => {
     ).toBeNull();
   });
 });
+
+describe('streaming text rendering', () => {
+  function textBody(node: HTMLElement): HTMLElement | null {
+    return node.querySelector<HTMLElement>('.jp-AgentWorkspace-activityBody');
+  }
+
+  beforeEach(() => {
+    jest.mocked(renderMarkdown).mockReset();
+    jest.mocked(renderMarkdown).mockImplementation(options => {
+      options.host.innerHTML = options.source ? '<p>markdown</p>' : '';
+      return Promise.resolve();
+    });
+  });
+
+  afterEach(() => {
+    document.body.replaceChildren();
+    jest.mocked(renderMarkdown).mockReset();
+  });
+
+  it('renders the running tail synchronously without Markdown parsing', () => {
+    const turn = deriveTurn(createTurn('run-1'), [
+      { kind: 'text', id: 'text-1', text: 'Hello stream' }
+    ]);
+    const node = renderTurn(turn, {
+      rendermime: {} as IRenderMimeRegistry,
+      handlers: handlers()
+    });
+    const body = textBody(node);
+    expect(
+      body?.querySelector('.jp-AgentWorkspace-streamingText')?.textContent
+    ).toBe('Hello stream');
+    expect(body?.querySelector('p')).toBeNull();
+    expect(renderMarkdown).not.toHaveBeenCalled();
+  });
+
+  it('grows across deltas without duplicating the full text', () => {
+    const first = deriveTurn(createTurn('run-1'), [
+      { kind: 'text', id: 'text-1', text: 'Hello' }
+    ]);
+    const second = deriveTurn(first, [
+      { kind: 'text', id: 'text-1', text: 'Hello world' }
+    ]);
+    const firstNode = renderTurn(first, {
+      rendermime: {} as IRenderMimeRegistry,
+      handlers: handlers()
+    });
+    const secondNode = renderTurn(second, {
+      rendermime: {} as IRenderMimeRegistry,
+      handlers: handlers()
+    });
+    expect(textBody(firstNode)?.textContent).toBe('Hello');
+    expect(textBody(secondNode)?.textContent).toBe('Hello world');
+    expect(renderMarkdown).not.toHaveBeenCalled();
+  });
+
+  it('renders the completed answer through Markdown', () => {
+    const turn = setTurnStatus(createTurn('run-1'), 'done', [
+      { kind: 'text', id: 'text-1', text: 'Final answer' }
+    ]);
+    const node = renderTurn(turn, {
+      rendermime: {} as IRenderMimeRegistry,
+      handlers: handlers()
+    });
+    const outcome = node.querySelector('.jp-AgentWorkspace-outcomeBody');
+    expect(outcome?.querySelector('p')?.textContent).toBe('markdown');
+    expect(renderMarkdown).toHaveBeenCalled();
+  });
+
+  it('turns a trailing text into stable Markdown once a tool starts', () => {
+    let turn = deriveTurn(createTurn('run-1'), [
+      { kind: 'text', id: 'text-1', text: 'Streaming so far' },
+      toolBlock('tool-1', { status: 'running' })
+    ]);
+    turn = toggleActivity(turn, 'activity-text-1');
+    const node = renderTurn(turn, {
+      rendermime: {} as IRenderMimeRegistry,
+      handlers: handlers()
+    });
+    const body = textBody(node);
+    expect(body?.querySelector('.jp-AgentWorkspace-streamingText')).toBeNull();
+    expect(body?.querySelector('p')?.textContent).toBe('markdown');
+    expect(renderMarkdown).toHaveBeenCalled();
+  });
+
+  it.each(['error', 'interrupted'] as const)(
+    'renders the final answer as Markdown for a %s turn',
+    status => {
+      const turn = setTurnStatus(createTurn('run-1'), status, [
+        { kind: 'text', id: 'text-1', text: 'Partial answer' }
+      ]);
+      const node = renderTurn(turn, {
+        rendermime: {} as IRenderMimeRegistry,
+        handlers: handlers()
+      });
+      const outcome = node.querySelector('.jp-AgentWorkspace-outcomeBody');
+      expect(outcome?.querySelector('p')?.textContent).toBe('markdown');
+      expect(renderMarkdown).toHaveBeenCalled();
+    }
+  );
+});
+
+describe('Markdown host whitespace', () => {
+  const fs = jest.requireActual<{
+    readFileSync: (file: string, encoding: string) => string;
+  }>('fs');
+  const nodePath = jest.requireActual<{
+    resolve: (...parts: string[]) => string;
+  }>('path');
+  const cwd = jest.requireActual<{ cwd: () => string }>('process').cwd();
+  const baseCss = fs
+    .readFileSync(nodePath.resolve(cwd, 'style/base.css'), 'utf8')
+    // jsdom does not parse @container, so downgrade it to @media for the DOM
+    // cascade check while every selector and declaration stays the file's own.
+    .replace(/@container[^{]*\{/g, '@media all {');
+  let style: HTMLStyleElement;
+
+  const representativeMarkdown = `
+    <p>First line
+second line</p>
+    <ul><li><p>Primary item</p></li></ul>
+    <p>Inline <code>const  spaced</code> code.</p>
+    <pre><code>const ready = true;
+const done = false;</code></pre>
+  `;
+
+  beforeEach(() => {
+    style = document.createElement('style');
+    style.textContent = baseCss;
+    document.head.append(style);
+    jest.mocked(renderMarkdown).mockImplementation(options => {
+      options.host.innerHTML = options.source ? representativeMarkdown : '';
+      return Promise.resolve();
+    });
+  });
+
+  afterEach(() => {
+    style.remove();
+    document.body.replaceChildren();
+    jest.mocked(renderMarkdown).mockReset();
+  });
+
+  it('keeps outcome prose normal while preserving preformatted blocks', () => {
+    const node = renderTurn(completedTurn([toolBlock('tool-1')]), {
+      rendermime: {} as IRenderMimeRegistry,
+      handlers: handlers()
+    });
+    document.body.append(node);
+
+    const body = node.querySelector<HTMLElement>(
+      '.jp-AgentWorkspace-outcomeBody'
+    );
+    expect(body).not.toBeNull();
+    expect(getComputedStyle(body!).whiteSpace).toBe('normal');
+    expect(getComputedStyle(body!.querySelector('pre')!).whiteSpace).toBe(
+      'pre-wrap'
+    );
+    expect(getComputedStyle(body!.querySelector('p > code')!).whiteSpace).toBe(
+      'normal'
+    );
+    expect(body!.querySelector('p')?.textContent).toContain(
+      'First line\nsecond line'
+    );
+    expect(body!.querySelector('li > p')?.textContent).toBe('Primary item');
+    expect(body!.querySelector('pre code')?.textContent).toContain(
+      'const ready = true;'
+    );
+  });
+
+  it('renders the running streamed tail as synchronous pre-wrapped text', () => {
+    const turn = deriveTurn(createTurn('run-1'), [
+      { kind: 'text', id: 'text-stream', text: 'Streaming answer.' }
+    ]);
+    const node = renderTurn(turn, {
+      rendermime: {} as IRenderMimeRegistry,
+      handlers: handlers()
+    });
+    document.body.append(node);
+
+    const body = node.querySelector<HTMLElement>(
+      '.jp-AgentWorkspace-activityBody'
+    );
+    expect(body).not.toBeNull();
+    expect(getComputedStyle(body!).whiteSpace).toBe('normal');
+    const stream = body!.querySelector<HTMLElement>(
+      '.jp-AgentWorkspace-streamingText'
+    );
+    expect(stream).not.toBeNull();
+    expect(getComputedStyle(stream!).whiteSpace).toBe('pre-wrap');
+    expect(stream!.textContent).toBe('Streaming answer.');
+    expect(renderMarkdown).not.toHaveBeenCalled();
+  });
+});

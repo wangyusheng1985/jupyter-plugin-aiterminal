@@ -36,18 +36,20 @@ export interface WorkspaceCell {
   agentContextGeneration: number | null;
 }
 
-let cellCounter = 0;
-let executionCounter = 0;
-let runCounter = 0;
+let standaloneCellCounter = 0;
 
-export function restoreCounters(cells: WorkspaceCell[]): void {
+export function restoreCounters(
+  cells: WorkspaceCell[],
+  notebook?: WorkspaceNotebook
+): void {
+  if (notebook) {
+    notebook.restoreCounters(cells);
+    return;
+  }
   cells.forEach(cell => {
     const match = /^cell-(\d+)$/.exec(cell.id);
     if (match) {
-      cellCounter = Math.max(cellCounter, Number(match[1]));
-    }
-    if (typeof cell.executionCount === 'number') {
-      executionCounter = Math.max(executionCounter, cell.executionCount);
+      standaloneCellCounter = Math.max(standaloneCellCounter, Number(match[1]));
     }
   });
 }
@@ -57,7 +59,7 @@ export function createWorkspaceCell(
   source = ''
 ): WorkspaceCell {
   return {
-    id: `cell-${++cellCounter}`,
+    id: `cell-${++standaloneCellCounter}`,
     kind,
     source,
     output: '',
@@ -74,13 +76,43 @@ export function isShellEscapeSource(source: string): boolean {
   return /^\s*!/.test(source);
 }
 
-function executionSource(source: string): string {
-  const input = source.trim();
-  return isShellEscapeSource(input) ? input.slice(1).trim() : input;
+export function stripShellEscape(source: string): string {
+  const trimmed = source.trim();
+  const match = /^\s*!\s*(.*)$/s.exec(trimmed);
+  return match ? match[1] : trimmed;
+}
+
+export function resolveRunExecution(
+  source: string,
+  preferredKind: CellKind = 'ai'
+): { kind: CellKind; executionSource: string } | null {
+  const trimmed = source.trim();
+  if (!trimmed) return null;
+
+  if (isShellEscapeSource(trimmed)) {
+    const stripped = stripShellEscape(trimmed);
+    if (!stripped) return null;
+    return {
+      kind: 'command',
+      executionSource: stripped
+    };
+  }
+
+  if (preferredKind === 'command') {
+    return {
+      kind: 'command',
+      executionSource: trimmed
+    };
+  }
+
+  return {
+    kind: 'ai',
+    executionSource: trimmed
+  };
 }
 
 export class WorkspaceNotebook {
-  cells: WorkspaceCell[] = [createWorkspaceCell('ai')];
+  cells: WorkspaceCell[];
   active = 0;
   mode: EditorMode = 'edit';
   agentSessionId: string | null = null;
@@ -88,6 +120,48 @@ export class WorkspaceNotebook {
   agentContextBridges: AgentContextBridge[] = [];
   private runQueue: RunRequest[] = [];
   private activeRequest: RunRequest | null = null;
+  private cellCounter = 0;
+  private executionCounter = 0;
+  private runCounter = 0;
+  // Cells whose draft kind was chosen explicitly (e.g. the composer Shell
+  // toggle). Untracked drafts derive their kind from an `!` marker so editing
+  // the source can flip them back to AI without changing the document format.
+  private readonly explicitDraftKinds = new Set<string>();
+
+  constructor() {
+    this.cells = [this.createCell('ai')];
+  }
+
+  createCell(kind: CellKind = 'ai', source = ''): WorkspaceCell {
+    return {
+      id: `cell-${++this.cellCounter}`,
+      kind,
+      source,
+      output: '',
+      blocks: [],
+      turn: null,
+      status: 'idle',
+      executionCount: null,
+      outputCollapsed: false,
+      agentContextGeneration: null
+    };
+  }
+
+  restoreCounters(cells: WorkspaceCell[] = this.cells): void {
+    let maxCell = 0;
+    let maxExecution = 0;
+    cells.forEach(cell => {
+      const match = /^cell-(\d+)$/.exec(cell.id);
+      if (match) {
+        maxCell = Math.max(maxCell, Number(match[1]));
+      }
+      if (typeof cell.executionCount === 'number') {
+        maxExecution = Math.max(maxExecution, cell.executionCount);
+      }
+    });
+    this.cellCounter = maxCell;
+    this.executionCounter = maxExecution;
+  }
 
   get activeRun(): RunRequest | null {
     return this.activeRequest;
@@ -121,7 +195,7 @@ export class WorkspaceNotebook {
     if (this.empty) {
       return this.appendCell();
     }
-    const cell = createWorkspaceCell();
+    const cell = this.createCell();
     this.cells.splice(this.active, 0, cell);
     this.mode = 'edit';
     return cell;
@@ -131,7 +205,7 @@ export class WorkspaceNotebook {
     if (this.empty) {
       return this.appendCell();
     }
-    const cell = createWorkspaceCell();
+    const cell = this.createCell();
     this.cells.splice(this.active + 1, 0, cell);
     this.active += 1;
     this.mode = 'edit';
@@ -141,7 +215,7 @@ export class WorkspaceNotebook {
   prepareRetry(index = this.active): WorkspaceCell | null {
     const source = this.cells[index];
     if (!source || !source.source.trim()) return null;
-    const retry = createWorkspaceCell(source.kind, source.source);
+    const retry = this.createCell(source.kind, source.source);
     this.cells.splice(index + 1, 0, retry);
     this.active = index + 1;
     this.mode = 'edit';
@@ -169,7 +243,7 @@ export class WorkspaceNotebook {
   }
 
   appendCell(): WorkspaceCell {
-    const cell = createWorkspaceCell();
+    const cell = this.createCell();
     this.cells.push(cell);
     this.active = this.cells.length - 1;
     this.mode = 'edit';
@@ -186,7 +260,22 @@ export class WorkspaceNotebook {
 
   setSource(source: string): void {
     if (this.empty) return;
-    this.current.source = source;
+    const cell = this.current;
+    cell.source = source;
+    if (cell.executionCount === null && !this.explicitDraftKinds.has(cell.id)) {
+      cell.kind = isShellEscapeSource(source) ? 'command' : 'ai';
+    }
+  }
+
+  setDraftKind(kind: CellKind, index = this.active): WorkspaceCell | null {
+    const cell = this.cells[index];
+    if (!cell) return null;
+    if (cell.status !== 'idle' || cell.executionCount !== null) {
+      return null;
+    }
+    this.explicitDraftKinds.add(cell.id);
+    cell.kind = kind;
+    return cell;
   }
 
   enqueueRun(
@@ -197,11 +286,11 @@ export class WorkspaceNotebook {
     const cell = this.cells[index];
     const source = cell?.source.trim();
     if (!cell || !source) return null;
-    const kind: CellKind = isShellEscapeSource(source) ? 'command' : 'ai';
-    const executableSource = executionSource(source);
-    if (!executableSource) return null;
+    const resolved = resolveRunExecution(source, cell.kind);
+    if (!resolved) return null;
+    const { kind, executionSource: executableSource } = resolved;
     const request: RunRequest = {
-      id: `run-${++runCounter}`,
+      id: `run-${++this.runCounter}`,
       cellId: cell.id,
       kind,
       source,
@@ -234,7 +323,7 @@ export class WorkspaceNotebook {
       cell.output = '';
       cell.blocks = [];
       cell.turn = null;
-      cell.executionCount = ++executionCounter;
+      cell.executionCount = ++this.executionCounter;
       cell.outputCollapsed = false;
       return request;
     }
@@ -368,7 +457,7 @@ export class WorkspaceNotebook {
     ) {
       return last;
     }
-    const cell = createWorkspaceCell();
+    const cell = this.createCell();
     this.cells.push(cell);
     return cell;
   }

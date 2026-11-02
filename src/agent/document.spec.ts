@@ -1,9 +1,14 @@
 import {
   AGENT_WORKSPACE_VERSION,
+  getAgentSessionReference,
+  getResumableDshSessionReference,
   normalizeAgentSessionId,
+  normalizeAgentSessionReference,
   parseWorkspaceSnapshot,
   restoreNotebook,
-  serializeNotebook
+  serializeNotebook,
+  setAgentSessionReference,
+  UnsupportedWorkspaceVersionError
 } from './document';
 import { WorkspaceNotebook } from './notebook';
 import { createTurn, setTurnStatus, toggleOutcome, toggleTrace } from './turn';
@@ -740,5 +745,373 @@ describe('Agent Workspace document', () => {
       title: 'Unsupported future-activity activity',
       detail: 'ok\nlegacy payload'
     });
+  });
+
+  it('round-trips a DSH session reference apart from the legacy agent session id', () => {
+    const notebook = new WorkspaceNotebook();
+    notebook.agentSessionId = '123e4567-e89b-12d3-a456-426614174000';
+    setAgentSessionReference(notebook, {
+      engine: 'dsh',
+      sessionId: 'dsh-session_01-ABC.123'
+    });
+
+    const text = serializeNotebook(notebook);
+    const serialized = JSON.parse(text) as Record<string, unknown>;
+
+    expect(serialized.sessionReference).toEqual({
+      engine: 'dsh',
+      sessionId: 'dsh-session_01-ABC.123'
+    });
+    expect(serialized.agentSessionId).toBe(
+      '123e4567-e89b-12d3-a456-426614174000'
+    );
+    expect(JSON.stringify(serialized)).not.toMatch(
+      /runtimeId|dshRuntimeId|connectionId/i
+    );
+
+    const restored = new WorkspaceNotebook();
+    restoreNotebook(restored, text);
+
+    expect(getResumableDshSessionReference(restored)).toEqual({
+      engine: 'dsh',
+      sessionId: 'dsh-session_01-ABC.123'
+    });
+    expect(getAgentSessionReference(restored)).toEqual({
+      engine: 'dsh',
+      sessionId: 'dsh-session_01-ABC.123'
+    });
+    // The DSH reference is preserved without forcing a legacy UUID onto it.
+    expect(restored.agentSessionId).toBe(
+      '123e4567-e89b-12d3-a456-426614174000'
+    );
+  });
+
+  it('reads a legacy V4 file without resuming its agentSessionId as DSH', () => {
+    const restored = new WorkspaceNotebook();
+    restoreNotebook(
+      restored,
+      JSON.stringify({
+        version: 4,
+        active: 0,
+        agentSessionId: '123e4567-e89b-12d3-a456-426614174000',
+        cells: [
+          {
+            id: 'legacy-ai',
+            kind: 'ai',
+            source: 'kept',
+            output: '',
+            blocks: [{ kind: 'text', id: 'text-1', text: 'evidence' }],
+            status: 'done',
+            executionCount: 1
+          }
+        ]
+      })
+    );
+
+    // History and the legacy identity survive untouched...
+    expect(restored.agentSessionId).toBe(
+      '123e4567-e89b-12d3-a456-426614174000'
+    );
+    expect(restored.cells[0].source).toBe('kept');
+    expect(restored.cells[0].blocks[0]).toMatchObject({ text: 'evidence' });
+    // ...but it is unbound, never treated as a resumable DSH session.
+    expect(getAgentSessionReference(restored)).toBeNull();
+    expect(getResumableDshSessionReference(restored)).toBeNull();
+  });
+
+  it('rejects unknown engines and malformed references while keeping history', () => {
+    const malformed: unknown[] = [
+      { engine: 'pi', sessionId: 'legacy-1' },
+      { engine: 'dsh' },
+      { engine: 'dsh', sessionId: '' },
+      { engine: 'dsh', sessionId: 'a/b' },
+      { engine: 'dsh', sessionId: '..' },
+      { engine: 'dsh', sessionId: 'bad\u0001id' },
+      { engine: 'dsh', sessionId: ' padded ' },
+      { engine: 'dsh', sessionId: 'x'.repeat(300) },
+      { engine: 'dsh', sessionId: 42 },
+      null,
+      {}
+    ];
+
+    for (const candidate of malformed) {
+      expect(normalizeAgentSessionReference(candidate)).toBeNull();
+
+      const restored = new WorkspaceNotebook();
+      restoreNotebook(
+        restored,
+        JSON.stringify({
+          version: AGENT_WORKSPACE_VERSION,
+          active: 0,
+          agentSessionId: '123e4567-e89b-12d3-a456-426614174000',
+          sessionReference: candidate,
+          cells: [
+            {
+              id: 'kept',
+              kind: 'ai',
+              source: 'kept',
+              output: '',
+              blocks: [],
+              status: 'done',
+              executionCount: 1
+            }
+          ]
+        })
+      );
+
+      expect(getResumableDshSessionReference(restored)).toBeNull();
+      expect(restored.agentSessionId).toBe(
+        '123e4567-e89b-12d3-a456-426614174000'
+      );
+      expect(restored.cells[0].source).toBe('kept');
+    }
+  });
+
+  it('rejects every U+0000..U+001F control character and DEL in a session id', () => {
+    const rejected: number[] = [];
+    for (let code = 0x00; code <= 0x1f; code++) rejected.push(code);
+    rejected.push(0x7f);
+
+    for (const code of rejected) {
+      const sessionId = `a${String.fromCharCode(code)}b`;
+      expect(
+        normalizeAgentSessionReference({ engine: 'dsh', sessionId })
+      ).toBeNull();
+    }
+
+    // The boundary above the control range stays usable.
+    expect(
+      normalizeAgentSessionReference({ engine: 'dsh', sessionId: 'a b' })
+    ).toEqual({ engine: 'dsh', sessionId: 'a b' });
+    expect(
+      normalizeAgentSessionReference({ engine: 'dsh', sessionId: 'a\u0080b' })
+    ).toEqual({ engine: 'dsh', sessionId: 'a\u0080b' });
+  });
+
+  it('does not persist runtime identity or running as authoritative activity', () => {
+    const notebook = new WorkspaceNotebook();
+    setAgentSessionReference(notebook, {
+      engine: 'dsh',
+      sessionId: 'dsh-session-live'
+    });
+    notebook.cells[0].status = 'running';
+
+    const text = serializeNotebook(notebook);
+    const serialized = JSON.parse(text) as Record<string, unknown>;
+
+    // Only the durable reference is stored; transients are never serialized.
+    expect(serialized.sessionReference).toEqual({
+      engine: 'dsh',
+      sessionId: 'dsh-session-live'
+    });
+    expect(JSON.stringify(serialized)).not.toMatch(
+      /runtimeId|dshRuntimeId|connectionId|running/i
+    );
+    expect((serialized.cells as Array<Record<string, unknown>>)[0].status).toBe(
+      'interrupted'
+    );
+
+    // A close/reopen keeps the session reference (it is not deleted) and does
+    // not resurrect "running" as authoritative activity.
+    const reopened = new WorkspaceNotebook();
+    restoreNotebook(reopened, text);
+    expect(getResumableDshSessionReference(reopened)).toEqual({
+      engine: 'dsh',
+      sessionId: 'dsh-session-live'
+    });
+    expect(reopened.cells[0].status).toBe('interrupted');
+  });
+
+  it('rejects a newer workspace version instead of normalizing it lossily', () => {
+    const raw = JSON.stringify({
+      version: AGENT_WORKSPACE_VERSION + 1,
+      active: 0,
+      agentSessionId: '123e4567-e89b-12d3-a456-426614174000',
+      sessionReference: { engine: 'future-engine', sessionId: 'future-1' },
+      futureRootField: { nested: true },
+      cells: [
+        {
+          id: 'future-cell',
+          kind: 'ai',
+          source: 'future question',
+          output: '',
+          blocks: [],
+          status: 'done',
+          executionCount: 1,
+          futureCellField: [1, 2, 3]
+        }
+      ]
+    });
+
+    let parseError: unknown;
+    try {
+      parseWorkspaceSnapshot(raw);
+    } catch (error) {
+      parseError = error;
+    }
+    expect(parseError).toBeInstanceOf(UnsupportedWorkspaceVersionError);
+    expect(parseError).toMatchObject({
+      foundVersion: AGENT_WORKSPACE_VERSION + 1,
+      supportedVersion: AGENT_WORKSPACE_VERSION
+    });
+
+    // Restoring must reject before touching the target: a lossy rebuild here
+    // would let the next save overwrite the newer document.
+    const notebook = new WorkspaceNotebook();
+    notebook.cells[0].source = 'local edit';
+    notebook.agentSessionId = '123e4567-e89b-12d3-a456-426614174000';
+    notebook.agentContextGeneration = 2;
+    setAgentSessionReference(notebook, {
+      engine: 'dsh',
+      sessionId: 'dsh-keep'
+    });
+    const cellsBefore = notebook.cells;
+
+    expect(() => restoreNotebook(notebook, raw)).toThrow(
+      UnsupportedWorkspaceVersionError
+    );
+    expect(notebook.cells).toBe(cellsBefore);
+    expect(notebook.cells[0].source).toBe('local edit');
+    expect(notebook.agentSessionId).toBe(
+      '123e4567-e89b-12d3-a456-426614174000'
+    );
+    expect(notebook.agentContextGeneration).toBe(2);
+    expect(getAgentSessionReference(notebook)).toEqual({
+      engine: 'dsh',
+      sessionId: 'dsh-keep'
+    });
+  });
+
+  it('clears a stale session reference when restoring text without one', () => {
+    const notebook = new WorkspaceNotebook();
+    setAgentSessionReference(notebook, {
+      engine: 'dsh',
+      sessionId: 'dsh-stale'
+    });
+
+    restoreNotebook(
+      notebook,
+      JSON.stringify({
+        version: AGENT_WORKSPACE_VERSION,
+        active: 0,
+        agentSessionId: null,
+        sessionReference: null,
+        cells: [
+          {
+            id: 'plain',
+            kind: 'ai',
+            source: 'plain question',
+            output: '',
+            blocks: [],
+            status: 'done',
+            executionCount: 1
+          }
+        ]
+      })
+    );
+
+    expect(getAgentSessionReference(notebook)).toBeNull();
+    expect(getResumableDshSessionReference(notebook)).toBeNull();
+    expect(JSON.parse(serializeNotebook(notebook)).sessionReference).toBeNull();
+  });
+
+  it('clears the session reference when set explicitly to null', () => {
+    const notebook = new WorkspaceNotebook();
+    setAgentSessionReference(notebook, {
+      engine: 'dsh',
+      sessionId: 'dsh-1'
+    });
+    setAgentSessionReference(notebook, null);
+
+    expect(getAgentSessionReference(notebook)).toBeNull();
+    expect(JSON.parse(serializeNotebook(notebook)).sessionReference).toBeNull();
+  });
+
+  it('returns a copy of the session reference that cannot mutate state', () => {
+    const notebook = new WorkspaceNotebook();
+    setAgentSessionReference(notebook, {
+      engine: 'dsh',
+      sessionId: 'dsh-copy'
+    });
+
+    const first = getAgentSessionReference(notebook);
+    expect(first).not.toBeNull();
+    first!.sessionId = 'tampered';
+    first!.engine = 'dsh';
+
+    expect(getAgentSessionReference(notebook)).toEqual({
+      engine: 'dsh',
+      sessionId: 'dsh-copy'
+    });
+    expect(JSON.parse(serializeNotebook(notebook)).sessionReference).toEqual({
+      engine: 'dsh',
+      sessionId: 'dsh-copy'
+    });
+  });
+
+  it('keeps the DSH session id and the legacy UUID as separate fields', () => {
+    const notebook = new WorkspaceNotebook();
+    notebook.agentSessionId = '123e4567-e89b-12d3-a456-426614174000';
+    setAgentSessionReference(notebook, {
+      engine: 'dsh',
+      sessionId: 'dsh-separate'
+    });
+
+    const serialized = JSON.parse(serializeNotebook(notebook)) as {
+      agentSessionId: string | null;
+      sessionReference: { engine: string; sessionId: string } | null;
+    };
+
+    expect(serialized.agentSessionId).toBe(
+      '123e4567-e89b-12d3-a456-426614174000'
+    );
+    expect(serialized.sessionReference).toEqual({
+      engine: 'dsh',
+      sessionId: 'dsh-separate'
+    });
+    expect(serialized.sessionReference?.sessionId).not.toBe(
+      serialized.agentSessionId
+    );
+  });
+
+  it('restores execution counter baseline for the document without leaking to new notebooks', () => {
+    const raw = JSON.stringify({
+      version: AGENT_WORKSPACE_VERSION,
+      active: 0,
+      agentSessionId: null,
+      sessionReference: null,
+      agentContextGeneration: 0,
+      agentContextBridges: [],
+      cells: [
+        {
+          id: 'cell-1',
+          kind: 'ai',
+          source: 'historical turn 1',
+          output: 'done',
+          blocks: [],
+          status: 'done',
+          executionCount: 18,
+          outputCollapsed: false
+        }
+      ]
+    });
+
+    const historicalNotebook = new WorkspaceNotebook();
+    restoreNotebook(historicalNotebook, raw);
+    expect(historicalNotebook.cells[0].executionCount).toBe(18);
+
+    historicalNotebook.insertBelow();
+    historicalNotebook.setSource('next run in historical');
+    historicalNotebook.enqueueRun();
+    historicalNotebook.promoteNextRun();
+    // The historical notebook continues at 19
+    expect(historicalNotebook.cells[1].executionCount).toBe(19);
+
+    // Another notebook instantiated after this must not start at 20; it must strictly start at 1
+    const freshNotebook = new WorkspaceNotebook();
+    freshNotebook.setSource('fresh');
+    freshNotebook.enqueueRun();
+    freshNotebook.promoteNextRun();
+    expect(freshNotebook.cells[0].executionCount).toBe(1);
   });
 });

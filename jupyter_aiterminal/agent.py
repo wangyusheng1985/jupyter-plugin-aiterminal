@@ -10,12 +10,16 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from jupyter_core.paths import jupyter_config_dir
+from jupyter_core.paths import jupyter_config_dir, jupyter_data_dir
 
-from .policy import forbidden_reason, install_argv, missing_binary
-from .settings import AgentConfigError, load_agent_settings
+from .dsh_acp_events import DshAcpEventProjector
+from .dsh_acp_session import DshAcpSession, DshAcpSessionError
+from .pi_client import PiProcessError
+from .settings import AgentConfigError, load_dsh_settings
 
 Emit = Callable[[dict[str, Any]], Awaitable[None]]
+
+# Legacy tool names for backward compatibility with existing tests/references
 ALLOWED_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
 SYSTEM_PROMPT_APPEND = (
     "After a tool finishes, do not summarize, restate, reformat, or "
@@ -25,6 +29,7 @@ SYSTEM_PROMPT_APPEND = (
     "tables, recaps, or conclusions after Bash output."
 )
 CLI_PATH_PREFIX = (
+    "/opt/homebrew/bin",
     "/usr/local/bin",
     str(Path.home() / ".local" / "bin"),
 )
@@ -32,19 +37,19 @@ STRIP_INHERITED_ENV = ("ANTHROPIC_AUTH_TOKEN",)
 NOT_CONNECTED_MESSAGE = "Not connected. Call connect() first."
 
 
-try:
-    from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher
-except ImportError:  # pragma: no cover - exercised when the extra is missing
-    ClaudeAgentOptions = None  # type: ignore[assignment]
-    ClaudeSDKClient = None  # type: ignore[assignment]
-    HookMatcher = None  # type: ignore[assignment]
+# Legacy names kept importable for old tests. Production connect never uses them.
+ClaudeAgentOptions = None  # type: ignore[assignment]
+ClaudeSDKClient = None  # type: ignore[assignment]
+HookMatcher = None  # type: ignore[assignment]
 
 
 def _is_not_connected_error(exc: BaseException) -> bool:
-    return (
-        type(exc).__name__ == "CLIConnectionError"
-        and str(exc).strip() == NOT_CONNECTED_MESSAGE
-    )
+    if type(exc).__name__ == "CLIConnectionError":
+        return str(exc).strip() == NOT_CONNECTED_MESSAGE
+    if isinstance(exc, PiProcessError) or type(exc).__name__ == "PiProcessError":
+        msg = str(exc).strip()
+        return msg == NOT_CONNECTED_MESSAGE or "not running" in msg
+    return False
 
 
 def normalize_session_id(value: object) -> str | None:
@@ -57,89 +62,263 @@ def normalize_session_id(value: object) -> str | None:
 
 
 class AgentSession:
+    """Legacy WebSocket session facade over one DSH ACP session.
+
+    Construction and ``start`` never install or spawn Pi/Claude; the only
+    runtime is the reviewed :class:`~jupyter_aiterminal.dsh_acp_session.DshAcpSession`.
+    The old Pi/Claude helper functions below stay importable for compatibility,
+    but production never calls them.
+    """
+
     def __init__(self, cwd: str, emit: Emit, resume_session_id: str | None = None):
         self.cwd = cwd
         self.emit = emit
-        self.session_id = resume_session_id or str(uuid.uuid4())
-        self._resume_requested = resume_session_id is not None
-        self.client: Any | None = None
+        self.session_id: str | None = None
+        self.runtime_id: str | None = None
         self.model = ""
+        self.storage_root = dsh_storage_root()
+        self._resume_requested = resume_session_id is not None
+        self._resume_session_id = resume_session_id
+        self._acp: DshAcpSession | None = None
+        self._config: Any | None = None
+        self._token = ""
+        self._start_lock = asyncio.Lock()
+        self._emit_tasks: set[asyncio.Task[None]] = set()
+        self._closed = False
         self._running = False
-        self._cli_stderr: list[str] = []
-        self._connect_lock = asyncio.Lock()
-        self._closing = False
         self._active_turn_id: str | None = None
-        self._tool_started_at: dict[str, float] = {}
+        self._projector: DshAcpEventProjector | None = None
+        self._legacy_text: dict[str, str] = {}
+        self._tool_names: dict[str, str] = {}
+        # Pending approval scopes keyed by the ACP request id, so a future
+        # handler can route a decision without reconstructing runtime identity.
+        self._permission_scopes: dict[str, dict[str, str]] = {}
 
     async def start(self) -> None:
-        await self._ensure_client()
+        await self._ensure_session()
 
-    async def _ensure_client(self):
-        async with self._connect_lock:
-            if self.client is not None:
-                return self.client
-            if self._closing:
+    async def _ensure_session(self) -> DshAcpSession | None:
+        # The lock serialises concurrent starts so only one ACP session is
+        # created; every failure below emits an error and leaves ``_acp`` unset
+        # so a later call can retry (e.g. after fixing Settings).
+        async with self._start_lock:
+            if self._acp is not None:
+                return self._acp
+            if self._closed:
                 return None
-            return await self._connect_unlocked()
+            try:
+                config = load_dsh_settings()
+            except AgentConfigError as exc:
+                await self._emit_event(
+                    {"type": "error", "code": "config", "message": str(exc)}
+                )
+                return None
+            except Exception:  # noqa: BLE001 - never echo raw settings payloads
+                await self._emit_event(
+                    {
+                        "type": "error",
+                        "code": "config",
+                        "message": (
+                            "AI Terminal provider settings could not be loaded."
+                        ),
+                    }
+                )
+                return None
 
-    async def _connect_unlocked(self):
-        try:
-            config = load_agent_settings()
-        except AgentConfigError as exc:
-            await self._emit_event(
-                {"type": "error", "code": "config", "message": str(exc)}
-            )
-            return None
-        if ClaudeSDKClient is None:
+            self._config = config
+            self.model = config.model
+            self._token = config.token
+            root = self.storage_root
+            try:
+                root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                # Refuse a symlinked storage root before chmod follows it.
+                if root.is_symlink():
+                    raise OSError(
+                        "agent storage directory must not be a symbolic link"
+                    )
+                os.chmod(root, 0o700)
+            except OSError as exc:
+                await self._emit_event(
+                    {
+                        "type": "error",
+                        "code": "runtime",
+                        "message": f"Agent storage directory is not usable: {exc}",
+                    }
+                )
+                return None
+
+            acp: DshAcpSession | None = None
+            try:
+                acp = DshAcpSession(
+                    config=config,
+                    cwd=self.cwd,
+                    storage_root=root,
+                    emit=self._on_acp_event,
+                    on_notification=self._handle_notification,
+                    resume_session_id=self._resume_session_id,
+                )
+                await acp.start()
+            except DshAcpSessionError as exc:
+                if acp is not None:
+                    await self._close_quietly(acp)
+                message = self._safe_message(exc)
+                if self._resume_requested:
+                    resume_error: dict[str, Any] = {
+                        "type": "error",
+                        "code": "resume",
+                        "message": (
+                            "Saved Agent context is unavailable; start a "
+                            f"new context. ({message})"
+                        ),
+                    }
+                    if self._resume_session_id:
+                        # Keep the durable identity visible so a client never
+                        # mistakes this failure for a fresh, silently replaced
+                        # session.
+                        resume_error["sessionId"] = self._resume_session_id
+                    await self._emit_event(resume_error)
+                else:
+                    await self._emit_event(
+                        {"type": "error", "code": "runtime", "message": message}
+                    )
+                return None
+            except Exception as exc:  # noqa: BLE001 - surface safely
+                if acp is not None:
+                    await self._close_quietly(acp)
+                await self._emit_event(
+                    {
+                        "type": "error",
+                        "code": "runtime",
+                        "message": self._safe_message(exc),
+                    }
+                )
+                return None
+
+            if self._closed:
+                await self._close_quietly(acp)
+                return None
+
+            self._acp = acp
+            self.session_id = acp.session_id
+            self.runtime_id = acp.runtime_id
             await self._emit_event(
                 {
-                    "type": "error",
-                    "code": "runtime",
-                    "message": "claude-agent-sdk is not installed on this Jupyter server.",
+                    "type": "ready",
+                    "sessionId": self.session_id,
+                    "contextState": "resumed" if self._resume_requested else "new",
+                    "model": self.model,
+                    "cwd": self.cwd,
                 }
             )
-            return None
-        self.model = config["ANTHROPIC_MODEL"]
-        self._cli_stderr = []
-        options = _build_options(
-            **sdk_client_kwargs(
-                config,
-                self.cwd,
-                self._pre_tool_use,
-                self._cli_stderr,
-                session_id=self.session_id,
-                resume=self.session_id if self._resume_requested else None,
-            )
-        )
-        client = None
-        try:
-            client = ClaudeSDKClient(options)
-            await client.connect()
-        except Exception as exc:  # noqa: BLE001 - relay/CLI failures stay visible
+            return acp
+
+    # -- ACP event adapters --------------------------------------------------
+
+    def _on_acp_event(self, event: dict[str, Any]) -> None:
+        """Sync ACP emit callback: track permissions and schedule websocket emit."""
+        event_type = event.get("type")
+        if event_type == "dsh/v1/session":
+            runtime_id = event.get("runtimeId")
+            previous_runtime = self.runtime_id
+            if (
+                isinstance(runtime_id, str)
+                and runtime_id
+                and previous_runtime is not None
+                and runtime_id != previous_runtime
+            ):
+                # Same websocket, new runtime generation (e.g. resuming after a
+                # failed turn). The client only retires the old runtime on a
+                # connection event and rejects a session handshake from a
+                # different runtime, so this must be emitted first or every
+                # later event for the new generation is dropped.
+                self._schedule_emit(
+                    {
+                        "type": "dsh/v1/connection",
+                        "runtimeId": runtime_id,
+                        "phase": "reconnecting",
+                    }
+                )
+        if event_type == "dsh/v1/interaction.requested":
+            request_id = event.get("requestId")
+            if isinstance(request_id, str) and request_id:
+                self._permission_scopes[request_id] = {
+                    "sessionId": str(event.get("sessionId", "")),
+                    "runtimeId": str(event.get("runtimeId", "")),
+                }
+        elif event_type in {
+            "dsh/v1/interaction.resolved",
+            "dsh/v1/interaction.cancelled",
+        }:
+            request_id = event.get("requestId")
+            if isinstance(request_id, str):
+                self._permission_scopes.pop(request_id, None)
+        self._schedule_emit(event)
+
+    def _schedule_emit(self, event: dict[str, Any]) -> None:
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(self._emit_event(event))
+        self._emit_tasks.add(task)
+        task.add_done_callback(self._on_emit_task_done)
+
+    async def _handle_notification(self, message: dict[str, Any]) -> None:
+        projector = self._projector
+        if projector is None or not isinstance(message, dict):
+            return
+        for event in projector.project_notification(
+            message.get("method"), message.get("params")
+        ):
+            await self._emit_product_event(event)
+
+    async def _emit_product_event(self, event: dict[str, Any]) -> None:
+        event_type = event.get("type")
+        if event_type in {"dsh/v1/text.snapshot", "dsh/v1/text.delta"}:
+            message_id = str(event.get("messageId", ""))
+            if event_type.endswith("snapshot"):
+                text = str(event.get("text", ""))
+            else:
+                text = self._legacy_text.get(message_id, "") + str(
+                    event.get("delta", "")
+                )
+            self._legacy_text[message_id] = text
+            await self._emit_event(event)
             await self._emit_event(
-                {
-                    "type": "error",
-                    "code": "resume" if self._resume_requested else "runtime",
-                    "message": format_sdk_error(exc, self._cli_stderr),
-                }
+                {"type": "text", "text": text, "messageId": message_id}
             )
-            return None
-        if self._closing:
-            disconnect = getattr(client, "disconnect", None)
-            if disconnect is not None:
-                await disconnect()
-            return None
-        self.client = client
-        await self._emit_event(
-            {
-                "type": "ready",
-                "sessionId": self.session_id,
-                "contextState": "resumed" if self._resume_requested else "new",
-                "model": self.model,
-                "cwd": self.cwd,
-            }
-        )
-        return client
+            return
+        if event_type == "dsh/v1/activity":
+            activity_id = str(event.get("activityId", ""))
+            tool_name = event.get("toolName")
+            if isinstance(tool_name, str) and tool_name:
+                self._tool_names[activity_id] = tool_name
+            await self._emit_event(event)
+            phase = event.get("phase")
+            if phase == "started":
+                await self._emit_event(
+                    {
+                        "type": "tool_start",
+                        "id": activity_id,
+                        "name": self._tool_names.get(activity_id, ""),
+                        "input": {},
+                        "startedAt": round(time.time() * 1000),
+                    }
+                )
+            elif phase == "finished":
+                output = str(event.get("outputSummary") or "")
+                await self._emit_event(
+                    {
+                        "type": "tool_end",
+                        "id": activity_id,
+                        "name": self._tool_names.get(activity_id, ""),
+                        "output": output,
+                        "isError": event.get("status") == "error",
+                        "lineCount": _line_count(output),
+                        "byteCount": len(output.encode("utf-8")),
+                    }
+                )
+            return
+        await self._emit_event(event)
+
+    # -- prompt and cancel ---------------------------------------------------
 
     async def query(self, text: str, turn_id: str | None = None) -> None:
         prompt = text.strip()
@@ -154,138 +333,186 @@ class AgentSession:
                 }
             )
             return
-        self._running = True
-        self._active_turn_id = turn_id
-        self._tool_started_at = {}
-        try:
-            client = await self._ensure_client()
-            if client is None:
-                return
-            stale = False
-            try:
-                await client.query(prompt)
-            except Exception as exc:  # noqa: BLE001 - retry only a stale client
-                if not _is_not_connected_error(exc):
-                    raise
-                stale = True
-            if stale:
-                await self._discard_client(client)
-                client = await self._ensure_client()
-                if client is None:
-                    return
-                await client.query(prompt)
-            await self._emit_event(
-                {"type": "accepted", "sessionId": self.session_id}
-            )
-            async for message in client.receive_response():
-                reported_session_id = normalize_session_id(
-                    getattr(message, "session_id", None)
-                )
-                if reported_session_id:
-                    self.session_id = reported_session_id
-                    self._resume_requested = True
-                for event in events_from_message(
-                    message,
-                    turn_id=turn_id,
-                    tool_started_at=self._tool_started_at,
-                ):
-                    await self._emit_event(event)
-        except Exception as exc:  # noqa: BLE001 - surface SDK/relay failures
-            message = (
-                "Agent connection is not available after reconnecting."
-                if _is_not_connected_error(exc)
-                else format_sdk_error(exc, self._cli_stderr)
-            )
+
+        acp = await self._ensure_session()
+        if acp is None:
+            return
+        session_id = acp.session_id
+        runtime_id = acp.runtime_id
+        if not session_id or not runtime_id:
             await self._emit_event(
                 {
                     "type": "error",
-                    "code": "resume" if self._resume_requested else "runtime",
-                    "message": message,
+                    "code": "runtime",
+                    "message": "Agent runtime did not report a session identity.",
                 }
             )
+            return
+
+        self._running = True
+        self._active_turn_id = turn_id
+        run_id = turn_id or f"turn-{uuid.uuid4().hex}"
+        projector = DshAcpEventProjector(session_id, runtime_id, run_id)
+        self._projector = projector
+        self._legacy_text = {}
+        self._tool_names = {}
+        try:
+            await self._emit_event({"type": "accepted", "sessionId": session_id})
+            for event in projector.begin():
+                await self._emit_product_event(event)
+            result = await acp.prompt(prompt, run_id)
+            terminal = projector.finish(result)
+            for event in terminal:
+                await self._emit_product_event(event)
+            status = terminal[0].get("status") if terminal else "failed"
+            await self._emit_event(
+                {
+                    "type": "result",
+                    "text": "",
+                    "isError": status != "completed",
+                    "sessionId": session_id,
+                }
+            )
+        except asyncio.CancelledError:
+            for event in projector.finish_error(None):
+                await self._emit_product_event(event)
+            raise
+        except DshAcpSessionError as exc:
+            for event in projector.finish_error(exc):
+                await self._emit_product_event(event)
+            await self._emit_event(
+                {
+                    "type": "error",
+                    "code": "runtime",
+                    "message": self._safe_message(exc),
+                }
+            )
+            await self._discard_session(acp)
+        except Exception as exc:  # noqa: BLE001 - surface safely
+            for event in projector.finish_error(exc):
+                await self._emit_product_event(event)
+            await self._emit_event(
+                {
+                    "type": "error",
+                    "code": "runtime",
+                    "message": self._safe_message(exc),
+                }
+            )
+            await self._discard_session(acp)
         finally:
             self._running = False
             self._active_turn_id = None
-            self._tool_started_at = {}
+            self._projector = None
+            self._legacy_text = {}
+            self._tool_names = {}
 
     async def interrupt(self) -> None:
-        if self.client is None:
+        acp = self._acp
+        if acp is None:
             return
-        interrupt = getattr(self.client, "interrupt", None)
-        if interrupt is not None:
-            await interrupt()
+        try:
+            await acp.cancel()
+        except Exception as exc:  # noqa: BLE001 - transport errors must reach user
+            message = self._safe_message(exc)
+            if "not running" in message:
+                return
+            await self._emit_event(
+                {"type": "error", "code": "runtime", "message": message}
+            )
+
+    async def resolve_permission(
+        self,
+        request_id: str,
+        decision: str,
+        scope: dict[str, str] | None = None,
+    ) -> bool:
+        """Route a pending approval to the ACP session. Never approves by default."""
+        acp = self._acp
+        if acp is None:
+            raise DshAcpSessionError("ACP session is not running")
+        resolved_scope = scope or self._permission_scopes.get(request_id)
+        if resolved_scope is None:
+            raise DshAcpSessionError(
+                f"no pending permission request {request_id!r}"
+            )
+        return await acp.resolve_permission(request_id, decision, resolved_scope)
 
     async def close(self) -> None:
-        self._closing = True
-        async with self._connect_lock:
-            client = self.client
-            self.client = None
-        if client is not None:
-            disconnect = getattr(client, "disconnect", None)
-            if disconnect is not None:
-                await disconnect()
+        self._closed = True
+        acp = self._acp
+        self._acp = None
+        if acp is not None:
+            await acp.close()
+        for task in list(self._emit_tasks):
+            task.cancel()
+        self._emit_tasks.clear()
 
-    async def _discard_client(self, client: Any) -> None:
-        async with self._connect_lock:
-            if self.client is client:
-                self.client = None
-        disconnect = getattr(client, "disconnect", None)
-        if disconnect is not None:
-            try:
-                await disconnect()
-            except Exception:  # noqa: BLE001 - stale clients are already unusable
-                pass
+    # -- helpers -------------------------------------------------------------
 
-    async def _pre_tool_use(self, input_data, tool_use_id, context):
-        del tool_use_id, context
-        if input_data.get("tool_name") != "Bash":
-            return {}
-        command = str(input_data.get("tool_input", {}).get("command", ""))
-        reason = forbidden_reason(command)
-        if reason:
+    def _safe_message(self, exc: BaseException) -> str:
+        message = str(exc).strip() or type(exc).__name__
+        if self._token:
+            message = message.replace(self._token, "[redacted]")
+        return message
+
+    async def _close_quietly(self, acp: DshAcpSession) -> None:
+        try:
+            await acp.close()
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
+
+    async def _discard_session(self, acp: DshAcpSession) -> None:
+        if self._acp is acp:
+            self._acp = None
+        session_id = acp.session_id
+        if session_id:
+            # Preserve the durable identity across a failed turn. The next
+            # turn must resume this session on a fresh runtime; silently
+            # opening a new session would be rejected by the browser (which
+            # refuses session/runtime changes) and would orphan approvals.
+            self._resume_session_id = session_id
+            self._resume_requested = True
+        await self._close_quietly(acp)
+        if not session_id:
+            # Nothing durable survived this runtime: say so explicitly instead
+            # of letting the next turn open a new session unannounced.
             await self._emit_event(
-                {"type": "denied", "command": command, "reason": reason}
-            )
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": reason,
+                {
+                    "type": "error",
+                    "code": "resume",
+                    "message": (
+                        "Agent context could not be preserved; start a new "
+                        "context before continuing."
+                    ),
                 }
-            }
-        binary = missing_binary(command)
-        argv = install_argv(binary) if binary else None
-        if argv:
-            display = " ".join(argv)
-            await self._emit_event(
-                {"type": "install", "command": display, "status": "started"}
             )
-            try:
-                detail = await _run_install(argv)
-            except Exception as exc:  # noqa: BLE001
-                await self._emit_event(
-                    {
-                        "type": "install",
-                        "command": display,
-                        "status": "failed",
-                        "detail": str(exc),
-                    }
-                )
-            else:
-                await self._emit_event(
-                    {
-                        "type": "install",
-                        "command": display,
-                        "status": "ok",
-                        "detail": detail,
-                    }
-                )
-        return {}
+
+    def _on_emit_task_done(self, task: asyncio.Task[None]) -> None:
+        self._emit_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()  # consume so a dead websocket never leaks a warning
 
     async def _emit_event(self, event: dict[str, Any]) -> None:
-        if self._active_turn_id and event.get("type") != "ready":
+        event_type = str(event.get("type", ""))
+        if (
+            self._active_turn_id
+            and event_type != "ready"
+            and not event_type.startswith("dsh/")
+        ):
             event = {**event, "turnId": self._active_turn_id}
         await self.emit(event)
+
+
+def dsh_storage_root() -> Path:
+    """Server-owned private ACP storage root; clients cannot choose it."""
+    override = os.environ.get("JUPYTER_DATA_DIR")
+    if override:
+        base = Path(override).expanduser()
+    else:
+        base = Path(jupyter_data_dir())
+    if not base.is_absolute():
+        base = Path(os.path.abspath(base))
+    return base / "aiterminal" / "dsh"
 
 
 def claude_home_dir() -> str:
@@ -333,6 +560,7 @@ def sdk_client_kwargs(
     session_id: str | None = None,
     resume: str | None = None,
 ) -> dict[str, Any]:
+    """Legacy unused helper. Production connect does not build Claude options."""
     kwargs: dict[str, Any] = {
         "allowed_tools": ALLOWED_TOOLS,
         "system_prompt": {
@@ -347,9 +575,9 @@ def sdk_client_kwargs(
         # Ignore ~/.claude/settings.json so Jupyter Settings are the only source.
         "setting_sources": [],
         "hooks": {
-            "PreToolUse": [HookMatcher(matcher="Bash", hooks=[pre_tool_use])]
-            if HookMatcher is not None
-            else []
+            "PreToolUse": [
+                {"matcher": "Bash", "hooks": [pre_tool_use]}
+            ]
         },
     }
     if resume:
@@ -598,4 +826,4 @@ def _optional_list(message: Any, attribute: str) -> list[Any] | None:
 def _line_count(text: str) -> int:
     if not text:
         return 0
-    return len(text.splitlines())
+    return text.count("\n") + (1 if not text.endswith("\n") else 0)

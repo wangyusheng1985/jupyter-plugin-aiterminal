@@ -5,9 +5,13 @@ import { Panel, Widget } from '@lumino/widgets';
 
 import { AGENT_PANEL_CLASS, ShutdownCoordinator } from '../theme';
 import {
+  getResumableDshSessionReference,
   normalizeAgentSessionId,
+  parseWorkspaceSnapshot,
   restoreNotebook,
-  serializeNotebook
+  serializeNotebook,
+  setAgentSessionReference,
+  UnsupportedWorkspaceVersionError
 } from './document';
 import { WorkspaceInputHistory, type HistoryNavigation } from './history';
 import {
@@ -20,7 +24,7 @@ import { mapHistoryKey, mapWorkspaceKey, strokeFromEvent } from './keys';
 import { renderMarkdownSource } from './markdown';
 import { CellNavigatorView } from './navigator';
 import {
-  isShellEscapeSource,
+  resolveRunExecution,
   WorkspaceNotebook,
   type RunRequest,
   type WorkspaceCell
@@ -30,7 +34,7 @@ import { WorkspaceSaveCoordinator } from './save-coordinator';
 import { SelectionCopyButton } from './selectioncopy';
 import { formatToolInput } from './tool';
 import type { AgentToolbarHost } from './toolbar';
-import type { ChatBlock } from './protocol';
+import type { ChatBlock, DshProductEvent } from './protocol';
 import { renderTurn, type TurnRenderHandlers } from './turn-renderer';
 import {
   createTurn,
@@ -60,6 +64,19 @@ import {
 
 export interface SourceChangeOptions {
   fromHistory?: boolean;
+}
+
+/**
+ * Explicit state for a document that could not be loaded safely. While set, the
+ * workspace is read-only: it never starts a fresh session, never serializes the
+ * in-memory model back into the document, and refuses new runs. The kind keeps
+ * a newer-format rejection distinct from an unexpected failure for diagnostics.
+ */
+export interface DocumentLoadError {
+  kind: 'unsupported-version' | 'unknown' | 'session-mismatch';
+  message: string;
+  foundVersion?: number;
+  supportedVersion?: number;
 }
 
 export interface CellHandlers {
@@ -115,7 +132,11 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     null;
   private historyPath: string | null = null;
   private applyingModel = false;
+  private documentLoadErrorState: DocumentLoadError | null = null;
+  private sessionStarted = false;
   private deleteChordTimer = 0;
+  private composing = false;
+  private compositionEndTimer = 0;
   private readonly copyButton: SelectionCopyButton;
   private followState: FollowState = INACTIVE_FOLLOW_STATE;
   private viewportCellId: string | null = null;
@@ -130,6 +151,8 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   private pendingContextAcceptance: Pick<RunRequest, 'id' | 'cellId'> | null =
     null;
   private readonly saveCoordinator: WorkspaceSaveCoordinator;
+  private unsubscribeDsh: (() => void) | null = null;
+  private dshOwnedSession: string | null = null;
 
   constructor(
     private readonly rendermime: IRenderMimeRegistry | null = null,
@@ -146,6 +169,13 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     this.addClass(AGENT_PANEL_CLASS);
     this.notebookView = new NotebookView(this.notebook, {
       onSource: (source, options) => {
+        if (this.documentLoadErrorState) {
+          // The open document could not be loaded safely, so cell edits must
+          // not change the model; refresh so the editor shows the kept text.
+          this.reportDocumentLoadError();
+          this.refresh();
+          return;
+        }
         if (!options?.fromHistory) {
           this.inputHistory.resetNavigation();
         }
@@ -155,6 +185,8 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
           pending?.cellId === this.notebook.current.id &&
           pending.source !== source.trim()
         ) {
+          // Editing the pending cell's source cancels the context choice but
+          // must keep the cell and its just-edited content.
           this.cancelContextChoice(false);
         }
         this.persistSoon();
@@ -189,6 +221,7 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     this.body.addClass('jp-AgentWorkspace-body');
     this.body.addWidget(this.notebookView);
     this.body.addWidget(this.navigatorView);
+
     this.returnLatestButton = document.createElement('button');
     this.returnLatestButton.type = 'button';
     this.returnLatestButton.className = 'jp-AgentWorkspace-returnLatest';
@@ -218,6 +251,28 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     this.node.tabIndex = -1;
     this.copyButton = new SelectionCopyButton(this.node);
     this.node.addEventListener('keydown', event => this.onKey(event), true);
+    this.node.addEventListener(
+      'compositionstart',
+      () => {
+        this.composing = true;
+      },
+      true
+    );
+    this.node.addEventListener(
+      'compositionend',
+      () => {
+        // Some IMEs dispatch the committing keydown right after compositionend
+        // with isComposing already false. Keep the guard one macrotask longer
+        // so that key cannot submit the cell it just committed.
+        this.composing = true;
+        window.clearTimeout(this.compositionEndTimer);
+        this.compositionEndTimer = window.setTimeout(() => {
+          this.compositionEndTimer = 0;
+          this.composing = false;
+        }, 0);
+      },
+      true
+    );
     this.notebookView.node.addEventListener('scroll', this.onNotebookScroll, {
       passive: true
     });
@@ -245,6 +300,9 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     );
     this.createViewportObserver();
     this.session.subscribe(() => this.onSessionChange());
+    this.unsubscribeDsh = this.session.subscribeDsh(event =>
+      this.onDshEvent(event)
+    );
     this.refresh();
   }
 
@@ -254,10 +312,18 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   }
 
   start(): void {
-    if (this.closing || this.isDisposed) return;
+    if (this.closing || this.isDisposed || this.sessionStarted) return;
+    this.sessionStarted = true;
     this.session.connect();
     this.refresh();
-    queueMicrotask(() => this.notebookView.focusActive());
+    queueMicrotask(() => {
+      if (this.closing || this.isDisposed) return;
+      // Only seed focus when nothing meaningful is focused yet; an existing
+      // cell editor focus must survive activation.
+      const active = document.activeElement;
+      if (active && active !== document.body) return;
+      this.notebookView.focusActive();
+    });
   }
 
   get uiState(): WorkspaceUiState {
@@ -289,22 +355,39 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     return () => this.uiListeners.delete(listener);
   }
 
+  /**
+   * The current load-protection state, or null when the document loaded cleanly.
+   * A non-null value means the workspace is read-only for the open document.
+   */
+  get documentLoadError(): DocumentLoadError | null {
+    return this.documentLoadErrorState;
+  }
+
   attachContext(
     context: DocumentRegistry.IContext<DocumentRegistry.ICodeModel>
   ): void {
     this.context = context;
-    void context.ready.then(() => {
-      if (this.isDisposed || this.closing) return;
-      this.historyPath = context.path;
-      this.inputHistory.restore(this.historyStorage.load(context.path));
-      this.applyModel();
-      this.session.configureContext(this.notebook.agentSessionId);
-      if (!context.model.toString().trim()) {
-        this.persistNow();
-      }
-      this.start();
-      context.model.contentChanged.connect(this.onModelContentChanged, this);
-    });
+    void context.ready
+      .then(() => {
+        if (this.isDisposed || this.closing) return;
+        this.historyPath = context.path;
+        this.inputHistory.restore(this.historyStorage.load(context.path));
+        this.applyModel();
+        if (!this.documentLoadErrorState) {
+          this.session.configureContext(this.notebook.agentSessionId);
+          this.configureDshSessionFromDocument();
+          if (!context.model.toString().trim()) {
+            this.persistNow();
+          }
+          this.start();
+        }
+        context.model.contentChanged.connect(this.onModelContentChanged, this);
+      })
+      .catch(error => {
+        if (this.isDisposed || this.closing) return;
+        this.enterDocumentLoadError(error);
+        this.refresh();
+      });
   }
 
   private onModelContentChanged(): void {
@@ -313,6 +396,10 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   }
 
   insertAbove(): void {
+    if (this.documentLoadErrorState) {
+      this.reportDocumentLoadError();
+      return;
+    }
     this.inputHistory.resetNavigation();
     this.notebook.insertAbove();
     this.refresh();
@@ -321,6 +408,10 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   }
 
   insertBelow(): void {
+    if (this.documentLoadErrorState) {
+      this.reportDocumentLoadError();
+      return;
+    }
     this.inputHistory.resetNavigation();
     this.notebook.insertBelow();
     this.refresh();
@@ -329,6 +420,10 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   }
 
   addCellFromFooter(): void {
+    if (this.documentLoadErrorState) {
+      this.reportDocumentLoadError();
+      return;
+    }
     this.clearDeleteChord();
     this.inputHistory.resetNavigation();
     if (this.notebook.empty) {
@@ -343,6 +438,10 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   }
 
   deleteActive(): void {
+    if (this.documentLoadErrorState) {
+      this.reportDocumentLoadError();
+      return;
+    }
     this.clearDeleteChord();
     this.inputHistory.resetNavigation();
     if (this.notebook.empty) {
@@ -402,6 +501,8 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     if (this.isDisposed) return;
     this.closing = true;
     this.clearDeleteChord();
+    window.clearTimeout(this.compositionEndTimer);
+    this.compositionEndTimer = 0;
     this.copyButton.dispose();
     this.inputHistory.resetNavigation();
     const hadPendingRuns =
@@ -432,6 +533,8 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
       this.viewportFrame = 0;
     }
     this.uiListeners.clear();
+    this.unsubscribeDsh?.();
+    this.unsubscribeDsh = null;
     if (hadPendingRuns) this.persistNow();
     void this.shutdownOnce().catch(error => {
       console.error(`Agent Workspace not shut down: ${error}`);
@@ -488,8 +591,23 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     if (!cell) return;
     const turn = cell.turn ?? turnForCell(cell);
     if (!turn || turn.id !== turnId) return;
+    // Rebuilding the output changes its height, so keep the disclosure the
+    // user just activated anchored at the same viewport position instead of
+    // letting the list jump under the pointer.
+    const scrollNode = this.notebookView.node;
+    const focusKey = this.notebookView.takeToggleFocusKey();
+    const anchor = focusKey ? this.notebookView.toggleElement(focusKey) : null;
+    const anchorTop = anchor?.getBoundingClientRect().top ?? null;
+    const scrollTop = scrollNode.scrollTop;
     cell.turn = update(turn);
     this.refresh();
+    if (focusKey !== null && anchorTop !== null) {
+      const next = this.notebookView.toggleElement(focusKey);
+      if (next) {
+        scrollNode.scrollTop =
+          scrollTop + (next.getBoundingClientRect().top - anchorTop);
+      }
+    }
     this.persistSoon();
   }
 
@@ -523,6 +641,15 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   }
 
   private onKey(event: KeyboardEvent): void {
+    // Never translate shortcut keys while an IME composition is active (or
+    // just ended); the editor must own the committing keydown.
+    if (event.isComposing || this.composing) return;
+    if (event.key === 'Escape' && this.pendingContextSubmission) {
+      event.preventDefault();
+      event.stopPropagation();
+      this.cancelContextChoice(true);
+      return;
+    }
     if (
       event.target instanceof Node &&
       this.status.node.contains(event.target)
@@ -624,9 +751,24 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   }
 
   private runCell(advance: boolean): void {
+    if (this.documentLoadErrorState) {
+      this.reportDocumentLoadError();
+      return;
+    }
     if (this.notebook.empty) return;
     const source = this.notebook.current.source.trim();
-    if (source && !isShellEscapeSource(source)) {
+    // Shell commands are resolved from the cell kind plus the `!` escape, the
+    // same way `enqueueRun` resolves them, so a command cell is never treated
+    // as an AI request and a `!` prefix is never treated as one either.
+    if (
+      resolveRunExecution(source, this.notebook.current.kind)?.kind === 'ai'
+    ) {
+      if (this.pendingContextSubmission) {
+        this.status.setMessage(
+          'Resolve the pending context choice before submitting again.'
+        );
+        return;
+      }
       const membership = this.contextMembership();
       const visibleAiCount =
         membership.nativeCount +
@@ -661,7 +803,8 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   private acceptRun(
     index: number,
     advance: boolean,
-    historyBridge?: HistoryBridgeCapsule
+    historyBridge?: HistoryBridgeCapsule,
+    ensureTrailing = true
   ): RunRequest | null {
     this.notebook.select(index);
     const request = this.notebook.enqueueRun(index, advance, historyBridge);
@@ -669,7 +812,9 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     if (this.inputHistory.add(request.source)) {
       this.saveInputHistory();
     }
-    this.notebook.ensureTrailingInput();
+    if (ensureTrailing) {
+      this.notebook.ensureTrailingInput();
+    }
     this.refresh();
     this.persistSoon();
     if (advance) {
@@ -727,20 +872,28 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
       if (this.session.contextState === 'unavailable') {
         this.notebook.startNewAgentContext(null);
         this.session.resetContext();
+        this.clearDshSessionBinding();
       }
     } else if (
       this.notebook.agentSessionId ||
+      getResumableDshSessionReference(this.notebook) !== null ||
       this.session.contextState === 'live' ||
       this.session.contextState === 'resumed' ||
       this.session.contextState === 'unavailable'
     ) {
       this.notebook.startNewAgentContext();
       this.session.resetContext();
+      this.clearDshSessionBinding();
     } else {
       this.notebook.setAgentContextBridge([]);
     }
 
-    const request = this.acceptRun(index, pending.advance, historyBridge);
+    const request = this.acceptRun(
+      index,
+      pending.advance,
+      historyBridge,
+      false
+    );
     if (!request) {
       this.status.closeHistoryChoice();
       return;
@@ -751,12 +904,12 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     };
   }
 
-  private cancelContextChoice(focusDraft: boolean): void {
+  private cancelContextChoice(focusEditor = true): void {
     if (this.pendingContextAcceptance) return;
     const pending = this.pendingContextSubmission;
     this.pendingContextSubmission = null;
     this.status.closeHistoryChoice();
-    if (!focusDraft || !pending) return;
+    if (!pending || !focusEditor) return;
     const index = this.notebook.cells.findIndex(
       cell => cell.id === pending.cellId
     );
@@ -822,6 +975,7 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
         ? normalizeAgentSessionId(this.session.sessionId)
         : null;
     if (
+      !this.documentLoadErrorState &&
       confirmedSessionId &&
       confirmedSessionId !== this.notebook.agentSessionId
     ) {
@@ -908,20 +1062,124 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   private applyModel(): void {
     if (!this.context) return;
     const text = this.context.model.toString();
+    const recovering = this.documentLoadErrorState !== null;
     if (text === serializeNotebook(this.notebook)) {
+      // The open document already matches memory: a previously blocked load is
+      // now consistent, so safe to release the read-only protection.
+      this.documentLoadErrorState = null;
       this.saveCoordinator.acceptExternalSavedState();
+      this.finishDocumentRecovery(recovering);
+      this.refresh();
       return;
     }
-    if (!this.saveCoordinator.acceptExternalSavedState()) return;
+    // Check the format before the dirty-state guard so a newer document is
+    // never ignored while local edits are pending; otherwise the next save
+    // would serialize the older in-memory model over it.
+    try {
+      parseWorkspaceSnapshot(text);
+    } catch (error) {
+      this.enterDocumentLoadError(error);
+      this.refresh();
+      return;
+    }
+    // While protected, an external supported replacement is authoritative even
+    // if the coordinator still holds pre-error edits; accepting the reset is
+    // what clears the protection and lets the document load again.
+    if (!recovering && !this.saveCoordinator.acceptExternalSavedState()) return;
     this.inputHistory.resetNavigation();
     this.applyingModel = true;
-    restoreNotebook(this.notebook, text);
-    this.applyingModel = false;
+    try {
+      restoreNotebook(this.notebook, text);
+      this.documentLoadErrorState = null;
+    } catch (error) {
+      this.enterDocumentLoadError(error);
+    } finally {
+      this.applyingModel = false;
+    }
+    this.finishDocumentRecovery(recovering);
     this.refresh();
   }
 
+  private finishDocumentRecovery(recovering: boolean): void {
+    if (!recovering || this.documentLoadErrorState) return;
+    if (this.sessionStarted) {
+      const legacyMatches =
+        normalizeAgentSessionId(this.session.sessionId) ===
+        normalizeAgentSessionId(this.notebook.agentSessionId);
+      const liveDsh = this.session.dshSessionId;
+      const documentDsh =
+        getResumableDshSessionReference(this.notebook)?.sessionId ?? null;
+      if (legacyMatches && liveDsh === documentDsh) {
+        return;
+      }
+      // The open socket is already bound to the previous document's session and
+      // cannot be reconfigured in place. Refuse the recovered session instead
+      // of letting the old connection write its id into the new document.
+      // DSH documents have no legacy UUID, so their identity must be compared
+      // too or two `null` legacy ids would silently look like a match.
+      this.documentLoadErrorState = {
+        kind: 'session-mismatch',
+        message:
+          'This workspace was recovered, but the open agent session belongs to a different document. Reopen the workspace to attach the recovered session; the file is left unchanged to protect it.'
+      };
+      return;
+    }
+    this.session.configureContext(this.notebook.agentSessionId);
+    this.configureDshSessionFromDocument();
+    this.start();
+  }
+
+  /**
+   * Binds the durable DSH session persisted in the document before the socket
+   * connects. `AgentSession.configureDshSession` sends it as the independent
+   * `dshSessionId` query parameter and refuses to run on an open socket, so this
+   * only ever applies while the workspace is still starting.
+   */
+  private configureDshSessionFromDocument(): void {
+    const reference = getResumableDshSessionReference(this.notebook);
+    this.session.configureDshSession(reference?.sessionId ?? null);
+  }
+
+  /**
+   * Drops the durable DSH binding so a new context cannot resume the previous
+   * session: memory, the document reference, and the session URL all forget it.
+   */
+  private clearDshSessionBinding(): void {
+    this.dshOwnedSession = null;
+    setAgentSessionReference(this.notebook, null);
+  }
+
+  private enterDocumentLoadError(error: unknown): void {
+    if (error instanceof UnsupportedWorkspaceVersionError) {
+      this.documentLoadErrorState = {
+        kind: 'unsupported-version',
+        message: `This workspace uses a newer format (v${error.foundVersion}); this build supports v${error.supportedVersion}. Editing and saving are disabled to protect the file.`,
+        foundVersion: error.foundVersion,
+        supportedVersion: error.supportedVersion
+      };
+      return;
+    }
+    const detail = error instanceof Error ? error.message : String(error);
+    this.documentLoadErrorState = {
+      kind: 'unknown',
+      message: `This workspace could not be loaded; editing and saving are disabled to protect the file. (${detail})`
+    };
+  }
+
+  private reportDocumentLoadError(): void {
+    if (!this.documentLoadErrorState) return;
+    this.status.setMessage(this.documentLoadErrorState.message);
+  }
+
   private persistSoon(): void {
-    if (!this.context || this.applyingModel || this.closing) return;
+    if (
+      !this.context ||
+      this.applyingModel ||
+      this.closing ||
+      this.documentLoadErrorState
+    ) {
+      return;
+    }
     this.saveCoordinator.markDirty();
   }
 
@@ -935,7 +1193,8 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
       !this.context ||
       !this.context.isReady ||
       this.applyingModel ||
-      this.isDisposed
+      this.isDisposed ||
+      this.documentLoadErrorState
     ) {
       return;
     }
@@ -947,8 +1206,23 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     if (!context || !context.isReady) {
       throw new Error('Workspace document is not ready to save.');
     }
+    if (this.documentLoadErrorState) {
+      throw new Error(
+        'Workspace document is protected because it could not be loaded safely.'
+      );
+    }
+    const current = context.model.toString();
     const text = serializeNotebook(this.notebook);
-    if (text === context.model.toString()) return;
+    if (text === current) return;
+    // Last line of defense: never overwrite a newer document with the current
+    // in-memory model, even if a save was queued before the change was seen.
+    try {
+      parseWorkspaceSnapshot(current);
+    } catch (error) {
+      this.enterDocumentLoadError(error);
+      this.reportDocumentLoadError();
+      throw error;
+    }
     this.applyingModel = true;
     try {
       context.model.fromString(text);
@@ -962,6 +1236,11 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     if (!context || !context.isReady) {
       throw new Error('Workspace document is not ready to save.');
     }
+    if (this.documentLoadErrorState) {
+      throw new Error(
+        'Workspace document is protected because it could not be loaded safely.'
+      );
+    }
     await context.save();
   }
 
@@ -971,7 +1250,7 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   }
 
   private refresh(): void {
-    this.notebookView.render();
+    this.notebookView.render(this.documentLoadErrorState !== null);
     if (!this.viewportCellId && !this.notebook.empty) {
       this.viewportCellId = this.notebook.current.id;
     }
@@ -988,7 +1267,42 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   private syncWorkspaceChrome(): void {
     const state = this.uiState;
     this.status.sync(state, workspaceOverview(this.notebook.cells));
+    if (this.documentLoadErrorState) {
+      // A load protection notice must stay visible across refreshes, unlike a
+      // transient status message that the next sync would replace.
+      this.status.setMessage(this.documentLoadErrorState.message);
+    }
     this.notifyUiState(state);
+  }
+
+  /**
+   * DSH product events only bind durable identity here: the engine-issued
+   * session id is persisted so a reopened document can resume that session.
+   * Activity already reaches the Cell through the legacy tool blocks the
+   * backend mirrors, the current runtime produces no artifact record, and
+   * interactions are resolved by the runtime itself, so none of those records
+   * get a second workspace surface.
+   */
+  private onDshEvent(event: DshProductEvent): void {
+    if (this.isDisposed) return;
+    switch (event.type) {
+      case 'dsh/v1/session':
+      case 'dsh/v1/run.started':
+        this.adoptDshSession(event.sessionId);
+        return;
+      default:
+        return;
+    }
+  }
+
+  private adoptDshSession(sessionId: string): void {
+    if (this.dshOwnedSession === sessionId) return;
+    this.dshOwnedSession = sessionId;
+    if (this.documentLoadErrorState) return;
+    // Persist only the engine-issued session id, never the runtime or any live
+    // state, so reopening the document can resume this exact session.
+    setAgentSessionReference(this.notebook, { engine: 'dsh', sessionId });
+    this.persistSoon();
   }
 
   private notifyUiState(state: WorkspaceUiState): void {
@@ -999,9 +1313,14 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   }
 
   private startNewContext(): void {
+    if (this.documentLoadErrorState) {
+      this.reportDocumentLoadError();
+      return;
+    }
     if (this.notebook.activeRun) return;
     this.notebook.startNewAgentContext();
     this.session.resetContext();
+    this.clearDshSessionBinding();
     this.persistNow();
     this.refresh();
   }
@@ -1143,16 +1462,48 @@ class NotebookView extends Widget {
     });
     this.node.append(footer);
     this.footer = footer;
+    this.node.addEventListener(
+      'click',
+      event => {
+        const target = event.target;
+        if (!(target instanceof Element)) return;
+        this.toggleFocusKey =
+          target.closest<HTMLElement>('[data-turn-focus-key]')?.dataset
+            .turnFocusKey ?? null;
+      },
+      true
+    );
   }
 
   private readonly footer: HTMLButtonElement;
+  private toggleFocusKey: string | null = null;
 
-  render(): void {
+  /**
+   * Consume the focus key of the disclosure control in the click that is
+   * currently being handled. The capture-phase listener above observes the
+   * click before the control's own handler rebuilds the output.
+   */
+  takeToggleFocusKey(): string | null {
+    const key = this.toggleFocusKey;
+    this.toggleFocusKey = null;
+    return key;
+  }
+
+  toggleElement(focusKey: string): HTMLElement | null {
+    return (
+      Array.from(
+        this.node.querySelectorAll<HTMLElement>('[data-turn-focus-key]')
+      ).find(node => node.dataset.turnFocusKey === focusKey) ?? null
+    );
+  }
+
+  render(readOnly = false): void {
     const seen = new Set<string>();
     this.notebook.cells.forEach((cell, index) => {
       seen.add(cell.id);
-      const view = this.views.get(cell.id) ?? this.createView(cell, index);
-      view.sync(cell, index, this.notebook);
+      const view =
+        this.views.get(cell.id) ?? this.createView(cell, index, readOnly);
+      view.sync(cell, index, this.notebook, readOnly);
       if (view.node.parentElement !== this.node) {
         this.node.insertBefore(view.node, this.footer);
       } else if (this.node.children[index] !== view.node) {
@@ -1165,6 +1516,7 @@ class NotebookView extends Widget {
     this.views.forEach((view, id) => {
       if (seen.has(id)) return;
       view.node.remove();
+      view.dispose();
       this.views.delete(id);
     });
   }
@@ -1231,12 +1583,38 @@ class NotebookView extends Widget {
     return visible >= Math.min(80, rect.height * 0.4);
   }
 
-  private createView(cell: WorkspaceCell, index: number): CellView {
+  private createView(
+    cell: WorkspaceCell,
+    index: number,
+    readOnly: boolean
+  ): CellView {
     const view = new CellView(cell.id, this.handlers);
     this.views.set(cell.id, view);
-    view.sync(cell, index, this.notebook);
+    view.sync(cell, index, this.notebook, readOnly);
     return view;
   }
+}
+
+const CELL_INPUT_MAX_HEIGHT = 320;
+
+function editorLineHeight(editor: HTMLTextAreaElement): number {
+  const style = getComputedStyle(editor);
+  const lineHeight = Number.parseFloat(style.lineHeight);
+  if (!Number.isFinite(lineHeight) || lineHeight <= 0) return 0;
+  const padding =
+    (Number.parseFloat(style.paddingTop) || 0) +
+    (Number.parseFloat(style.paddingBottom) || 0);
+  const border =
+    (Number.parseFloat(style.borderTopWidth) || 0) +
+    (Number.parseFloat(style.borderBottomWidth) || 0);
+  return lineHeight + padding + border;
+}
+
+function editorMaxHeight(editor: HTMLTextAreaElement): number {
+  const declared = Number.parseFloat(getComputedStyle(editor).maxHeight);
+  return Number.isFinite(declared) && declared > 0
+    ? declared
+    : CELL_INPUT_MAX_HEIGHT;
 }
 
 export class CellView {
@@ -1244,12 +1622,14 @@ export class CellView {
   private readonly editor: HTMLTextAreaElement;
   private readonly inputPrompt: HTMLDivElement;
   private readonly inputCollapser: HTMLDivElement;
+  private readonly resizeObserver: ResizeObserver | null;
   private outputRow: HTMLDivElement | null = null;
   private outputPrompt: HTMLDivElement | null = null;
   private outputBody: HTMLDivElement | null = null;
   private outputCollapser: HTMLDivElement | null = null;
   private index = 0;
   private lastOutputKey = '';
+  private lastSizedValue: string | null = null;
 
   constructor(
     readonly id: string,
@@ -1288,7 +1668,7 @@ export class CellView {
     this.editor.spellcheck = false;
     this.editor.addEventListener('input', () => {
       this.handlers.onSource(this.editor.value);
-      this.editor.rows = Math.max(1, this.editor.value.split('\n').length);
+      this.autoSizeEditor();
     });
     this.editor.addEventListener('keydown', event => this.onEditorKey(event));
     this.editor.addEventListener('blur', () => {
@@ -1307,20 +1687,39 @@ export class CellView {
     });
     inputRow.append(this.inputCollapser, this.inputPrompt, this.editor);
     this.node.append(inputRow);
+    this.resizeObserver =
+      typeof ResizeObserver === 'undefined'
+        ? null
+        : new ResizeObserver(() => this.autoSizeEditor(true));
+    this.resizeObserver?.observe(inputRow);
+    this.autoSizeEditor();
   }
 
-  sync(cell: WorkspaceCell, index: number, notebook: WorkspaceNotebook): void {
+  dispose(): void {
+    this.resizeObserver?.disconnect();
+  }
+
+  sync(
+    cell: WorkspaceCell,
+    index: number,
+    notebook: WorkspaceNotebook,
+    readOnly = false
+  ): void {
     this.index = index;
     const active = index === notebook.active;
-    const editing = active && notebook.mode === 'edit';
+    const editing = !readOnly && active && notebook.mode === 'edit';
     this.node.classList.toggle('is-active', active);
     this.node.classList.toggle('is-edit', editing);
     this.node.classList.toggle('is-collapsed', cell.outputCollapsed);
     setPrompt(this.inputPrompt, cell);
-    if (document.activeElement !== this.editor) {
+    if (
+      readOnly ||
+      this.editor.readOnly ||
+      document.activeElement !== this.editor
+    ) {
       this.editor.value = cell.source;
     }
-    this.editor.rows = Math.max(1, this.editor.value.split('\n').length);
+    this.autoSizeEditor();
     this.editor.readOnly = !editing;
     if (!editing) {
       this.handlers.onHistoryReset();
@@ -1364,6 +1763,54 @@ export class CellView {
     });
   }
 
+  /**
+   * Fits the editor to its wrapped content height so soft-wrapped lines grow
+   * the row too; past the maximum the editor scrolls internally instead.
+   * Repeated syncs of unchanged text skip re-measuring to avoid layout churn
+   * that would move the caret or scroll position.
+   */
+  private autoSizeEditor(force = false): void {
+    const editor = this.editor;
+    if (
+      !force &&
+      editor.style.height !== '' &&
+      this.lastSizedValue === editor.value
+    ) {
+      return;
+    }
+    const previousHeight = editor.style.height;
+    const previousOverflowY = editor.style.overflowY;
+    const previousScrollTop = editor.scrollTop;
+    editor.style.height = 'auto';
+    const scrollHeight = editor.scrollHeight;
+    if (!Number.isFinite(scrollHeight) || scrollHeight <= 0) {
+      // No layout yet (detached node or jsdom): keep the previous height
+      // instead of collapsing the editor to zero.
+      editor.style.height = previousHeight;
+      editor.style.overflowY = previousOverflowY;
+      return;
+    }
+    const maxHeight = editorMaxHeight(editor);
+    const style = getComputedStyle(editor);
+    const borderBox =
+      (Number.parseFloat(style.borderTopWidth) || 0) +
+      (Number.parseFloat(style.borderBottomWidth) || 0);
+    const contentHeight = scrollHeight + borderBox;
+    const overflow = contentHeight > maxHeight;
+    editor.style.height = `${Math.max(
+      editorLineHeight(editor),
+      Math.min(contentHeight, maxHeight)
+    )}px`;
+    editor.style.overflowY = overflow ? 'auto' : 'hidden';
+    this.lastSizedValue = editor.value;
+    if (overflow && previousScrollTop > 0) {
+      editor.scrollTop = Math.min(
+        previousScrollTop,
+        Math.max(0, scrollHeight - editor.clientHeight)
+      );
+    }
+  }
+
   private onEditorKey(event: KeyboardEvent): void {
     const action = mapHistoryKey(strokeFromEvent(event), {
       editable: !this.editor.readOnly,
@@ -1380,7 +1827,7 @@ export class CellView {
     event.preventDefault();
     event.stopPropagation();
     this.editor.value = navigation.source;
-    this.editor.rows = Math.max(1, navigation.source.split('\n').length);
+    this.autoSizeEditor();
     this.handlers.onSource(navigation.source, { fromHistory: true });
     this.editor.setSelectionRange(
       navigation.source.length,
@@ -1715,6 +2162,9 @@ export class StatusBar extends Widget {
           } outside the current Agent context. Continue with a bounded read-only history bridge, or start without that history.`;
     this.resetContextButton.hidden = true;
     this.historyChoice.hidden = false;
+    if (!this.contextPopover.contains(this.historyChoice)) {
+      this.contextPopover.append(this.historyChoice);
+    }
     this.setHistoryChoiceBusy(false);
     this.setContextOpen(true);
     queueMicrotask(() => {
@@ -1724,6 +2174,8 @@ export class StatusBar extends Widget {
 
   closeHistoryChoice(): void {
     this.historyChoice.hidden = true;
+    // Detach so a cancelled choice leaves no stale buttons in the popover.
+    this.historyChoice.remove();
     this.resetContextButton.hidden = false;
     this.setHistoryChoiceBusy(false);
     this.setContextOpen(false);

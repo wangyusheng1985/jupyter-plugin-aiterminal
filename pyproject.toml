@@ -24,7 +24,7 @@ classifiers = [
 dependencies = [
     "jupyterlab>=4.5,<5",
     "jupyter_server>=2.0",
-    "claude-agent-sdk"
+    "deepseek-harness-runtime-bin==0.2.1rc2"
 ]
 dynamic = ["version", "description", "authors", "keywords"]
 

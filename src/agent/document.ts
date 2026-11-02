@@ -11,7 +11,6 @@ import {
 import {
   createWorkspaceCell,
   isShellEscapeSource,
-  restoreCounters,
   type AgentContextBridge,
   type CellKind,
   type CellStatus,
@@ -19,11 +18,47 @@ import {
   type WorkspaceNotebook
 } from './notebook';
 
-export const AGENT_WORKSPACE_VERSION = 4;
+export const AGENT_WORKSPACE_VERSION = 5;
 export const AGENT_FILE_TYPE = 'agent-workspace';
 export const AGENT_FILE_EXT = '.agentnb';
 export const AGENT_FACTORY = 'Agent Workspace';
 export const AGENT_MODEL_NAME = 'agent-workspace';
+
+/**
+ * Thrown when a document was written by a newer workspace format than this
+ * build understands. Parsing and restoring reject it outright instead of
+ * normalizing it down to {@link AGENT_WORKSPACE_VERSION}: a best-effort rebuild
+ * would silently drop unknown fields, and any later save would overwrite the
+ * newer document with the lossy version.
+ */
+export class UnsupportedWorkspaceVersionError extends Error {
+  readonly foundVersion: number;
+  readonly supportedVersion: number;
+
+  constructor(foundVersion: number) {
+    super(
+      `Workspace version ${foundVersion} is newer than supported version ${AGENT_WORKSPACE_VERSION}.`
+    );
+    this.name = 'UnsupportedWorkspaceVersionError';
+    this.foundVersion = foundVersion;
+    this.supportedVersion = AGENT_WORKSPACE_VERSION;
+  }
+}
+
+/** Durable engine that owns an agent session reference. */
+export type AgentSessionEngine = 'dsh';
+
+/**
+ * Durable, serializable reference to an agent session. This is deliberately
+ * separate from {@link WorkspaceNotebook.agentSessionId}, which carries the
+ * legacy Pi/Claude UUID. It stores only the engine discriminator and the
+ * engine-issued session id; it never stores a runtime id, live connection, or
+ * "running" state, because those are transient and must not be resumed.
+ */
+export interface AgentSessionReference {
+  engine: AgentSessionEngine;
+  sessionId: string;
+}
 
 export interface CellSnapshot {
   id: string;
@@ -42,6 +77,7 @@ export interface WorkspaceSnapshot {
   version: number;
   active: number;
   agentSessionId: string | null;
+  sessionReference: AgentSessionReference | null;
   agentContextGeneration: number;
   agentContextBridges: AgentContextBridge[];
   cells: CellSnapshot[];
@@ -54,6 +90,7 @@ export function snapshotFromNotebook(
     version: AGENT_WORKSPACE_VERSION,
     active: notebook.active,
     agentSessionId: normalizeAgentSessionId(notebook.agentSessionId),
+    sessionReference: getAgentSessionReference(notebook),
     agentContextGeneration: normalizeGeneration(
       notebook.agentContextGeneration
     ),
@@ -75,13 +112,23 @@ export function parseWorkspaceSnapshot(text: string): WorkspaceSnapshot {
   if (!trimmed) {
     return emptySnapshot();
   }
+  let value: Partial<WorkspaceSnapshot> | null;
   try {
-    return normalizeSnapshot(JSON.parse(trimmed) as Partial<WorkspaceSnapshot>);
+    value = JSON.parse(trimmed) as Partial<WorkspaceSnapshot> | null;
   } catch {
+    // Unreadable JSON yields an empty document (historical behavior).
     return emptySnapshot();
   }
+  // Outside the JSON try/catch: a newer-format document must surface as a
+  // typed rejection, never as an empty snapshot that would be saved over it.
+  return normalizeSnapshot(value);
 }
 
+/**
+ * Restores a notebook in place. Parsing happens first, so a document from a
+ * newer workspace format throws {@link UnsupportedWorkspaceVersionError} while
+ * the target notebook and its session reference remain untouched.
+ */
 export function restoreNotebook(
   notebook: WorkspaceNotebook,
   text: string
@@ -89,6 +136,11 @@ export function restoreNotebook(
   const snapshot = parseWorkspaceSnapshot(text);
   notebook.cells = snapshot.cells.map(cellFromSnapshot);
   notebook.agentSessionId = snapshot.agentSessionId;
+  if (snapshot.sessionReference) {
+    sessionReferences.set(notebook, { ...snapshot.sessionReference });
+  } else {
+    sessionReferences.delete(notebook);
+  }
   notebook.agentContextGeneration = snapshot.agentContextGeneration;
   notebook.agentContextBridges = snapshot.agentContextBridges.map(bridge => ({
     generation: bridge.generation,
@@ -97,12 +149,12 @@ export function restoreNotebook(
   if (!notebook.cells.length) {
     notebook.active = 0;
     notebook.mode = 'command';
-    restoreCounters(notebook.cells);
+    notebook.restoreCounters(notebook.cells);
     return;
   }
   notebook.active = clamp(snapshot.active, 0, notebook.cells.length - 1);
   notebook.mode = 'edit';
-  restoreCounters(notebook.cells);
+  notebook.restoreCounters(notebook.cells);
 }
 
 function snapshotFromCell(cell: WorkspaceCell): CellSnapshot {
@@ -152,11 +204,27 @@ function cellFromSnapshot(cell: CellSnapshot): WorkspaceCell {
 function normalizeSnapshot(
   value: Partial<WorkspaceSnapshot> | null | undefined
 ): WorkspaceSnapshot {
+  if (
+    value &&
+    typeof value.version === 'number' &&
+    Number.isSafeInteger(value.version) &&
+    value.version > AGENT_WORKSPACE_VERSION
+  ) {
+    throw new UnsupportedWorkspaceVersionError(value.version);
+  }
   if (!Array.isArray(value?.cells)) {
     return emptySnapshot();
   }
   const sourceVersion = normalizeGeneration(value.version);
   const agentSessionId = normalizeAgentSessionId(value.agentSessionId);
+  // A reference is only honored from version 5 onward; legacy V1-V4 files never
+  // persisted one, so an incidental field can never be resurrected as a DSH
+  // resume. Newer versions are rejected above, so this only ever reads the
+  // current format; unknown session engines still resolve to none.
+  const sessionReference =
+    sourceVersion >= 5
+      ? normalizeAgentSessionReference(value.sessionReference)
+      : null;
   const cells = value.cells.map(normalizeCell);
   if (sourceVersion < 4) {
     migrateLegacyContext(cells, sourceVersion, agentSessionId);
@@ -195,6 +263,7 @@ function normalizeSnapshot(
     version: AGENT_WORKSPACE_VERSION,
     active: typeof value?.active === 'number' ? value.active : 0,
     agentSessionId,
+    sessionReference,
     agentContextGeneration,
     agentContextBridges,
     cells
@@ -247,6 +316,7 @@ function emptySnapshot(): WorkspaceSnapshot {
     version: AGENT_WORKSPACE_VERSION,
     active: 0,
     agentSessionId: null,
+    sessionReference: null,
     agentContextGeneration: 0,
     agentContextBridges: [],
     cells: [snapshotFromCell(cell)]
@@ -379,6 +449,83 @@ function clamp(value: number, min: number, max: number): number {
   if (value < min) return min;
   if (value > max) return max;
   return value;
+}
+
+// The notebook model intentionally holds only display state. The serializable
+// agent session reference is stored here, keyed to its notebook instance, so
+// the document can round-trip it without leaking engine/runtime details into
+// the notebook model or adding ad-hoc properties to it.
+const sessionReferences = new WeakMap<
+  WorkspaceNotebook,
+  AgentSessionReference
+>();
+
+/** Store (or clear) the durable agent session reference for a notebook. */
+export function setAgentSessionReference(
+  notebook: WorkspaceNotebook,
+  reference: AgentSessionReference | null
+): void {
+  const normalized = normalizeAgentSessionReference(reference);
+  if (normalized) {
+    sessionReferences.set(notebook, normalized);
+  } else {
+    sessionReferences.delete(notebook);
+  }
+}
+
+/** Returns the stored reference (a copy) regardless of engine, or null. */
+export function getAgentSessionReference(
+  notebook: WorkspaceNotebook
+): AgentSessionReference | null {
+  const reference = sessionReferences.get(notebook);
+  return reference ? { ...reference } : null;
+}
+
+/**
+ * Returns a resume-ready DSH reference for wiring into a live session. Returns
+ * null when the document is legacy/unbound or carries anything but a valid
+ * `dsh` reference; callers must not fall back to the legacy `agentSessionId`.
+ */
+export function getResumableDshSessionReference(
+  notebook: WorkspaceNotebook
+): AgentSessionReference | null {
+  const reference = getAgentSessionReference(notebook);
+  return reference && reference.engine === 'dsh' ? reference : null;
+}
+
+/**
+ * True when the value contains an ASCII control character (U+0000..U+001F) or
+ * DEL (U+007F). Checked per code unit because ESLint's `no-control-regex`
+ * rejects the equivalent character class in a regular expression.
+ */
+function hasControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) return true;
+  }
+  return false;
+}
+
+/**
+ * Validates an agent session reference. DSH session ids are opaque SDK strings,
+ * not UUIDs, so only clearly unsafe values are rejected: empty or oversized
+ * ids, control characters, surrounding whitespace, and path-like values that
+ * could escape a directory. Unknown engines yield no reference and never fall
+ * back to the legacy `agentSessionId`.
+ */
+export function normalizeAgentSessionReference(
+  value: unknown
+): AgentSessionReference | null {
+  if (!value || typeof value !== 'object') return null;
+  const reference = value as Partial<AgentSessionReference>;
+  if (reference.engine !== 'dsh') return null;
+  if (typeof reference.sessionId !== 'string') return null;
+  const sessionId = reference.sessionId;
+  if (sessionId.length === 0 || sessionId.length > 256) return null;
+  if (sessionId !== sessionId.trim()) return null;
+  if (hasControlCharacter(sessionId)) return null;
+  if (/[/\\]/.test(sessionId) || sessionId.includes('..')) return null;
+  return { engine: 'dsh', sessionId };
 }
 
 export function normalizeAgentSessionId(value: unknown): string | null {

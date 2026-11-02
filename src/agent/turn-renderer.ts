@@ -301,7 +301,15 @@ function renderActivityDetails(
 
   switch (activity.kind) {
     case 'text':
-      renderMarkdownSource(body, activity.text, options.rendermime ?? null);
+      if (isStreamingTextActivity(turn, activity)) {
+        const stream = document.createElement('div');
+        stream.className = 'jp-AgentWorkspace-streamingText';
+        stream.style.whiteSpace = 'pre-wrap';
+        stream.textContent = activity.text;
+        body.append(stream);
+      } else {
+        renderMarkdownSource(body, activity.text, options.rendermime ?? null);
+      }
       break;
     case 'thinking':
       body.textContent = 'Reasoning activity';
@@ -326,6 +334,18 @@ function renderActivityDetails(
     );
   }
   return body;
+}
+
+function isStreamingTextActivity(
+  turn: ChatTurn,
+  activity: TurnActivity
+): boolean {
+  return (
+    turn.status === 'running' &&
+    activity.kind === 'text' &&
+    turn.timeline.length > 0 &&
+    turn.timeline[turn.timeline.length - 1].id === activity.id
+  );
 }
 
 function renderToolDetails(

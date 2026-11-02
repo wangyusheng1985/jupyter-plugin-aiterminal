@@ -1,4 +1,5 @@
 import type { DocumentRegistry } from '@jupyterlab/docregistry';
+import { ServerConnection } from '@jupyterlab/services';
 
 import {
   AgentWorkspaceContent,
@@ -10,7 +11,13 @@ import {
   renderCellOutputPreservingScroll,
   runningIndicatorNode
 } from './workspace';
-import { restoreNotebook, serializeNotebook } from './document';
+import {
+  getResumableDshSessionReference,
+  restoreNotebook,
+  serializeNotebook,
+  setAgentSessionReference,
+  AGENT_WORKSPACE_VERSION
+} from './document';
 import { WorkspaceInputHistory } from './history';
 import {
   InputHistoryStorage,
@@ -640,6 +647,188 @@ describe('CellView input history', () => {
       this.history.resetNavigation();
     };
   }
+});
+
+describe('CellView input height', () => {
+  function cell(overrides: Partial<WorkspaceCell> = {}): WorkspaceCell {
+    return {
+      id: 'cell-1',
+      kind: 'command',
+      source: '',
+      output: '',
+      blocks: [],
+      turn: null,
+      status: 'idle',
+      executionCount: null,
+      outputCollapsed: false,
+      ...overrides,
+      agentContextGeneration: overrides.agentContextGeneration ?? null
+    };
+  }
+
+  function handlers(history = new WorkspaceInputHistory()): CellHandlers {
+    return {
+      onSource: jest.fn(),
+      onSelect: jest.fn(),
+      onToggleCollapse: jest.fn(),
+      onAddCell: jest.fn(),
+      onHistoryPrevious: draft => history.previous(draft),
+      onHistoryNext: () => history.next(),
+      onHistoryReset: () => history.resetNavigation(),
+      rendermime: null
+    };
+  }
+
+  function mockScrollHeight(
+    editor: HTMLTextAreaElement,
+    read: () => number
+  ): void {
+    Object.defineProperty(editor, 'scrollHeight', {
+      configurable: true,
+      get: read
+    });
+  }
+
+  function expectFittedHeight(
+    editor: HTMLTextAreaElement,
+    content: number
+  ): void {
+    const height = Number.parseFloat(editor.style.height);
+    expect(Number.isFinite(height)).toBe(true);
+    expect(height).toBeGreaterThanOrEqual(content);
+    expect(height).toBeLessThanOrEqual(content + 4);
+  }
+
+  function editorOf(view: CellView): HTMLTextAreaElement {
+    const editor = view.node.querySelector<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    );
+    if (!editor) throw new Error('missing cell input');
+    return editor;
+  }
+
+  it('keeps the height when layout measurement is unavailable', () => {
+    const view = new CellView('cell-1', handlers());
+    view.sync(cell({ source: 'one\ntwo\nthree' }), 0, new WorkspaceNotebook());
+
+    const editor = editorOf(view);
+    expect(editor.style.height).toBe('');
+    expect(editor.style.overflowY).toBe('');
+  });
+
+  it('grows with soft-wrapped content and scrolls internally past the maximum', () => {
+    const onSource = jest.fn();
+    const view = new CellView('cell-1', { ...handlers(), onSource });
+    view.sync(cell(), 0, new WorkspaceNotebook());
+    const editor = editorOf(view);
+    let measured = 52;
+    mockScrollHeight(editor, () => measured);
+
+    editor.value = 'single line that wraps inside a narrow row';
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+
+    expect(onSource).toHaveBeenLastCalledWith(editor.value);
+    expectFittedHeight(editor, 52);
+    expect(editor.style.overflowY).toBe('hidden');
+
+    measured = 900;
+    editor.value = 'x'.repeat(2000);
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+
+    expect(editor.style.height).toBe('320px');
+    expect(editor.style.overflowY).toBe('auto');
+  });
+
+  it('re-measures when synced source and history navigation change the text', () => {
+    const history = new WorkspaceInputHistory();
+    history.add('recalled\ncommand');
+    const view = new CellView('cell-1', handlers(history));
+    const notebook = new WorkspaceNotebook();
+    const command = cell({ source: 'short' });
+    view.sync(command, 0, notebook);
+    const editor = editorOf(view);
+    let measured = 30;
+    mockScrollHeight(editor, () => measured);
+
+    measured = 96;
+    command.source = 'longer\nsource\nblock';
+    view.sync(command, 0, notebook);
+    expectFittedHeight(editor, 96);
+
+    measured = 44;
+    editor.setSelectionRange(0, 0);
+    editor.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'ArrowUp',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+
+    expect(editor.value).toBe('recalled\ncommand');
+    expectFittedHeight(editor, 44);
+    expect(editor.style.overflowY).toBe('hidden');
+  });
+
+  it('keeps the fitted height stable across repeated syncs of the same text', () => {
+    const view = new CellView('cell-1', handlers());
+    const notebook = new WorkspaceNotebook();
+    const command = cell({ source: 'alpha\nbeta' });
+    view.sync(command, 0, notebook);
+    const editor = editorOf(view);
+    let measured = 64;
+    mockScrollHeight(editor, () => measured);
+
+    view.sync(command, 0, notebook);
+    expectFittedHeight(editor, 64);
+
+    measured = 200;
+    view.sync(command, 0, notebook);
+    expect(editor.value).toBe('alpha\nbeta');
+    expectFittedHeight(editor, 64);
+  });
+
+  it('re-measures on resize and disconnects the observer on dispose', () => {
+    const callbacks: ResizeObserverCallback[] = [];
+    const disconnect = jest.fn();
+    const observe = jest.fn();
+    class MockResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        callbacks.push(callback);
+      }
+      observe = observe;
+      unobserve = jest.fn();
+      disconnect = disconnect;
+    }
+    const globals = globalThis as { ResizeObserver?: unknown };
+    const previous = globals.ResizeObserver;
+    globals.ResizeObserver = MockResizeObserver;
+    try {
+      const view = new CellView('cell-1', handlers());
+      view.sync(cell({ source: 'wrapped text' }), 0, new WorkspaceNotebook());
+      const editor = editorOf(view);
+      const inputRow = view.node.querySelector(
+        '.jp-AgentWorkspace-row.is-input'
+      );
+      expect(observe).toHaveBeenCalledWith(inputRow);
+      expect(callbacks).toHaveLength(1);
+
+      let measured = 0;
+      mockScrollHeight(editor, () => measured);
+      callbacks[0]([], {} as ResizeObserver);
+      expect(editor.style.height).toBe('');
+
+      measured = 130;
+      callbacks[0]([], {} as ResizeObserver);
+      expectFittedHeight(editor, 130);
+
+      view.dispose();
+      expect(disconnect).toHaveBeenCalledTimes(1);
+    } finally {
+      if (previous === undefined) delete globals.ResizeObserver;
+      else globals.ResizeObserver = previous;
+    }
+  });
 });
 
 describe('AgentWorkspaceContent queue scheduling', () => {
@@ -3039,6 +3228,1332 @@ describe('AgentWorkspaceContent page interaction', () => {
       content.node.querySelector('.jp-AgentWorkspace-navigatorItem.is-running')
     ).not.toBeNull();
     unsubscribe();
+    content.dispose();
+  });
+});
+
+describe('cell context submission', () => {
+  interface CellSubmitInternals {
+    refresh(): void;
+    runCell(advance: boolean): void;
+    onSessionChange(): void;
+  }
+
+  beforeEach(() => {
+    jest.spyOn(AgentSession.prototype, 'connect').mockImplementation(() => {});
+    jest.spyOn(AgentSession.prototype, 'close').mockImplementation(() => {});
+    jest.spyOn(AgentSession.prototype, 'sendUser').mockImplementation(function (
+      this: AgentSession,
+      text: string
+    ): void {
+      this.blocks = [{ kind: 'user', id: 'queued-user', text }];
+      this.error = null;
+      this.running = true;
+    });
+    jest
+      .spyOn(AgentSession.prototype, 'interrupt')
+      .mockImplementation(() => {});
+    jest
+      .spyOn(AgentSession.prototype, 'interruptExec')
+      .mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    document.body.replaceChildren();
+  });
+
+  function cellInputs(content: AgentWorkspaceContent): HTMLTextAreaElement[] {
+    return Array.from(
+      content.node.querySelectorAll<HTMLTextAreaElement>(
+        '.jp-AgentWorkspace-cellInput'
+      )
+    );
+  }
+
+  function cellInput(
+    content: AgentWorkspaceContent,
+    index = content.notebook.active
+  ): HTMLTextAreaElement {
+    const input = cellInputs(content)[index];
+    expect(input).toBeDefined();
+    return input!;
+  }
+
+  function typeIntoCell(
+    content: AgentWorkspaceContent,
+    source: string,
+    index = content.notebook.active
+  ): HTMLTextAreaElement {
+    const input = cellInput(content, index);
+    input.value = source;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    return input;
+  }
+
+  function submitCell(
+    content: AgentWorkspaceContent,
+    source: string,
+    options: { advance?: boolean; index?: number; select?: boolean } = {}
+  ): void {
+    if (options.select) {
+      content.notebook.select(options.index ?? content.notebook.active);
+      (content as unknown as CellSubmitInternals).refresh();
+    }
+    const input = typeIntoCell(content, source, options.index);
+    input.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Enter',
+        shiftKey: options.advance === true,
+        ctrlKey: options.advance !== true,
+        bubbles: true,
+        cancelable: true
+      })
+    );
+  }
+
+  function seedDoneAiCell(content: AgentWorkspaceContent): WorkspaceCell {
+    const cell = content.notebook.current;
+    cell.source = 'previous ai';
+    cell.kind = 'ai';
+    cell.status = 'done';
+    cell.executionCount = 1;
+    return cell;
+  }
+
+  function appendInputCell(content: AgentWorkspaceContent): WorkspaceCell {
+    const cell = content.notebook.appendCell();
+    (content as unknown as CellSubmitInternals).refresh();
+    return cell;
+  }
+
+  function contextButtons(content: AgentWorkspaceContent): {
+    bridge: HTMLButtonElement | null;
+    empty: HTMLButtonElement | null;
+  } {
+    return {
+      bridge: content.node.querySelector(
+        '.jp-AgentWorkspace-contextChoice.is-primary'
+      ),
+      empty: content.node.querySelector(
+        '.jp-AgentWorkspace-contextChoice.is-secondary'
+      )
+    };
+  }
+
+  function dismissContextChoice(content: AgentWorkspaceContent): void {
+    content.node.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Escape',
+        bubbles: true,
+        cancelable: true
+      })
+    );
+  }
+
+  it('runs an AI cell submit and queues a ! shell submit', () => {
+    const exec = jest
+      .spyOn(AgentSession.prototype, 'exec')
+      .mockResolvedValue({ output: 'ok\n', returncode: 0, cwd: '/tmp' });
+    const sendUser = jest.mocked(AgentSession.prototype.sendUser);
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as CellSubmitInternals;
+    document.body.append(content.node);
+
+    submitCell(content, 'explain this notebook');
+    expect(content.notebook.cells[0].kind).toBe('ai');
+    expect(content.notebook.cells[0].status).toBe('running');
+    expect(sendUser).toHaveBeenCalledWith(
+      'explain this notebook',
+      expect.stringMatching(/^run-/)
+    );
+    expect(content.notebook.cells[1]).toMatchObject({
+      kind: 'ai',
+      source: '',
+      status: 'idle'
+    });
+
+    submitCell(content, '!ls -la', { index: 1, select: true });
+    const shell = content.notebook.cells.find(
+      cell => cell.source === '!ls -la'
+    );
+    expect(shell?.kind).toBe('command');
+    expect(shell?.status).toBe('queued');
+    expect(exec).not.toHaveBeenCalled();
+
+    content.session.running = false;
+    content.session.connected = true;
+    content.session.error = null;
+    internals.onSessionChange();
+
+    expect(content.notebook.cells[0].status).toBe('done');
+    expect(exec).toHaveBeenCalledWith('ls -la');
+    expect(content.notebook.activeRun).toMatchObject({
+      kind: 'command',
+      source: '!ls -la',
+      executionSource: 'ls -la'
+    });
+
+    content.dispose();
+  });
+
+  it('refuses a second cell submit while a context choice is pending', () => {
+    const content = new AgentWorkspaceContent(null);
+    document.body.append(content.node);
+    seedDoneAiCell(content);
+    appendInputCell(content);
+    content.session.contextState = 'unavailable';
+
+    submitCell(content, 'continue the analysis');
+    const pendingId = content.notebook.cells.find(
+      cell => cell.source === 'continue the analysis'
+    )?.id;
+    expect(contextButtons(content).bridge).not.toBeNull();
+    expect(content.notebook.cells).toHaveLength(2);
+
+    cellInput(content).dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Enter',
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true
+      })
+    );
+
+    expect(
+      content.notebook.cells.filter(
+        cell => cell.source === 'continue the analysis'
+      )
+    ).toHaveLength(1);
+    expect(content.notebook.cells).toHaveLength(2);
+    expect(
+      content.notebook.cells.find(cell => cell.id === pendingId)?.status
+    ).toBe('idle');
+    expect(content.node.textContent).toContain(
+      'Resolve the pending context choice before submitting again.'
+    );
+
+    content.dispose();
+  });
+
+  it('runs the pending cell once after the context choice is confirmed', () => {
+    const sendUser = jest.mocked(AgentSession.prototype.sendUser);
+    const content = new AgentWorkspaceContent(null);
+    document.body.append(content.node);
+    seedDoneAiCell(content);
+    const input = appendInputCell(content);
+    content.session.contextState = 'unavailable';
+
+    submitCell(content, 'original question');
+    expect(content.notebook.cells).toHaveLength(2);
+    contextButtons(content).bridge?.click();
+
+    expect(content.notebook.cells).toHaveLength(2);
+    expect(
+      content.notebook.cells.some(cell => cell.source === 'original question')
+    ).toBe(true);
+    expect(sendUser).toHaveBeenCalledWith(
+      'original question',
+      expect.stringMatching(/^run-/),
+      expect.anything()
+    );
+    expect(
+      content.notebook.cells.find(cell => cell.id === input.id)?.status
+    ).toBe('running');
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-contextChoice')
+        ?.textContent
+    ).toContain('Continuing…');
+
+    content.dispose();
+  });
+
+  it('keeps the pending cell when the choice is cancelled', () => {
+    const content = new AgentWorkspaceContent(null);
+    document.body.append(content.node);
+    seedDoneAiCell(content);
+    appendInputCell(content);
+    const before = content.notebook.cells.map(cell => cell.id);
+    content.session.contextState = 'unavailable';
+
+    submitCell(content, 'will be cancelled');
+    expect(content.notebook.cells.map(cell => cell.id)).toEqual(before);
+    dismissContextChoice(content);
+
+    expect(content.notebook.cells.map(cell => cell.id)).toEqual(before);
+    expect(content.notebook.current.source).toBe('will be cancelled');
+    expect(cellInput(content).value).toBe('will be cancelled');
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-contextChoice')
+    ).toBeNull();
+
+    content.dispose();
+  });
+
+  it('does not leave an idle cell when an AI submit is refused as unavailable', () => {
+    const content = new AgentWorkspaceContent(null);
+    document.body.append(content.node);
+    content.session.contextState = 'unavailable';
+    const before = content.notebook.cells.map(cell => cell.id);
+
+    submitCell(content, 'cannot run yet');
+
+    expect(content.notebook.cells.map(cell => cell.id)).toEqual(before);
+    expect(content.notebook.cells[0].source).toBe('cannot run yet');
+    expect(
+      content.notebook.cells.some(
+        cell => cell.status === 'queued' || cell.status === 'running'
+      )
+    ).toBe(false);
+    expect(cellInput(content).value).toBe('cannot run yet');
+    expect(content.node.textContent).toContain(
+      'Start a new context before continuing with an AI request.'
+    );
+
+    content.dispose();
+  });
+
+  it('deletes only the pending cell, preserving history', () => {
+    const content = new AgentWorkspaceContent(null);
+    document.body.append(content.node);
+    const historical = seedDoneAiCell(content);
+    historical.blocks = [
+      { kind: 'text', id: 'history-outcome', text: '历史结果保留' }
+    ];
+    appendInputCell(content);
+    const historyIds = [historical.id];
+    content.session.contextState = 'unavailable';
+
+    submitCell(content, 'pending question');
+    const pending = content.notebook.cells.find(
+      cell => cell.source === 'pending question'
+    );
+    expect(pending).toBeDefined();
+    expect(content.notebook.current.id).toBe(pending!.id);
+    expect(content.notebook.cells).toHaveLength(historyIds.length + 1);
+
+    content.deleteActive();
+
+    expect(content.notebook.cells.map(cell => cell.id)).toEqual(historyIds);
+    expect(historical.source).toBe('previous ai');
+    expect(historical.blocks).toEqual([
+      { kind: 'text', id: 'history-outcome', text: '历史结果保留' }
+    ]);
+    expect(
+      content.notebook.cells.some(cell => cell.source === 'pending question')
+    ).toBe(false);
+    expect(content.node.textContent).not.toContain(
+      'Cannot delete a running cell.'
+    );
+
+    content.dispose();
+  });
+
+  it('keeps the edited text when the pending cell source changes', () => {
+    const content = new AgentWorkspaceContent(null);
+    document.body.append(content.node);
+    seedDoneAiCell(content);
+    const input = appendInputCell(content);
+    content.session.contextState = 'unavailable';
+
+    submitCell(content, 'pending question');
+    expect(contextButtons(content).bridge).not.toBeNull();
+
+    typeIntoCell(content, 'edited while pending');
+
+    expect(
+      content.notebook.cells.find(cell => cell.id === input.id)?.source
+    ).toBe('edited while pending');
+    expect(
+      content.notebook.cells.find(cell => cell.id === input.id)?.status
+    ).toBe('idle');
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-contextChoice')
+    ).toBeNull();
+
+    content.dispose();
+  });
+
+  it('ignores submit keys while an IME composition is active', async () => {
+    const content = new AgentWorkspaceContent(null);
+    document.body.append(content.node);
+    const input = typeIntoCell(content, '拼写中');
+
+    input.dispatchEvent(
+      new CompositionEvent('compositionstart', { bubbles: true })
+    );
+    input.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Enter',
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    expect(content.notebook.cells[0].status).toBe('idle');
+    expect(content.notebook.cells).toHaveLength(1);
+
+    input.dispatchEvent(
+      new CompositionEvent('compositionend', { bubbles: true })
+    );
+    input.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Enter',
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    expect(content.notebook.cells[0].status).toBe('idle');
+
+    await new Promise(resolve => setTimeout(resolve, 0));
+    input.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Enter',
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    expect(content.notebook.cells[0].status).toBe('running');
+
+    content.dispose();
+  });
+});
+
+class FakeDshSocket {
+  static readonly instances: FakeDshSocket[] = [];
+  static readonly OPEN = 1;
+  readyState = 0;
+  sent: string[] = [];
+  onopen: (() => void) | null = null;
+  onmessage: ((event: { data: string }) => void) | null = null;
+  onerror: (() => void) | null = null;
+  onclose: (() => void) | null = null;
+
+  constructor(readonly url: string) {
+    FakeDshSocket.instances.push(this);
+  }
+
+  send(data: string): void {
+    this.sent.push(data);
+  }
+
+  open(): void {
+    this.readyState = FakeDshSocket.OPEN;
+    this.onopen?.();
+  }
+
+  close(): void {
+    this.readyState = 3;
+    this.onclose?.();
+  }
+}
+
+describe('DSH records without inspection UI', () => {
+  const sessionId = 'session-1';
+  const runtimeId = 'runtime-1';
+
+  let makeSettingsSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    FakeDshSocket.instances.length = 0;
+    makeSettingsSpy = jest
+      .spyOn(ServerConnection, 'makeSettings')
+      .mockReturnValue({
+        wsUrl: 'ws://example',
+        WebSocket: FakeDshSocket,
+        appendToken: false,
+        token: ''
+      } as never);
+  });
+
+  afterEach(() => {
+    makeSettingsSpy.mockRestore();
+    document.body.replaceChildren();
+  });
+
+  function emit(socket: FakeDshSocket, event: Record<string, unknown>): void {
+    socket.onmessage?.({ data: JSON.stringify(event) });
+  }
+
+  function connect(content: AgentWorkspaceContent): FakeDshSocket {
+    content.start();
+    const socket = FakeDshSocket.instances[0];
+    socket.open();
+    return socket;
+  }
+
+  function handshake(socket: FakeDshSocket): void {
+    emit(socket, {
+      type: 'dsh/v1/connection',
+      runtimeId,
+      phase: 'connected'
+    });
+    emit(socket, {
+      type: 'dsh/v1/session',
+      sessionId,
+      runtimeId,
+      phase: 'attached'
+    });
+  }
+
+  function artifact(): Record<string, unknown> {
+    return {
+      type: 'dsh/v1/artifact',
+      sessionId,
+      runtimeId,
+      runId: 'run-1',
+      artifactId: 'artifact-1',
+      phase: 'created',
+      name: 'notes.md',
+      uri: 'notes/a.md',
+      mediaType: 'text/markdown',
+      source: 'presented'
+    };
+  }
+
+  function activity(): Record<string, unknown> {
+    return {
+      type: 'dsh/v1/activity',
+      sessionId,
+      runtimeId,
+      runId: 'run-1',
+      activityId: 'activity-1',
+      phase: 'started',
+      toolName: 'bash',
+      label: 'List files'
+    };
+  }
+
+  function question(): Record<string, unknown> {
+    return {
+      type: 'dsh/v1/interaction.requested',
+      sessionId,
+      runtimeId,
+      runId: 'run-1',
+      requestId: 'req-1',
+      kind: 'question',
+      prompt: 'Which file?',
+      options: [{ id: 'a', label: 'a.md' }]
+    };
+  }
+
+  it('surfaces no DSH inspection UI or hidden record cache', () => {
+    const content = new AgentWorkspaceContent(null);
+    document.body.append(content.node);
+    const socket = connect(content);
+
+    handshake(socket);
+    emit(socket, artifact());
+    emit(socket, activity());
+    emit(socket, question());
+
+    for (const selector of [
+      '.jp-AgentWorkspace-inspection',
+      '.jp-AgentWorkspace-inspectionReopen',
+      '.jp-Dsh-activityList',
+      '.jp-Dsh-activityFallback',
+      '.jp-Dsh-artifactHost',
+      '.jp-Dsh-artifactFallback',
+      '.jp-Dsh-interactionList',
+      '.jp-Dsh-interactionFallback',
+      '.jp-Dsh-interactionDeliveryNote'
+    ]) {
+      expect(content.node.querySelector(selector)).toBeNull();
+    }
+    // Removing inspection must not leave a detached record cache behind.
+    expect('activityElements' in content).toBe(false);
+    expect('artifactView' in content).toBe(false);
+    expect('interactionCoordinator' in content).toBe(false);
+
+    content.dispose();
+  });
+
+  it('keeps Cell output activity visible while DSH records are not re-rendered', () => {
+    const content = new AgentWorkspaceContent(null);
+    const blocks = [
+      {
+        kind: 'tool' as const,
+        id: 'tool-1',
+        name: 'Bash',
+        input: { command: 'ls' },
+        output: 'a.ts\n',
+        status: 'done' as const
+      }
+    ];
+    const cell = content.notebook.current;
+    cell.kind = 'ai';
+    cell.status = 'done';
+    cell.source = 'list files';
+    cell.blocks = blocks;
+    cell.turn = toggleTrace(setTurnStatus(createTurn('run-1'), 'done', blocks));
+    document.body.append(content.node);
+    (content as unknown as { refresh(): void }).refresh();
+
+    const socket = connect(content);
+    handshake(socket);
+    emit(socket, activity());
+
+    const activityNodes = content.node.querySelectorAll(
+      '[data-turn-activity-id]'
+    );
+    expect(activityNodes).toHaveLength(1);
+    expect(
+      content.node.querySelector('[data-turn-activity-id="activity-tool-1"]')
+    ).not.toBeNull();
+    expect(content.node.querySelector('.jp-Dsh-activityList')).toBeNull();
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-inspection')
+    ).toBeNull();
+
+    content.dispose();
+  });
+
+  it('keeps the adopted DSH session persisted after removing inspection UI', () => {
+    const content = new AgentWorkspaceContent(null);
+    document.body.append(content.node);
+    const socket = connect(content);
+
+    handshake(socket);
+
+    expect(content.session.dshSessionId).toBe(sessionId);
+    expect(getResumableDshSessionReference(content.notebook)).toEqual({
+      engine: 'dsh',
+      sessionId
+    });
+
+    content.dispose();
+  });
+});
+
+describe('DSH session binding persistence', () => {
+  interface BindingInternals {
+    startNewContext(): void;
+    saveCoordinator: { flush(): Promise<void> };
+    pendingContextSubmission: {
+      cellId: string;
+      source: string;
+      advance: boolean;
+    } | null;
+    resolveContextChoice(mode: 'bridge' | 'empty'): void;
+  }
+
+  function makeContext(initialText: string) {
+    let text = initialText;
+    const fromString = jest.fn<void, [string]>(value => {
+      text = value;
+    });
+    const save = jest.fn<Promise<void>, []>().mockResolvedValue(undefined);
+    let contentChanged: { slot: () => void; thisArg: unknown } | null = null;
+    const context = {
+      path: 'dsh-session.agentnb',
+      ready: Promise.resolve(),
+      isReady: true,
+      model: {
+        toString: () => text,
+        fromString,
+        contentChanged: {
+          connect: jest.fn((slot: () => void, thisArg: unknown) => {
+            contentChanged = { slot, thisArg };
+          })
+        }
+      },
+      save
+    } as unknown as DocumentRegistry.IContext<DocumentRegistry.ICodeModel>;
+    return {
+      context,
+      fromString,
+      save,
+      text: () => text,
+      setText: (value: string) => {
+        text = value;
+      },
+      change: () => contentChanged?.slot.call(contentChanged.thisArg)
+    };
+  }
+
+  function emitEvent(
+    socket: FakeDshSocket,
+    event: Record<string, unknown>
+  ): void {
+    socket.onmessage?.({ data: JSON.stringify(event) });
+  }
+
+  function attach(harness: {
+    context: DocumentRegistry.IContext<DocumentRegistry.ICodeModel>;
+  }) {
+    const content = new AgentWorkspaceContent(null);
+    document.body.append(content.node);
+    content.attachContext(harness.context);
+    return content;
+  }
+
+  let makeSettingsSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    FakeDshSocket.instances.length = 0;
+    makeSettingsSpy = jest
+      .spyOn(ServerConnection, 'makeSettings')
+      .mockReturnValue({
+        wsUrl: 'ws://example',
+        WebSocket: FakeDshSocket,
+        appendToken: false,
+        token: ''
+      } as never);
+  });
+
+  afterEach(() => {
+    makeSettingsSpy.mockRestore();
+    document.body.replaceChildren();
+  });
+
+  it('persists the adopted DSH session and resumes it on reopen', async () => {
+    const initial = new WorkspaceNotebook();
+    initial.current.source = 'question';
+    const first = makeContext(serializeNotebook(initial));
+    const content = attach(first);
+    await Promise.resolve();
+
+    const socket = FakeDshSocket.instances[0];
+    socket.open();
+    emitEvent(socket, {
+      type: 'dsh/v1/connection',
+      runtimeId: 'runtime-1',
+      phase: 'connected'
+    });
+    emitEvent(socket, {
+      type: 'dsh/v1/session',
+      sessionId: 'session-1',
+      runtimeId: 'runtime-1',
+      phase: 'attached'
+    });
+    await (content as unknown as BindingInternals).saveCoordinator.flush();
+
+    expect(JSON.parse(first.text()).sessionReference).toEqual({
+      engine: 'dsh',
+      sessionId: 'session-1'
+    });
+    expect(getResumableDshSessionReference(content.notebook)).toEqual({
+      engine: 'dsh',
+      sessionId: 'session-1'
+    });
+    content.dispose();
+
+    const reopened = makeContext(first.text());
+    const resumed = attach(reopened);
+    await Promise.resolve();
+
+    expect(resumed.session.dshSessionId).toBe('session-1');
+    expect(
+      FakeDshSocket.instances[FakeDshSocket.instances.length - 1].url
+    ).toContain('dshSessionId=session-1');
+    resumed.dispose();
+  });
+
+  it('clears the saved DSH binding when a new context starts', async () => {
+    const initial = new WorkspaceNotebook();
+    initial.current.source = 'question';
+    const harness = makeContext(serializeNotebook(initial));
+    const content = attach(harness);
+    await Promise.resolve();
+
+    const socket = FakeDshSocket.instances[0];
+    socket.open();
+    emitEvent(socket, {
+      type: 'dsh/v1/connection',
+      runtimeId: 'runtime-1',
+      phase: 'connected'
+    });
+    emitEvent(socket, {
+      type: 'dsh/v1/session',
+      sessionId: 'session-1',
+      runtimeId: 'runtime-1',
+      phase: 'attached'
+    });
+    await (content as unknown as BindingInternals).saveCoordinator.flush();
+    expect(JSON.parse(harness.text()).sessionReference).not.toBeNull();
+
+    const internals = content as unknown as BindingInternals;
+    internals.startNewContext();
+    await internals.saveCoordinator.flush();
+
+    expect(JSON.parse(harness.text()).sessionReference).toBeNull();
+    expect(getResumableDshSessionReference(content.notebook)).toBeNull();
+    expect(content.session.dshSessionId).toBeNull();
+
+    // The reconnect URL must not advertise the cleared session either.
+    content.session.connect();
+    expect(
+      FakeDshSocket.instances[FakeDshSocket.instances.length - 1].url
+    ).not.toContain('dshSessionId=');
+
+    content.dispose();
+  });
+
+  it('clears the DSH binding when starting an empty context', async () => {
+    const initial = new WorkspaceNotebook();
+    initial.current.source = 'first question';
+    setAgentSessionReference(initial, {
+      engine: 'dsh',
+      sessionId: 'session-1'
+    });
+    const harness = makeContext(serializeNotebook(initial));
+    const content = attach(harness);
+    await Promise.resolve();
+
+    const socket = FakeDshSocket.instances[0];
+    socket.open();
+    emitEvent(socket, {
+      type: 'dsh/v1/connection',
+      runtimeId: 'runtime-1',
+      phase: 'connected'
+    });
+    emitEvent(socket, {
+      type: 'dsh/v1/session',
+      sessionId: 'session-1',
+      runtimeId: 'runtime-1',
+      phase: 'attached'
+    });
+
+    const internals = content as unknown as BindingInternals;
+    const cell = content.notebook.appendCell();
+    content.notebook.setSource('second question');
+    internals.pendingContextSubmission = {
+      cellId: cell.id,
+      source: 'second question',
+      advance: true
+    };
+    internals.resolveContextChoice('empty');
+
+    expect(content.session.dshSessionId).toBeNull();
+    expect(getResumableDshSessionReference(content.notebook)).toBeNull();
+
+    content.session.connect();
+    expect(
+      FakeDshSocket.instances[FakeDshSocket.instances.length - 1].url
+    ).not.toContain('dshSessionId=');
+
+    content.dispose();
+  });
+
+  it('refuses a recovered DSH session that differs from the live binding', async () => {
+    const initial = new WorkspaceNotebook();
+    initial.current.source = 'live question';
+    setAgentSessionReference(initial, {
+      engine: 'dsh',
+      sessionId: 'session-a'
+    });
+    const harness = makeContext(serializeNotebook(initial));
+    const content = attach(harness);
+    await Promise.resolve();
+
+    const socket = FakeDshSocket.instances[0];
+    socket.open();
+    expect(content.session.dshSessionId).toBe('session-a');
+    expect(content.documentLoadError).toBeNull();
+
+    harness.setText(
+      JSON.stringify({
+        version: AGENT_WORKSPACE_VERSION + 1,
+        active: 0,
+        cells: []
+      })
+    );
+    harness.change();
+    expect(content.documentLoadError?.kind).toBe('unsupported-version');
+
+    const recovered = new WorkspaceNotebook();
+    recovered.current.source = 'recovered question';
+    setAgentSessionReference(recovered, {
+      engine: 'dsh',
+      sessionId: 'session-b'
+    });
+    const recoveredText = serializeNotebook(recovered);
+    harness.setText(recoveredText);
+    harness.change();
+
+    expect(content.documentLoadError).toMatchObject({
+      kind: 'session-mismatch'
+    });
+    expect(harness.fromString).not.toHaveBeenCalled();
+    expect(harness.save).not.toHaveBeenCalled();
+
+    // The stale connection's first handshake for session A must not be adopted
+    // over the recovered document's session B, nor persisted.
+    emitEvent(socket, {
+      type: 'dsh/v1/session',
+      sessionId: 'session-a',
+      runtimeId: 'runtime-1',
+      phase: 'attached'
+    });
+    expect(getResumableDshSessionReference(content.notebook)?.sessionId).toBe(
+      'session-b'
+    );
+    expect(harness.text()).toBe(recoveredText);
+    expect(harness.save).not.toHaveBeenCalled();
+
+    content.dispose();
+  });
+});
+
+describe('AgentWorkspaceContent future document protection', () => {
+  interface ProtectionInternals {
+    runCell(advance: boolean): void;
+    persistSoon(): void;
+    persistNow(): void;
+    synchronizeDocumentModel(): void;
+    startNewContext(): void;
+    onSessionChange(): void;
+    selectCell(index: number, options?: { focusEditor?: boolean }): void;
+    applyingModel: boolean;
+    saveCoordinator: { flush(): Promise<void> };
+  }
+
+  interface ContextHarness {
+    context: DocumentRegistry.IContext<DocumentRegistry.ICodeModel>;
+    fromString: jest.Mock<void, [string]>;
+    save: jest.Mock<Promise<void>, []>;
+    text(): string;
+    setText(value: string): void;
+    change(): void;
+  }
+
+  function futureText(): string {
+    return JSON.stringify({
+      version: AGENT_WORKSPACE_VERSION + 1,
+      active: 0,
+      futureRootField: { nested: true },
+      cells: [
+        {
+          id: 'future-cell',
+          kind: 'ai',
+          source: 'future question',
+          output: '',
+          blocks: [],
+          status: 'done',
+          executionCount: 1,
+          futureCellField: [1, 2, 3]
+        }
+      ]
+    });
+  }
+
+  function makeContext(
+    initialText: string,
+    ready: Promise<void> = Promise.resolve()
+  ): ContextHarness {
+    let text = initialText;
+    const fromString = jest.fn<void, [string]>(value => {
+      text = value;
+    });
+    const save = jest.fn<Promise<void>, []>().mockResolvedValue(undefined);
+    let contentChanged: { slot: () => void; thisArg: unknown } | null = null;
+    const context = {
+      path: 'future.agentnb',
+      ready,
+      isReady: true,
+      model: {
+        toString: () => text,
+        fromString,
+        contentChanged: {
+          connect: jest.fn((slot: () => void, thisArg: unknown) => {
+            contentChanged = { slot, thisArg };
+          })
+        }
+      },
+      save
+    } as unknown as DocumentRegistry.IContext<DocumentRegistry.ICodeModel>;
+    return {
+      context,
+      fromString,
+      save,
+      text: () => text,
+      setText: value => {
+        text = value;
+      },
+      change: () => contentChanged?.slot.call(contentChanged.thisArg)
+    };
+  }
+
+  beforeEach(() => {
+    jest.spyOn(AgentSession.prototype, 'connect').mockImplementation(() => {});
+    jest.spyOn(AgentSession.prototype, 'close').mockImplementation(() => {});
+    jest.spyOn(AgentSession.prototype, 'sendUser').mockImplementation(() => {});
+    jest
+      .spyOn(AgentSession.prototype, 'exec')
+      .mockResolvedValue({ output: '', returncode: 0, cwd: '/tmp' });
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('protects a newer document without a session, save, or mutation', async () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as ProtectionInternals;
+    const future = futureText();
+    const harness = makeContext(future);
+
+    content.attachContext(harness.context);
+    await Promise.resolve();
+
+    expect(content.documentLoadError).toMatchObject({
+      kind: 'unsupported-version',
+      foundVersion: AGENT_WORKSPACE_VERSION + 1,
+      supportedVersion: AGENT_WORKSPACE_VERSION
+    });
+    expect(internals.applyingModel).toBe(false);
+    expect(AgentSession.prototype.connect).not.toHaveBeenCalled();
+    expect(harness.fromString).not.toHaveBeenCalled();
+    expect(harness.save).not.toHaveBeenCalled();
+    expect(harness.text()).toBe(future);
+    expect(
+      content.notebook.cells.some(cell => cell.source === 'future question')
+    ).toBe(false);
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-statusExecution')
+        ?.textContent
+    ).toContain('newer format');
+
+    // Even an explicit persist/flush/synchronize must refuse to write memory.
+    internals.persistNow();
+    await internals.saveCoordinator.flush();
+    expect(() => internals.synchronizeDocumentModel()).toThrow(/protected/i);
+    expect(harness.fromString).not.toHaveBeenCalled();
+    expect(harness.save).not.toHaveBeenCalled();
+    expect(harness.text()).toBe(future);
+
+    content.dispose();
+  });
+
+  it('refuses runs while keeping the cell source', async () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as ProtectionInternals;
+    const harness = makeContext(futureText());
+
+    content.attachContext(harness.context);
+    await Promise.resolve();
+
+    content.notebook.appendCell();
+    content.notebook.setSource('run this');
+
+    internals.runCell(true);
+
+    expect(
+      content.notebook.cells.some(
+        cell => cell.status === 'queued' || cell.status === 'running'
+      )
+    ).toBe(false);
+    expect(AgentSession.prototype.sendUser).not.toHaveBeenCalled();
+    expect(AgentSession.prototype.exec).not.toHaveBeenCalled();
+    expect(content.notebook.current.source).toBe('run this');
+
+    content.dispose();
+  });
+
+  it('never overwrites a newer document when local edits are pending', async () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as ProtectionInternals;
+    const harness = makeContext(serializeNotebook(content.notebook));
+
+    content.attachContext(harness.context);
+    await Promise.resolve();
+
+    content.notebook.setSource('pending local edit');
+    internals.persistSoon();
+
+    const future = futureText();
+    harness.setText(future);
+    harness.change();
+
+    expect(content.documentLoadError?.kind).toBe('unsupported-version');
+    await expect(internals.saveCoordinator.flush()).rejects.toThrow();
+    expect(harness.fromString).not.toHaveBeenCalled();
+    expect(harness.save).not.toHaveBeenCalled();
+    expect(harness.text()).toBe(future);
+
+    content.dispose();
+  });
+
+  it('refuses to start a new context while protected', async () => {
+    const connect = jest.mocked(AgentSession.prototype.connect);
+    connect.mockClear();
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as ProtectionInternals;
+    const harness = makeContext(futureText());
+
+    content.attachContext(harness.context);
+    await Promise.resolve();
+    expect(content.documentLoadError).not.toBeNull();
+
+    internals.startNewContext();
+
+    expect(connect).not.toHaveBeenCalled();
+    expect(content.documentLoadError).not.toBeNull();
+    expect(content.notebook.agentSessionId).toBeNull();
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-statusExecution')
+        ?.textContent
+    ).toContain('newer format');
+
+    content.dispose();
+  });
+
+  it('rejects focused cell edits while protected and restores the kept text', async () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as ProtectionInternals;
+    const harness = makeContext(futureText());
+    content.notebook.select(0);
+    content.notebook.setSource('kept source');
+    document.body.append(content.node);
+
+    content.attachContext(harness.context);
+    await Promise.resolve();
+    expect(content.documentLoadError).not.toBeNull();
+
+    internals.selectCell(0, { focusEditor: true });
+    const textarea = content.node.querySelector<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    );
+    expect(textarea).not.toBeNull();
+    if (!textarea) return;
+    textarea.focus();
+    expect(document.activeElement).toBe(textarea);
+    expect(textarea.readOnly).toBe(true);
+    textarea.value = 'typed while protected';
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+
+    expect(content.notebook.current.source).toBe('kept source');
+    const after = content.node.querySelector<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    );
+    expect(after?.value).toBe('kept source');
+    expect(after?.readOnly).toBe(true);
+    expect(harness.fromString).not.toHaveBeenCalled();
+    expect(harness.save).not.toHaveBeenCalled();
+    expect(harness.text()).toBe(futureText());
+
+    // A supported replacement clears the protection and makes the editor
+    // writable again, so the read-only guard is confined to the protected state.
+    const supported = new WorkspaceNotebook();
+    supported.current.source = 'recovered question';
+    supported.agentSessionId = '123e4567-e89b-12d3-a456-426614174003';
+    harness.setText(serializeNotebook(supported));
+    harness.change();
+    await Promise.resolve();
+
+    expect(content.documentLoadError).toBeNull();
+    const editable = content.node.querySelector<HTMLTextAreaElement>(
+      '.jp-AgentWorkspace-cellInput'
+    );
+    expect(editable?.value).toBe('recovered question');
+    expect(editable?.readOnly).toBe(false);
+
+    content.node.remove();
+    content.dispose();
+  });
+
+  it('keeps an unknown load error visible without connecting or saving', async () => {
+    const connect = jest.mocked(AgentSession.prototype.connect);
+    connect.mockClear();
+    const content = new AgentWorkspaceContent(null);
+    let rejectReady!: (error: unknown) => void;
+    const ready = new Promise<void>((_resolve, reject) => {
+      rejectReady = reject;
+    });
+    const original = futureText();
+    const harness = makeContext(original, ready);
+
+    content.attachContext(harness.context);
+    rejectReady(new Error('disk read failed'));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(content.documentLoadError).toMatchObject({ kind: 'unknown' });
+    expect(content.documentLoadError?.message).toContain('disk read failed');
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-statusExecution')
+        ?.textContent
+    ).toContain('disk read failed');
+    expect(connect).not.toHaveBeenCalled();
+    expect(harness.fromString).not.toHaveBeenCalled();
+    expect(harness.save).not.toHaveBeenCalled();
+    expect(harness.text()).toBe(original);
+
+    content.dispose();
+  });
+
+  it('refuses a different recovered session on a live connection', async () => {
+    const connect = jest.mocked(AgentSession.prototype.connect);
+    connect.mockClear();
+    const oldId = '123e4567-e89b-12d3-a456-426614174001';
+    const newId = '123e4567-e89b-12d3-a456-426614174002';
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as ProtectionInternals;
+    content.notebook.appendCell();
+    content.notebook.setSource('open question');
+    content.notebook.agentSessionId = oldId;
+    const harness = makeContext(serializeNotebook(content.notebook));
+
+    content.attachContext(harness.context);
+    await Promise.resolve();
+    expect(content.documentLoadError).toBeNull();
+    expect(content.session.sessionId).toBe(oldId);
+    expect(connect).toHaveBeenCalledTimes(1);
+
+    harness.setText(futureText());
+    harness.change();
+    expect(content.documentLoadError?.kind).toBe('unsupported-version');
+
+    const recovered = new WorkspaceNotebook();
+    recovered.current.source = 'recovered question';
+    recovered.agentSessionId = newId;
+    const recoveredText = serializeNotebook(recovered);
+    harness.setText(recoveredText);
+    harness.change();
+
+    expect(content.documentLoadError).toMatchObject({
+      kind: 'session-mismatch'
+    });
+    expect(content.documentLoadError?.message).toContain('Reopen');
+    expect(connect).toHaveBeenCalledTimes(1);
+    expect(harness.fromString).not.toHaveBeenCalled();
+    expect(harness.save).not.toHaveBeenCalled();
+
+    // The old live connection reporting its id must not cross into the new
+    // recovered document, neither in memory nor on disk.
+    content.session.contextState = 'live';
+    internals.onSessionChange();
+    expect(content.notebook.agentSessionId).toBe(newId);
+    expect(harness.text()).toBe(recoveredText);
+
+    content.dispose();
+  });
+
+  it('recovers from an external supported document and starts once', async () => {
+    const connect = jest.mocked(AgentSession.prototype.connect);
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as ProtectionInternals;
+    const harness = makeContext(futureText());
+
+    content.attachContext(harness.context);
+    await Promise.resolve();
+    expect(content.documentLoadError).not.toBeNull();
+    expect(connect).not.toHaveBeenCalled();
+
+    const supported = new WorkspaceNotebook();
+    supported.current.source = 'recovered question';
+    supported.agentSessionId = '123e4567-e89b-12d3-a456-426614174000';
+    harness.setText(serializeNotebook(supported));
+    harness.change();
+    await Promise.resolve();
+
+    expect(content.documentLoadError).toBeNull();
+    expect(internals.applyingModel).toBe(false);
+    expect(content.notebook.current.source).toBe('recovered question');
+    expect(content.session.sessionId).toBe(
+      '123e4567-e89b-12d3-a456-426614174000'
+    );
+    expect(connect).toHaveBeenCalledTimes(1);
+    expect(harness.fromString).not.toHaveBeenCalled();
+
+    const later = new WorkspaceNotebook();
+    later.current.source = 'later external state';
+    harness.setText(serializeNotebook(later));
+    harness.change();
+    await Promise.resolve();
+
+    expect(connect).toHaveBeenCalledTimes(1);
+    expect(content.documentLoadError).toBeNull();
+    content.dispose();
+  });
+});
+
+describe('AgentWorkspaceContent execution record toggle', () => {
+  interface ToggleInternals {
+    refresh(): void;
+    notebookView: { node: HTMLElement };
+  }
+
+  function rect(top: number): DOMRect {
+    return {
+      top,
+      bottom: top,
+      left: 0,
+      right: 0,
+      width: 0,
+      height: 0,
+      x: 0,
+      y: top,
+      toJSON: () => ({})
+    } as DOMRect;
+  }
+
+  it('anchors the clicked execution record toggle in the notebook viewport', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as ToggleInternals;
+    const blocks = [
+      {
+        kind: 'tool' as const,
+        id: 'tool-1',
+        name: 'Bash',
+        input: { command: 'ls' },
+        output: 'a.ts\n',
+        status: 'done' as const
+      }
+    ];
+    const cell = content.notebook.current;
+    cell.kind = 'ai';
+    cell.status = 'done';
+    cell.source = 'list files';
+    cell.blocks = blocks;
+    cell.turn = setTurnStatus(createTurn('run-1'), 'done', blocks);
+    document.body.append(content.node);
+    internals.refresh();
+
+    const scrollNode = internals.notebookView.node;
+    let scrollTop = 240;
+    Object.defineProperty(scrollNode, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTop,
+      set: value => {
+        scrollTop = value;
+      }
+    });
+
+    const rectSpy = jest
+      .spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+      .mockImplementation(function (this: HTMLElement) {
+        const expanded = this.getAttribute('aria-expanded') === 'true';
+        return rect(
+          this.dataset.turnFocusKey === 'trace:run-1'
+            ? expanded
+              ? 40
+              : 100
+            : 0
+        );
+      });
+
+    const before = content.node.querySelector<HTMLButtonElement>(
+      '[data-turn-focus-key="trace:run-1"]'
+    );
+    expect(before?.getAttribute('aria-expanded')).toBe('false');
+
+    before?.click();
+
+    const after = content.node.querySelector<HTMLButtonElement>(
+      '[data-turn-focus-key="trace:run-1"]'
+    );
+    expect(after?.getAttribute('aria-expanded')).toBe('true');
+    expect(scrollTop).toBe(180);
+    expect(cell.turn?.presentation.trace).toBe('expanded');
+    expect(document.activeElement).not.toBe(
+      content.node.querySelector('.jp-AgentWorkspace-cellInput')
+    );
+
+    rectSpy.mockRestore();
+    content.node.remove();
     content.dispose();
   });
 });

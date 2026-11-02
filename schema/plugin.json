@@ -1,25 +1,32 @@
 {
   "title": "AI Terminal",
-  "description": "Relay settings for AI Terminal (Agent Workspace).",
+  "description": "Provider settings for AI Terminal (Agent Workspace).",
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "apiProtocol": {
+      "type": "string",
+      "title": "API Protocol",
+      "description": "Wire protocol used to call the provider endpoint. Supported values: anthropic-messages and openai-completions.",
+      "enum": ["anthropic-messages", "openai-completions"],
+      "default": "anthropic-messages"
+    },
     "baseUrl": {
       "type": "string",
       "title": "Base URL",
-      "description": "Anthropic-compatible API base URL, for example https://api.anthropic.com or a local relay.",
+      "description": "API base URL for the selected protocol, for example https://api.anthropic.com for anthropic-messages or an OpenAI-compatible relay endpoint for openai-completions.",
       "default": ""
     },
     "model": {
       "type": "string",
       "title": "Model",
-      "description": "Model id sent to the Claude Agent SDK.",
+      "description": "Model id sent to the configured provider for the selected protocol.",
       "default": ""
     },
     "token": {
       "type": "string",
       "title": "API Token",
-      "description": "API token or key. Stored in JupyterLab user settings on the server and shown in Settings UI.",
+      "description": "API token or key sent to the configured provider. Stored in server-side JupyterLab user settings and shown in this Settings UI.",
       "default": ""
     }
   }

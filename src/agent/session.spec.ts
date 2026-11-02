@@ -31,7 +31,10 @@ class FakeWebSocket {
   }
 }
 
-function sessionWithSocket(sessionId: string | null = null): {
+function sessionWithSocket(
+  sessionId: string | null = null,
+  dshSessionId: string | null = null
+): {
   session: AgentSession;
   socket: FakeWebSocket;
 } {
@@ -51,6 +54,7 @@ function sessionWithSocket(sessionId: string | null = null): {
     undefined,
     sessionId
   );
+  session.configureDshSession(dshSessionId);
   session.connect();
   return { session, socket: created[0] };
 }
@@ -415,5 +419,604 @@ describe('AgentSession', () => {
       returncode: 0,
       cwd: '/root'
     });
+  });
+});
+
+describe('AgentSession DSH channel', () => {
+  const sessionId = 'dsh-session-1';
+  const runtimeId = 'runtime-1';
+
+  function emit(socket: FakeWebSocket, payload: unknown): void {
+    socket.onmessage?.({
+      data: typeof payload === 'string' ? payload : JSON.stringify(payload)
+    });
+  }
+
+  function handshake(socket: FakeWebSocket): void {
+    emit(socket, {
+      type: 'dsh/v1/connection',
+      runtimeId,
+      phase: 'connected'
+    });
+    emit(socket, {
+      type: 'dsh/v1/session',
+      sessionId,
+      runtimeId,
+      phase: 'attached'
+    });
+  }
+
+  function delta(
+    overrides: Record<string, unknown> = {}
+  ): Record<string, unknown> {
+    return {
+      type: 'dsh/v1/text.delta',
+      sessionId,
+      runtimeId,
+      runId: 'run-1',
+      messageId: 'msg-1',
+      delta: 'hello',
+      ...overrides
+    };
+  }
+
+  it('dispatches validated dsh/v1 events without touching legacy state', () => {
+    const { session, socket } = sessionWithSocket();
+    socket.open();
+    const received: string[] = [];
+    session.subscribeDsh(event => received.push(event.type));
+
+    handshake(socket);
+    emit(socket, {
+      type: 'dsh/v1/capabilities',
+      runtimeId,
+      capabilities: { text_stream: { status: 'available' } }
+    });
+    emit(socket, delta());
+    emit(socket, {
+      type: 'dsh/v1/run.started',
+      sessionId,
+      runtimeId,
+      runId: 'run-1'
+    });
+    emit(socket, {
+      type: 'dsh/v1/run.finished',
+      sessionId,
+      runtimeId,
+      runId: 'run-1',
+      status: 'completed'
+    });
+
+    expect(received).toEqual([
+      'dsh/v1/connection',
+      'dsh/v1/session',
+      'dsh/v1/capabilities',
+      'dsh/v1/text.delta',
+      'dsh/v1/run.started',
+      'dsh/v1/run.finished'
+    ]);
+    // A completed run is execution outcome only; nothing is projected as acceptance.
+    expect(session.running).toBe(false);
+    expect(session.blocks).toEqual([]);
+    expect(session.dshSessionId).toBe(sessionId);
+    expect(session.dshRuntimeId).toBe(runtimeId);
+    expect(session.dshSessionPhase).toBe('attached');
+    expect(session.dshCapabilityManifest).toEqual({
+      text_stream: { status: 'available' }
+    });
+
+    // Bad/unknown DSH payloads are dropped, never forwarded to legacy handling.
+    const count = received.length;
+    emit(socket, 'not json');
+    emit(socket, { type: 'dsh/v2/text.delta', sessionId, runtimeId });
+    emit(socket, { type: 'dsh/v1/unknown.event', sessionId, runtimeId });
+    emit(socket, { type: 'dsh/v1/text.delta', sessionId, runtimeId });
+    emit(socket, JSON.stringify({ type: 'dsh/v1/session' }));
+    expect(received).toHaveLength(count);
+    expect(session.blocks).toEqual([]);
+
+    // Legacy events keep their existing behaviour on the same socket.
+    session.sendUser('legacy', 'legacy-1');
+    emit(socket, { type: 'text', turnId: 'legacy-1', text: 'answer' });
+    expect(session.blocks).toEqual([
+      { kind: 'text', id: expect.stringContaining('text'), text: 'answer' }
+    ]);
+    expect(received).toHaveLength(count);
+  });
+
+  it('requires a session handshake and refuses cross-session events', () => {
+    const { session, socket } = sessionWithSocket();
+    socket.open();
+    const received: string[] = [];
+    session.subscribeDsh(event => received.push(event.type));
+
+    // Execution events before the session handshake are ignored.
+    emit(socket, delta());
+    expect(received).toEqual([]);
+
+    emit(socket, {
+      type: 'dsh/v1/session',
+      sessionId,
+      runtimeId,
+      phase: 'resumed'
+    });
+    emit(socket, delta());
+    expect(received).toEqual(['dsh/v1/session', 'dsh/v1/text.delta']);
+
+    // A different session on the same socket is refused, not silently adopted.
+    emit(socket, {
+      type: 'dsh/v1/session',
+      sessionId: 'dsh-session-2',
+      runtimeId,
+      phase: 'attached'
+    });
+    emit(socket, delta({ sessionId: 'dsh-session-2', runId: 'run-2' }));
+    expect(received).toEqual(['dsh/v1/session', 'dsh/v1/text.delta']);
+    expect(session.dshSessionId).toBe(sessionId);
+
+    // A new runtime generation does not delete the durable session, but needs
+    // its own handshake before execution events are accepted.
+    emit(socket, {
+      type: 'dsh/v1/connection',
+      runtimeId: 'runtime-2',
+      phase: 'connected'
+    });
+    emit(socket, delta({ runtimeId: 'runtime-2' }));
+    expect(session.dshSessionId).toBe(sessionId);
+    expect(session.dshRuntimeId).toBe('runtime-2');
+    expect(received).toHaveLength(3);
+
+    emit(socket, {
+      type: 'dsh/v1/session',
+      sessionId,
+      runtimeId: 'runtime-2',
+      phase: 'resumed'
+    });
+    emit(socket, delta({ runtimeId: 'runtime-2' }));
+    expect(received).toHaveLength(5);
+    expect(session.dshSessionPhase).toBe('resumed');
+
+    // After detach, execution events are refused until re-attach.
+    emit(socket, {
+      type: 'dsh/v1/session',
+      sessionId,
+      runtimeId: 'runtime-2',
+      phase: 'detached'
+    });
+    emit(socket, delta({ runtimeId: 'runtime-2' }));
+    expect(received).toHaveLength(6);
+    expect(session.dshSessionPhase).toBe('detached');
+  });
+
+  it('isolates throwing subscribers and supports unsubscribe', () => {
+    const { session, socket } = sessionWithSocket();
+    socket.open();
+    handshake(socket);
+    const seen: string[] = [];
+    const unsubscribe = session.subscribeDsh(() => {
+      throw new Error('listener failure');
+    });
+    session.subscribeDsh(event => seen.push(event.type));
+
+    expect(() => emit(socket, delta())).not.toThrow();
+    expect(seen).toEqual(['dsh/v1/text.delta']);
+
+    // Legacy handling on the same socket still works after a subscriber throws.
+    session.sendUser('legacy', 'legacy-1');
+    emit(socket, { type: 'text', turnId: 'legacy-1', text: 'answer' });
+    expect(session.blocks).toHaveLength(1);
+
+    unsubscribe();
+    unsubscribe();
+    emit(socket, delta());
+    expect(seen).toEqual(['dsh/v1/text.delta', 'dsh/v1/text.delta']);
+  });
+
+  it('keeps subscribers across reconnects and drops them on dispose', () => {
+    const created: FakeWebSocket[] = [];
+    const session = new AgentSession({
+      wsUrl: 'ws://example',
+      WebSocket: class extends FakeWebSocket {
+        constructor(url: string) {
+          super(url);
+          created.push(this);
+        }
+      },
+      appendToken: false,
+      token: ''
+    } as never);
+    session.connect();
+    const received: string[] = [];
+    session.subscribeDsh(event => received.push(event.type));
+    created[0].open();
+    handshake(created[0]);
+    expect(received).toEqual(['dsh/v1/connection', 'dsh/v1/session']);
+
+    // A disconnect neither deletes the session nor fabricates run.finished.
+    created[0].close();
+    expect(received).toEqual(['dsh/v1/connection', 'dsh/v1/session']);
+    expect(session.dshSessionId).toBe(sessionId);
+
+    session.connect();
+    expect(created).toHaveLength(2);
+    created[1].open();
+    emit(created[1], {
+      type: 'dsh/v1/session',
+      sessionId,
+      runtimeId,
+      phase: 'resumed'
+    });
+    expect(received).toEqual([
+      'dsh/v1/connection',
+      'dsh/v1/session',
+      'dsh/v1/session'
+    ]);
+
+    session.dispose();
+    emit(created[1], delta());
+    expect(received).toHaveLength(3);
+    expect(session.dshRuntimeId).toBeNull();
+    expect(session.dshCapabilityManifest).toBeNull();
+  });
+
+  it('ignores late events from a stale socket handler after reconnecting', () => {
+    const created: FakeWebSocket[] = [];
+    const session = new AgentSession({
+      wsUrl: 'ws://example',
+      WebSocket: class extends FakeWebSocket {
+        constructor(url: string) {
+          super(url);
+          created.push(this);
+        }
+      },
+      appendToken: false,
+      token: ''
+    } as never);
+    session.connect();
+    const first = created[0];
+    const staleOnMessage = first.onmessage;
+    first.open();
+    handshake(first);
+    first.close();
+
+    session.connect();
+    const second = created[1];
+    second.open();
+    emit(second, {
+      type: 'dsh/v1/connection',
+      runtimeId,
+      phase: 'connected'
+    });
+    emit(second, {
+      type: 'dsh/v1/session',
+      sessionId,
+      runtimeId,
+      phase: 'resumed'
+    });
+
+    const received: string[] = [];
+    session.subscribeDsh(event => received.push(event.type));
+    // A saved handler from the retired socket must not reach the new connection.
+    staleOnMessage?.({ data: JSON.stringify(delta()) });
+    emit(second, delta());
+    expect(received).toEqual(['dsh/v1/text.delta']);
+  });
+
+  it('requires a fresh attach on a reconnected socket for the same runtime', () => {
+    const created: FakeWebSocket[] = [];
+    const session = new AgentSession({
+      wsUrl: 'ws://example',
+      WebSocket: class extends FakeWebSocket {
+        constructor(url: string) {
+          super(url);
+          created.push(this);
+        }
+      },
+      appendToken: false,
+      token: ''
+    } as never);
+    session.connect();
+    created[0].open();
+    handshake(created[0]);
+    created[0].close();
+
+    session.connect();
+    const second = created[1];
+    second.open();
+    const received: string[] = [];
+    session.subscribeDsh(event => received.push(event.type));
+
+    // Same runtime, but the new socket has no attach yet: exec is refused.
+    emit(second, {
+      type: 'dsh/v1/connection',
+      runtimeId,
+      phase: 'connected'
+    });
+    emit(second, delta());
+    expect(received).toEqual(['dsh/v1/connection']);
+
+    // Only a new attach/resumed on this socket allows execution again.
+    emit(second, {
+      type: 'dsh/v1/session',
+      sessionId,
+      runtimeId,
+      phase: 'resumed'
+    });
+    emit(second, delta());
+    expect(received).toEqual([
+      'dsh/v1/connection',
+      'dsh/v1/session',
+      'dsh/v1/text.delta'
+    ]);
+    expect(session.dshSessionId).toBe(sessionId);
+  });
+
+  it('clears capabilities when the connection generation changes', () => {
+    const { session, socket } = sessionWithSocket();
+    socket.open();
+    handshake(socket);
+    emit(socket, {
+      type: 'dsh/v1/capabilities',
+      runtimeId,
+      capabilities: { text_stream: { status: 'available' } }
+    });
+    expect(session.dshCapabilityManifest).toEqual({
+      text_stream: { status: 'available' }
+    });
+
+    // A new generation drops the previous manifest; it is not inherited.
+    emit(socket, {
+      type: 'dsh/v1/connection',
+      runtimeId: 'runtime-2',
+      phase: 'connected'
+    });
+    expect(session.dshRuntimeId).toBe('runtime-2');
+    expect(session.dshCapabilityManifest).toBeNull();
+
+    // Capabilities for the old runtime cannot re-adopt it.
+    emit(socket, {
+      type: 'dsh/v1/capabilities',
+      runtimeId,
+      capabilities: { text_stream: { status: 'available' } }
+    });
+    expect(session.dshRuntimeId).toBe('runtime-2');
+    expect(session.dshCapabilityManifest).toBeNull();
+  });
+
+  it('refuses to fall back to a retired runtime', () => {
+    const { session, socket } = sessionWithSocket();
+    socket.open();
+    handshake(socket);
+    emit(socket, {
+      type: 'dsh/v1/connection',
+      runtimeId: 'runtime-2',
+      phase: 'connected'
+    });
+    expect(session.dshRuntimeId).toBe('runtime-2');
+
+    const received: string[] = [];
+    session.subscribeDsh(event => received.push(event.type));
+    // A stale connection/resumed for the retired runtime is refused.
+    emit(socket, {
+      type: 'dsh/v1/connection',
+      runtimeId,
+      phase: 'connected'
+    });
+    emit(socket, {
+      type: 'dsh/v1/session',
+      sessionId,
+      runtimeId,
+      phase: 'resumed'
+    });
+    emit(socket, delta());
+    expect(received).toEqual([]);
+    expect(session.dshRuntimeId).toBe('runtime-2');
+  });
+
+  it('clears all DSH state on dispose', () => {
+    const { session, socket } = sessionWithSocket();
+    socket.open();
+    handshake(socket);
+    emit(socket, {
+      type: 'dsh/v1/capabilities',
+      runtimeId,
+      capabilities: { text_stream: { status: 'available' } }
+    });
+
+    session.dispose();
+    expect(session.dshRuntimeId).toBeNull();
+    expect(session.dshSessionId).toBeNull();
+    expect(session.dshSessionPhase).toBeNull();
+    expect(session.dshCapabilityManifest).toBeNull();
+
+    const received: string[] = [];
+    session.subscribeDsh(event => received.push(event.type));
+    emit(socket, delta());
+    expect(received).toEqual([]);
+  });
+
+  it('encodes dshSessionId as an independent query parameter', () => {
+    expect(
+      agentSocketUrl(
+        {
+          wsUrl: 'ws://example/base',
+          appendToken: false,
+          token: ''
+        } as never,
+        'folder name',
+        null,
+        'dsh session/1'
+      )
+    ).toBe(
+      'ws://example/base/aiterminal/agent?cwd=folder%20name&dshSessionId=dsh%20session%2F1'
+    );
+  });
+
+  it('sends the configured DSH session without mixing it into sessionId', () => {
+    const { socket } = sessionWithSocket(null, sessionId);
+    const params = new URL(socket.url).searchParams;
+    expect(params.get('dshSessionId')).toBe(sessionId);
+    expect(params.get('sessionId')).toBeNull();
+  });
+
+  it('drops the legacy sessionId when a DSH session is present', () => {
+    const legacy = '123e4567-e89b-12d3-a456-426614174000';
+    expect(
+      agentSocketUrl(
+        { wsUrl: 'ws://example/base', appendToken: false, token: '' } as never,
+        'folder',
+        legacy,
+        'dsh session/1'
+      )
+    ).toBe(
+      'ws://example/base/aiterminal/agent?cwd=folder&dshSessionId=dsh%20session%2F1'
+    );
+    const { socket } = sessionWithSocket(legacy, 'dsh session/1');
+    const params = new URL(socket.url).searchParams;
+    expect(params.get('dshSessionId')).toBe('dsh session/1');
+    expect(params.get('sessionId')).toBeNull();
+  });
+
+  it('sends interaction decisions to the attached runtime', async () => {
+    const { session, socket } = sessionWithSocket();
+    socket.open();
+    handshake(socket);
+
+    await expect(
+      session.resolveInteraction('req-1', 'approved', {
+        sessionId,
+        runId: 'run-1'
+      })
+    ).resolves.toBeUndefined();
+    expect(socket.sent).toEqual([
+      JSON.stringify({
+        type: 'dsh/v1/interaction.resolve',
+        requestId: 'req-1',
+        resolution: 'approved',
+        scope: { sessionId, runtimeId, runId: 'run-1' }
+      })
+    ]);
+    // The local send has no acknowledgement; the session keeps its attach state.
+    expect(session.dshSessionPhase).toBe('attached');
+  });
+
+  it('refuses decisions for another session or a retired runtime', async () => {
+    const { session, socket } = sessionWithSocket();
+    socket.open();
+    handshake(socket);
+
+    await expect(
+      session.resolveInteraction('req-1', 'rejected', {
+        sessionId: 'other-session'
+      })
+    ).rejects.toThrow(/different session/);
+    await expect(
+      session.resolveInteraction('req-1', 'rejected', {
+        runtimeId: 'runtime-retired'
+      })
+    ).rejects.toThrow(/retired runtime/);
+    expect(socket.sent).toEqual([]);
+
+    // A new connection generation retires the old runtime and waits for a
+    // fresh attach; decisions must not be sent against the stale binding.
+    emit(socket, {
+      type: 'dsh/v1/connection',
+      runtimeId: 'runtime-2',
+      phase: 'connected'
+    });
+    await expect(
+      session.resolveInteraction('req-1', 'approved')
+    ).rejects.toThrow(/not connected/);
+    expect(socket.sent).toEqual([]);
+  });
+
+  it('never queues a decision after the socket closes', async () => {
+    const created: FakeWebSocket[] = [];
+    const session = new AgentSession({
+      wsUrl: 'ws://example',
+      WebSocket: class extends FakeWebSocket {
+        constructor(url: string) {
+          super(url);
+          created.push(this);
+        }
+      },
+      appendToken: false,
+      token: ''
+    } as never);
+    session.configureDshSession(null);
+    session.connect();
+    created[0].open();
+    handshake(created[0]);
+    created[0].close();
+
+    await expect(
+      session.resolveInteraction('req-1', 'approved')
+    ).rejects.toThrow(/not connected/);
+
+    // Reconnecting must not replay the unacknowledged decision.
+    session.sendUser('again', 'run-2');
+    expect(created).toHaveLength(2);
+    expect(created[1].sent).toEqual([]);
+  });
+
+  it('reconnects with the latest adopted DSH session', () => {
+    const created: FakeWebSocket[] = [];
+    const session = new AgentSession({
+      wsUrl: 'ws://example',
+      WebSocket: class extends FakeWebSocket {
+        constructor(url: string) {
+          super(url);
+          created.push(this);
+        }
+      },
+      appendToken: false,
+      token: ''
+    } as never);
+    session.configureDshSession(null);
+    session.connect();
+    created[0].open();
+    handshake(created[0]);
+    expect(session.dshSessionId).toBe(sessionId);
+
+    created[0].close();
+    session.sendUser('again', 'run-2');
+    expect(created).toHaveLength(2);
+    expect(new URL(created[1].url).searchParams.get('dshSessionId')).toBe(
+      sessionId
+    );
+  });
+
+  it('drops the DSH session on newSession and refuses stale handshakes', () => {
+    const created: FakeWebSocket[] = [];
+    const session = new AgentSession({
+      wsUrl: 'ws://example',
+      WebSocket: class extends FakeWebSocket {
+        constructor(url: string) {
+          super(url);
+          created.push(this);
+        }
+      },
+      appendToken: false,
+      token: ''
+    } as never);
+    session.configureDshSession(null);
+    session.connect();
+    created[0].open();
+    handshake(created[0]);
+    expect(session.dshSessionId).toBe(sessionId);
+
+    session.resetContext();
+    expect(session.dshSessionId).toBeNull();
+    expect(created).toHaveLength(2);
+    expect(new URL(created[1].url).searchParams.get('dshSessionId')).toBeNull();
+
+    // The detached socket must not re-adopt the cleared session.
+    emit(created[0], {
+      type: 'dsh/v1/session',
+      sessionId,
+      runtimeId,
+      phase: 'attached'
+    });
+    expect(session.dshSessionId).toBeNull();
   });
 });

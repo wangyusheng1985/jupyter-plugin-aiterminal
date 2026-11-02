@@ -39,6 +39,7 @@
   min-width: 0;
   min-height: 0;
   overflow: auto;
+  scrollbar-gutter: stable;
   padding: var(--jp-notebook-padding, 10px);
   background: var(--jp-layout-color0, #ffffff);
 }
@@ -184,24 +185,69 @@
   flex: 1 1 auto;
   min-width: 0;
   box-sizing: border-box;
+  height: auto;
+  min-height: calc(
+    var(--jp-code-line-height, 1.3077) * 1em + 2 * var(--jp-code-padding, 5px) +
+      2 * var(--jp-border-width, 1px)
+  );
+  max-height: min(40vh, 30rem);
+  overflow-y: auto;
   border: var(--jp-border-width, 1px) solid
-    var(--jp-cell-editor-border-color, #e0e0e0);
-  background: var(--jp-cell-editor-background, #f5f5f5);
+    var(--jp-cell-editor-border-color, var(--jp-border-color1, #bdbdbd));
+  background: var(
+    --jp-cell-editor-background,
+    var(--jp-layout-color2, #f0f0f0)
+  );
   padding: var(--jp-code-padding, 5px);
   color: var(--jp-content-font-color0, #111);
   font-family: var(--jp-code-font-family, Menlo, Consolas, monospace);
   font-size: var(--jp-code-font-size, 13px);
   line-height: var(--jp-code-line-height, 1.3077);
-  resize: vertical;
+  resize: none;
+}
+
+/* History/read-only cells: a deeper surface plus a solid frame and a
+   colored left edge keep the input visibly separate from the flat output
+   panel below, without borrowing the active cell's brand highlight. */
+.jp-AgentWorkspace-cell:not(.is-active) .jp-AgentWorkspace-cellInput {
+  background: var(--jp-layout-color2, #eeeeee);
+  border: 2px solid var(--jp-border-color1, #bdbdbd);
+  border-left: 3px solid var(--jp-brand-color2, #64b5f6);
+  padding-left: calc(var(--jp-code-padding, 5px) - 2px);
+  min-height: calc(
+    var(--jp-code-line-height, 1.3077) * 1em + 2 * var(--jp-code-padding, 5px) +
+      4px
+  );
+}
+
+/* Active cells keep the strongest frame so they never read as history. */
+.jp-AgentWorkspace-cell.is-active .jp-AgentWorkspace-cellInput {
+  border: 2px solid var(--jp-brand-color1, #1976d2);
+  border-left: 4px solid var(--jp-brand-color1, #1976d2);
+  padding-left: calc(var(--jp-code-padding, 5px) - 3px);
+  min-height: calc(
+    var(--jp-code-line-height, 1.3077) * 1em + 2 * var(--jp-code-padding, 5px) +
+      4px
+  );
+}
+
+.jp-AgentWorkspace-cellInput:focus-visible {
+  outline: 2px solid var(--jp-brand-color1, #1976d2);
+  outline-offset: 1px;
 }
 
 .jp-AgentWorkspace-cell.is-active.is-edit .jp-AgentWorkspace-cellInput {
-  background: var(--jp-cell-editor-active-background, #ffffff);
+  background: var(
+    --jp-cell-editor-active-background,
+    var(--jp-layout-color0, #ffffff)
+  );
   border-color: var(
     --jp-cell-editor-active-border-color,
     var(--jp-brand-color1, #1976d2)
   );
-  box-shadow: var(--jp-cell-editor-box-shadow, inset 0 0 2px #64b5f6);
+  box-shadow:
+    var(--jp-cell-editor-box-shadow, none),
+    inset 0 0 0 1px var(--jp-brand-color1, #1976d2);
 }
 
 .jp-AgentWorkspace-cellOutput {
@@ -266,6 +312,30 @@
   line-height: 1.5;
   overflow-x: hidden;
   overflow-wrap: anywhere;
+}
+
+/*
+ * The cell output host uses pre-wrap for raw output. Markdown hosts must reset
+ * it or every soft line break in prose renders as a hard line break; only
+ * preformatted blocks keep the original whitespace.
+ */
+.jp-AgentWorkspace-outcomeBody,
+.jp-AgentWorkspace-activityBody {
+  white-space: normal;
+}
+
+.jp-AgentWorkspace-outcomeBody.jp-RenderedHTMLCommon.jp-RenderedMarkdown pre,
+.jp-AgentWorkspace-activityBody.jp-RenderedHTMLCommon.jp-RenderedMarkdown pre {
+  white-space: pre-wrap;
+}
+
+.jp-AgentWorkspace-outcomeBody.jp-RenderedHTMLCommon.jp-RenderedMarkdown
+  :not(pre)
+  > code,
+.jp-AgentWorkspace-activityBody.jp-RenderedHTMLCommon.jp-RenderedMarkdown
+  :not(pre)
+  > code {
+  white-space: normal;
 }
 
 .jp-AgentWorkspace-outcomeBody
@@ -987,6 +1057,254 @@
   outline-offset: 2px;
 }
 
+.jp-Dsh-activityList,
+.jp-Dsh-artifactHost,
+.jp-Dsh-artifactList,
+.jp-Dsh-interactionList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.jp-Dsh-rendererFallback {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 6px 8px;
+  border: var(--jp-border-width, 1px) solid var(--jp-border-color2, #e0e0e0);
+  border-radius: var(--jp-border-radius, 2px);
+  background: var(--jp-layout-color2, #eeeeee);
+  overflow-wrap: anywhere;
+}
+
+.jp-Dsh-fallbackTitle {
+  font-weight: 600;
+}
+
+.jp-Dsh-fallbackMeta {
+  color: var(--jp-ui-font-color2, #5b6570);
+  font-size: var(--jp-ui-font-size0, 11px);
+}
+
+.jp-Dsh-fallbackText {
+  margin: 0;
+  font-family: var(--jp-code-font-family, Menlo, Consolas, monospace);
+  font-size: var(--jp-code-font-size, 13px);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.jp-Dsh-fallbackOptions,
+.jp-Dsh-interactionFallbackOptions {
+  margin: 0;
+  padding-inline-start: 16px;
+  overflow-wrap: anywhere;
+}
+
+.jp-Dsh-artifactCard {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 6px 8px;
+  border: var(--jp-border-width, 1px) solid var(--jp-border-color2, #e0e0e0);
+  border-radius: var(--jp-border-radius, 2px);
+  background: var(--jp-layout-color0, #ffffff);
+  overflow-wrap: anywhere;
+}
+
+.jp-Dsh-artifactHeader {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.jp-Dsh-artifactName {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.jp-Dsh-artifactMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  color: var(--jp-ui-font-color2, #5b6570);
+  font-size: var(--jp-ui-font-size0, 11px);
+}
+
+.jp-Dsh-artifactEmpty {
+  margin: 0;
+  color: var(--jp-ui-font-color2, #5b6570);
+  font-size: var(--jp-ui-font-size0, 11px);
+}
+
+.jp-Dsh-artifactVerification,
+.jp-Dsh-artifactUnavailable,
+.jp-Dsh-artifactOpenBlocked,
+.jp-Dsh-artifactOpenError {
+  margin: 0;
+  color: var(--jp-ui-font-color2, #5b6570);
+  font-size: var(--jp-ui-font-size0, 11px);
+  overflow-wrap: anywhere;
+}
+
+.jp-Dsh-artifactOpenBlocked,
+.jp-Dsh-artifactOpenError {
+  color: var(--jp-error-color1, #d32f2f);
+}
+
+.jp-Dsh-artifactOpenError[hidden] {
+  display: none;
+}
+
+.jp-Dsh-artifactOpen,
+.jp-Dsh-questionOption,
+.jp-Dsh-interactionSubmit,
+.jp-Dsh-approvalAllow,
+.jp-Dsh-approvalReject {
+  align-self: flex-start;
+  min-height: 28px;
+  padding: 3px 10px;
+  border: var(--jp-border-width, 1px) solid var(--jp-border-color1, #bdbdbd);
+  border-radius: var(--jp-border-radius, 2px);
+  background: var(--jp-layout-color2, #eeeeee);
+  color: var(--jp-ui-font-color0, #111111);
+  cursor: pointer;
+  font: inherit;
+  overflow-wrap: anywhere;
+  text-align: start;
+}
+
+.jp-Dsh-approvalAllow {
+  border-color: var(--jp-brand-color1, #1976d2);
+  color: var(--jp-content-link-color, #1976d2);
+}
+
+.jp-Dsh-artifactOpen:disabled,
+.jp-Dsh-questionOption:disabled,
+.jp-Dsh-interactionSubmit:disabled,
+.jp-Dsh-approvalAllow:disabled,
+.jp-Dsh-approvalReject:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.jp-Dsh-artifactOpen:focus-visible,
+.jp-Dsh-questionOption:focus-visible,
+.jp-Dsh-interactionSubmit:focus-visible,
+.jp-Dsh-approvalAllow:focus-visible,
+.jp-Dsh-approvalReject:focus-visible {
+  outline: 2px solid var(--jp-brand-color1, #1976d2);
+  outline-offset: 2px;
+}
+
+.jp-Dsh-interaction {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 6px 8px;
+  border: var(--jp-border-width, 1px) solid var(--jp-border-color2, #e0e0e0);
+  border-radius: var(--jp-border-radius, 2px);
+  background: var(--jp-layout-color0, #ffffff);
+  overflow-wrap: anywhere;
+}
+
+.jp-Dsh-interactionPrompt {
+  margin: 0;
+  font-weight: 600;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.jp-Dsh-interactionFieldLabel,
+.jp-Dsh-interactionNote,
+.jp-Dsh-interactionStatus,
+.jp-Dsh-interactionDeliveryNote {
+  margin: 0;
+  color: var(--jp-ui-font-color2, #5b6570);
+  font-size: var(--jp-ui-font-size0, 11px);
+  overflow-wrap: anywhere;
+}
+
+.jp-Dsh-interactionStatus:empty {
+  display: none;
+}
+
+.jp-Dsh-interactionError {
+  margin: 0;
+  color: var(--jp-error-color1, #d32f2f);
+  font-size: var(--jp-ui-font-size0, 11px);
+  overflow-wrap: anywhere;
+}
+
+.jp-Dsh-interactionError[hidden],
+.jp-Dsh-interactionNote[hidden],
+.jp-Dsh-interactionDeliveryNote[hidden] {
+  display: none;
+}
+
+.jp-Dsh-interactionInput {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 48px;
+  padding: 4px 6px;
+  border: var(--jp-border-width, 1px) solid var(--jp-border-color1, #bdbdbd);
+  border-radius: var(--jp-border-radius, 2px);
+  background: var(--jp-layout-color1, #ffffff);
+  color: inherit;
+  font: inherit;
+  resize: vertical;
+}
+
+.jp-Dsh-interactionInput:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.jp-Dsh-interactionInput:focus-visible {
+  outline: 2px solid var(--jp-brand-color1, #1976d2);
+  outline-offset: 1px;
+}
+
+.jp-Dsh-questionOptions,
+.jp-Dsh-approvalActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.jp-Dsh-questionOption,
+.jp-Dsh-interactionSubmit {
+  align-self: auto;
+}
+
+.jp-Dsh-approvalDetails {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.jp-Dsh-approvalMeta {
+  display: flex;
+  min-width: 0;
+  gap: 6px;
+  font-size: var(--jp-ui-font-size0, 11px);
+}
+
+.jp-Dsh-approvalMetaLabel {
+  color: var(--jp-ui-font-color2, #5b6570);
+}
+
+.jp-Dsh-approvalMetaValue {
+  font-family: var(--jp-code-font-family, Menlo, Consolas, monospace);
+  overflow-wrap: anywhere;
+}
+
 @keyframes jp-AgentWorkspace-runningEllipsis {
   0%,
   20% {
@@ -1025,6 +1343,7 @@
 
   .jp-AgentWorkspace-navigator {
     position: absolute;
+    z-index: 4;
     top: 6px;
     right: 8px;
     border-left: 0;

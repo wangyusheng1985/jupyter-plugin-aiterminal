@@ -46,7 +46,13 @@ jest.mock('@jupyterlab/cells', () => ({
   }
 }));
 jest.mock('@jupyterlab/translation', () => ({
-  ITranslator: Symbol('ITranslator')
+  ITranslator: Symbol('ITranslator'),
+  nullTranslator: {
+    load: () => ({
+      __: (msgid: string) => msgid,
+      gettext: (msgid: string) => msgid
+    })
+  }
 }));
 jest.mock('@jupyterlab/ui-components', () => ({
   terminalIcon: {},
