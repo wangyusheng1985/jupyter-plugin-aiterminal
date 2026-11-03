@@ -344,6 +344,7 @@ def test_query_projects_acp_notifications_to_legacy_turn_events(
                         "sessionUpdate": "tool_call",
                         "toolCallId": "tool-1",
                         "title": "bash",
+                        "rawInput": {"command": "pwd"},
                     },
                 },
             },
@@ -397,6 +398,7 @@ def test_query_projects_acp_notifications_to_legacy_turn_events(
     tool_start = next(event for event in events if event["type"] == "tool_start")
     assert tool_start["id"] == "tool-1"
     assert tool_start["name"] == "bash"
+    assert tool_start["input"] == {"command": "pwd"}
     tool_end = next(event for event in events if event["type"] == "tool_end")
     assert tool_end["id"] == "tool-1"
     assert tool_end["output"] == "ok\n"
@@ -411,6 +413,54 @@ def test_query_projects_acp_notifications_to_legacy_turn_events(
         "sessionId": session.session_id,
         "turnId": "turn-1",
     }
+
+
+def test_query_projects_thinking_state_across_run(tmp_path, monkeypatch):
+    """Thinking streams as ``started`` and closes as ``finished`` at run end."""
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+
+    def factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+
+        def thought(text):
+            return {
+                "method": "session/update",
+                "params": {
+                    "sessionId": session.new_session_id,
+                    "update": {
+                        "sessionUpdate": "agent_thought_chunk",
+                        "messageId": "thought-1",
+                        "content": {"type": "text", "text": text},
+                    },
+                },
+            }
+
+        session.script = [thought("weighing "), thought("options")]
+        return session
+
+    _configure_fake_acp(monkeypatch, factory)
+
+    async def run():
+        events = []
+        session = AgentSession(str(tmp_path), _emit_to(events))
+        await session.query("hello", "turn-1")
+        await asyncio.sleep(0)
+        return session, events
+
+    session, events = asyncio.run(run())
+
+    thinking = [event for event in events if event["type"] == "thinking"]
+    assert [event["state"] for event in thinking] == [
+        "started",
+        "started",
+        "finished",
+    ]
+    assert [event["text"] for event in thinking] == [
+        "weighing ",
+        "weighing options",
+        "weighing options",
+    ]
+    assert all(event["id"] == "thought:thought-1" for event in thinking)
 
 
 def test_query_reports_cancelled_prompt_as_error_result(tmp_path, monkeypatch):

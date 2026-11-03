@@ -65,23 +65,61 @@ describe('applyServerEvent', () => {
     ]);
   });
 
-  it('records thinking state without reasoning text', () => {
+  it('records thinking state and carries reasoning text', () => {
     let blocks = applyServerEvent([], {
       type: 'thinking',
       turnId: 'run-1',
       id: 'm1:0',
-      state: 'started'
+      state: 'started',
+      text: 'reasoning'
     });
     blocks = applyServerEvent(blocks, {
       type: 'thinking',
       turnId: 'run-1',
       id: 'm1:0',
-      state: 'finished'
+      state: 'finished',
+      text: 'reasoning'
     });
     expect(blocks).toEqual([
-      { kind: 'thinking', id: 'thinking-m1:0', status: 'finished' }
+      {
+        kind: 'thinking',
+        id: 'thinking-m1:0',
+        status: 'finished',
+        text: 'reasoning'
+      }
     ]);
-    expect(JSON.stringify(blocks)).not.toContain('reasoning');
+  });
+
+  it('accumulates incremental thinking text without duplicating snapshots', () => {
+    let blocks = applyServerEvent([], {
+      type: 'thinking',
+      turnId: 'run-1',
+      id: 'm2:0',
+      state: 'started',
+      text: 'step '
+    });
+    blocks = applyServerEvent(blocks, {
+      type: 'thinking',
+      turnId: 'run-1',
+      id: 'm2:0',
+      state: 'started',
+      text: 'one'
+    });
+    blocks = applyServerEvent(blocks, {
+      type: 'thinking',
+      turnId: 'run-1',
+      id: 'm2:0',
+      state: 'finished',
+      text: 'step one'
+    });
+    expect(blocks).toEqual([
+      {
+        kind: 'thinking',
+        id: 'thinking-m2:0',
+        status: 'finished',
+        text: 'step one'
+      }
+    ]);
   });
 
   it('records config errors without dropping earlier cards', () => {

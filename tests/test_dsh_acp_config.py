@@ -26,6 +26,7 @@ from jupyter_aiterminal.dsh_acp_config import (
     validate_controlled_root,
 )
 from jupyter_aiterminal.dsh_config import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
     DSH_API_KEY_ENV,
     PROTOCOL_ANTHROPIC_MESSAGES,
     PROTOCOL_OPENAI_COMPLETIONS,
@@ -252,12 +253,13 @@ def test_both_protocols_produce_expected_real_rows(tmp_path: Path):
         assert provider["api"] == protocol
         assert provider["baseURL"] == BASE_SETTINGS["baseUrl"]
         assert provider["apiKeyEnv"] == DSH_API_KEY_ENV
-        expected_max = min(4096, ACP_MAX_OUTPUT_TOKENS_CAP)
+        expected_max = min(DEFAULT_MAX_OUTPUT_TOKENS, ACP_MAX_OUTPUT_TOKENS_CAP)
+        assert expected_max == DEFAULT_MAX_OUTPUT_TOKENS
         assert provider["models"] == [
             {
                 "id": BASE_SETTINGS["model"],
                 "name": BASE_SETTINGS["model"],
-                "contextWindow": 8192,
+                "contextWindow": 128000,
                 "maxTokens": expected_max,
             }
         ]

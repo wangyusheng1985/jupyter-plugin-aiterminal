@@ -63,6 +63,7 @@ export interface AgentThinkingEvent {
   turnId?: string;
   id: string;
   state?: 'started' | 'finished';
+  text?: string;
 }
 
 export interface AgentToolStartEvent {
@@ -160,6 +161,7 @@ export type ChatBlock =
       kind: 'thinking';
       id: string;
       status: 'started' | 'finished';
+      text?: string;
     }
   | {
       kind: 'tool';
@@ -219,18 +221,24 @@ export function applyServerEvent(
         block => block.kind === 'thinking' && block.id === id
       );
       if (existing) {
-        return blocks.map(block =>
-          block.kind === 'thinking' && block.id === id
-            ? { ...block, status: event.state ?? 'finished' }
-            : block
-        );
+        return blocks.map(block => {
+          if (block.kind !== 'thinking' || block.id !== id) return block;
+          return {
+            ...block,
+            status: event.state ?? 'finished',
+            ...(event.text === undefined
+              ? {}
+              : { text: mergeThinkingText(block.text, event.text) })
+          };
+        });
       }
       return [
         ...blocks,
         {
           kind: 'thinking',
           id,
-          status: event.state ?? 'finished'
+          status: event.state ?? 'finished',
+          text: event.text || ''
         }
       ];
     }
@@ -318,6 +326,18 @@ export function applyServerEvent(
 let eventCounter = 0;
 function nextId(prefix: string): string {
   return `${prefix}-${++eventCounter}`;
+}
+
+/**
+ * Thinking text may arrive either as a full snapshot or as an increment. Treat
+ * a value that already contains the current text as an update and otherwise
+ * append, so repeated full snapshots never duplicate the visible reasoning.
+ */
+function mergeThinkingText(previous: string | undefined, next: string): string {
+  const current = previous ?? '';
+  if (next === '' || next === current) return current;
+  if (next.startsWith(current)) return next;
+  return current + next;
 }
 
 function findLastTextBlock(

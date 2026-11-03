@@ -182,10 +182,133 @@ def test_distinct_message_ids_get_distinct_snapshots() -> None:
     assert second[0]["messageId"] == "msg_b"
 
 
-def test_tool_call_projects_started_activity_without_leaking_raw_input() -> None:
+def test_thought_chunks_project_accumulated_thinking_activity() -> None:
     projector = _projector()
-    secret = "SECRET-INPUT-SHOULD-NOT-LEAK"
-    events = projector.project_notification(*_tool_call(raw_input={"command": secret}))
+    first = projector.project_notification(
+        *_notification(
+            {
+                "sessionUpdate": "agent_thought_chunk",
+                "messageId": "thought_1",
+                "content": {"type": "thinking", "text": "step "},
+            }
+        )
+    )
+    second = projector.project_notification(
+        *_notification(
+            {
+                "sessionUpdate": "agent_thought_chunk",
+                "messageId": "thought_1",
+                "content": {"type": "thinking", "text": "one"},
+            }
+        )
+    )
+    assert first == [
+        {
+            "type": "dsh/v1/activity",
+            "sessionId": SESSION_ID,
+            "runtimeId": RUNTIME_ID,
+            "runId": RUN_ID,
+            "activityId": "thought:thought_1",
+            "phase": "started",
+            "label": "thinking",
+            "outputSummary": "step ",
+        }
+    ]
+    assert second[0]["phase"] == "updated"
+    assert second[0]["outputSummary"] == "step one"
+
+
+def test_message_chunk_with_thinking_content_projects_thought() -> None:
+    projector = _projector()
+    events = projector.project_notification(
+        *_notification(
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "thought_2",
+                "content": {"type": "thinking", "thinking": "reasoning"},
+            }
+        )
+    )
+    assert events[0]["label"] == "thinking"
+    assert events[0]["outputSummary"] == "reasoning"
+
+
+def test_thought_text_content_block_accumulates_reasoning() -> None:
+    """A thought update may carry a plain ACP text ContentBlock, not ``thinking``."""
+    projector = _projector()
+    first = projector.project_notification(
+        *_notification(
+            {
+                "sessionUpdate": "agent_thought_chunk",
+                "messageId": "thought_text_1",
+                "content": {"type": "text", "text": "consider "},
+            }
+        )
+    )
+    second = projector.project_notification(
+        *_notification(
+            {
+                "sessionUpdate": "agent_thought_chunk",
+                "messageId": "thought_text_1",
+                "content": {"type": "text", "text": "options"},
+            }
+        )
+    )
+    assert first[0]["activityId"] == "thought:thought_text_1"
+    assert first[0]["phase"] == "started"
+    assert first[0]["outputSummary"] == "consider "
+    assert second[0]["phase"] == "updated"
+    assert second[0]["outputSummary"] == "consider options"
+
+
+def test_thought_without_message_id_reuses_one_synthetic_id() -> None:
+    """Missing ids must not fragment one streamed thought into many rows."""
+    projector = _projector()
+
+    def thought(text: str) -> tuple[str, dict]:
+        return _notification(
+            {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "thinking", "text": text},
+            }
+        )
+
+    first = projector.project_notification(*thought("step "))
+    second = projector.project_notification(*thought("one"))
+    assert first[0]["activityId"] == f"{RUN_ID}:thought#1"
+    assert first[0]["phase"] == "started"
+    assert second[0]["activityId"] == first[0]["activityId"]
+    assert second[0]["phase"] == "updated"
+    assert second[0]["outputSummary"] == "step one"
+
+
+def test_finish_closes_open_thought_as_finished() -> None:
+    """Run completion flips a still-streaming thought to ``finished``."""
+    projector = _projector()
+    projector.project_notification(
+        *_notification(
+            {
+                "sessionUpdate": "agent_thought_chunk",
+                "messageId": "thought_final",
+                "content": {"type": "thinking", "text": "reasoning"},
+            }
+        )
+    )
+    events = projector.finish({"stopReason": "end_turn"})
+    assert events[0]["type"] == "dsh/v1/run.finished"
+    assert events[0]["status"] == "completed"
+    finished = events[1]
+    assert finished["type"] == "dsh/v1/activity"
+    assert finished["activityId"] == "thought:thought_final"
+    assert finished["phase"] == "finished"
+    assert finished["label"] == "thinking"
+    assert finished["outputSummary"] == "reasoning"
+
+
+def test_tool_call_projects_started_activity_with_raw_input() -> None:
+    projector = _projector()
+    raw_input = {"command": "printf probe"}
+    events = projector.project_notification(*_tool_call(raw_input=raw_input))
     assert events == [
         {
             "type": "dsh/v1/activity",
@@ -196,9 +319,24 @@ def test_tool_call_projects_started_activity_without_leaking_raw_input() -> None
             "phase": "started",
             "toolCallId": "call_acp_1",
             "toolName": "bash",
+            "rawInput": raw_input,
         }
     ]
-    assert secret not in json.dumps(events)
+
+
+def test_tool_call_without_raw_input_omits_the_field() -> None:
+    projector = _projector()
+    events = projector.project_notification(
+        *_notification(
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_acp_1",
+                "title": "bash",
+            }
+        )
+    )
+    assert events[0]["phase"] == "started"
+    assert "rawInput" not in events[0]
 
 
 def test_tool_call_update_completed_projects_bounded_output_summary() -> None:
@@ -399,10 +537,10 @@ def test_published_0_2_1_rc2_updates_have_message_id_and_project_cleanly() -> No
     assert emitted[0]["text"] == "PROBE_TEXT_OK"
     assert emitted[1]["phase"] == "started"
     assert emitted[1]["toolName"] == "bash"
+    assert emitted[1]["rawInput"] == {"command": "printf probe"}
     assert emitted[2]["phase"] == "finished"
     assert emitted[2]["status"] == "ok"
     assert emitted[2]["outputSummary"] == "probe"
-    assert "rawInput" not in json.dumps(emitted)
 
 
 def test_missing_message_id_uses_run_stable_synthetic_until_tool_boundary() -> None:

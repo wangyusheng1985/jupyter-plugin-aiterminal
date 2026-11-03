@@ -788,6 +788,15 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
           choiceCount,
           unavailable ? 'unavailable' : 'uncovered'
         );
+        // The choice lives in the status-bar popover, which is easy to miss
+        // after Shift+Enter. Mirror the pending decision in the execution
+        // status line so the submit always produces visible feedback instead
+        // of looking like a no-op.
+        this.status.setMessage(
+          unavailable
+            ? 'Saved Agent context is unavailable: choose a history bridge or start a new context to run this cell.'
+            : 'This cell is outside the current Agent context: choose how to continue before running it.'
+        );
         return;
       }
       if (unavailable) {
@@ -2168,6 +2177,13 @@ export class StatusBar extends Widget {
     this.setHistoryChoiceBusy(false);
     this.setContextOpen(true);
     queueMicrotask(() => {
+      // Bring the choice region into view before focusing it, so a keyboard
+      // submit never leaves the visible choice off-screen.
+      this.historyChoice.scrollIntoView?.(
+        prefersReducedMotion()
+          ? { block: 'nearest' }
+          : { block: 'nearest', behavior: 'smooth' }
+      );
       this.continueHistoryButton.focus({ preventScroll: true });
     });
   }

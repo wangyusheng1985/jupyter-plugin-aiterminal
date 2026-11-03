@@ -234,6 +234,22 @@ def test_output_limit_is_parameterized_and_validated():
         parse_dsh_provider_config(_settings(), max_output_tokens=0)
 
 
+def test_raw_context_and_output_overrides_take_precedence_and_validate():
+    config = parse_dsh_provider_config(
+        _settings(contextWindow=64000, maxOutputTokens=2048),
+        context_window=32768,
+        max_output_tokens=1024,
+    )
+
+    assert config.context_window == 64000
+    assert config.max_output_tokens == 2048
+
+    with pytest.raises(AgentConfigError, match="contextWindow"):
+        parse_dsh_provider_config(_settings(contextWindow=0))
+    with pytest.raises(AgentConfigError, match="maxOutputTokens"):
+        parse_dsh_provider_config(_settings(maxOutputTokens="lots"))
+
+
 def test_rendered_patch_stays_utf8_writable_for_non_ascii_values():
     config = parse_dsh_provider_config(_settings(model="模型-\u03c0"))
     rendered = render_profile_patches(build_profile_patches(config))

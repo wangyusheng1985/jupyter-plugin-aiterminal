@@ -417,6 +417,107 @@ describe('renderTurn', () => {
   });
 });
 
+describe('thinking activity rendering', () => {
+  function thinkingBlock(
+    id: string,
+    overrides: Partial<Extract<ChatBlock, { kind: 'thinking' }>> = {}
+  ): Extract<ChatBlock, { kind: 'thinking' }> {
+    return {
+      kind: 'thinking',
+      id,
+      status: 'finished',
+      text: 'Weighing the options',
+      ...overrides
+    };
+  }
+
+  function activityRow(node: HTMLElement, id: string): HTMLElement | null {
+    return node.querySelector<HTMLElement>(
+      `[data-activity-id="activity-${id}"]`
+    );
+  }
+
+  it('keeps the thought body collapsed until its row is expanded', () => {
+    const base = toggleTrace(
+      completedTurn([thinkingBlock('think-1'), toolBlock('tool-1')])
+    );
+
+    const collapsed = renderTurn(base, { handlers: handlers() });
+    const collapsedRow = activityRow(collapsed, 'think-1');
+    expect(collapsedRow).not.toBeNull();
+    expect(
+      collapsedRow?.querySelector('.jp-AgentWorkspace-stepOperation strong')
+        ?.textContent
+    ).toBe('Thought');
+    expect(
+      collapsedRow?.querySelector('.jp-AgentWorkspace-stepResult')?.textContent
+    ).toBe('Completed');
+    expect(
+      collapsedRow?.querySelector('.jp-AgentWorkspace-thoughtContent')
+    ).toBeNull();
+
+    const expanded = renderTurn(toggleActivity(base, 'activity-think-1'), {
+      handlers: handlers()
+    });
+    const body = expanded
+      .querySelector('[data-activity-id="activity-think-1"]')
+      ?.querySelector<HTMLElement>('.jp-AgentWorkspace-thoughtContent');
+    expect(body?.textContent).toBe('Weighing the options');
+    expect(body?.classList.contains('is-placeholder')).toBe(false);
+  });
+
+  it('labels a streaming thought as Thinking/Running until it finishes', () => {
+    const running = toggleActivity(
+      deriveTurn(createTurn('run-1'), [
+        thinkingBlock('think-running', { status: 'started' })
+      ]),
+      'activity-think-running'
+    );
+    const node = renderTurn(running, { handlers: handlers() });
+    const row = activityRow(node, 'think-running');
+
+    expect(
+      row?.querySelector('.jp-AgentWorkspace-stepOperation strong')?.textContent
+    ).toBe('Thinking');
+    expect(
+      row?.querySelector('.jp-AgentWorkspace-stepResult')?.textContent
+    ).toBe('Running');
+    expect(
+      row?.querySelector('.jp-AgentWorkspace-thoughtContent')?.textContent
+    ).toBe('Weighing the options');
+  });
+
+  it('shows a status-aware placeholder when no reasoning text was captured', () => {
+    const running = toggleActivity(
+      deriveTurn(createTurn('run-1'), [
+        thinkingBlock('think-empty', { status: 'started', text: '' })
+      ]),
+      'activity-think-empty'
+    );
+    const runningBody = renderTurn(running, {
+      handlers: handlers()
+    }).querySelector<HTMLElement>(
+      '[data-activity-id="activity-think-empty"] .jp-AgentWorkspace-thoughtContent'
+    );
+    expect(runningBody?.classList.contains('is-placeholder')).toBe(true);
+    expect(runningBody?.textContent).toBe('Thinking…');
+
+    const finished = toggleActivity(
+      toggleTrace(
+        completedTurn([thinkingBlock('think-empty-2', { text: '   ' })])
+      ),
+      'activity-think-empty-2'
+    );
+    const finishedBody = renderTurn(finished, {
+      handlers: handlers()
+    }).querySelector<HTMLElement>(
+      '[data-activity-id="activity-think-empty-2"] .jp-AgentWorkspace-thoughtContent'
+    );
+    expect(finishedBody?.classList.contains('is-placeholder')).toBe(true);
+    expect(finishedBody?.textContent).toBe('Reasoning completed');
+  });
+});
+
 describe('streaming text rendering', () => {
   function textBody(node: HTMLElement): HTMLElement | null {
     return node.querySelector<HTMLElement>('.jp-AgentWorkspace-activityBody');

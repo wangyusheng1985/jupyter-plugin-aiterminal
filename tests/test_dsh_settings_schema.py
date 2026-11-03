@@ -41,7 +41,12 @@ def test_schema_is_a_json_object_with_disabled_extra_settings():
 
     assert schema["type"] == "object"
     assert schema["additionalProperties"] is False
-    assert set(_properties()) == {"apiProtocol", *CONFIG_FIELDS}
+    assert set(_properties()) == {
+        "apiProtocol",
+        "contextWindow",
+        "maxOutputTokens",
+        *CONFIG_FIELDS,
+    }
 
 
 def test_schema_has_no_root_required_so_new_and_partial_settings_load():
@@ -104,6 +109,36 @@ def test_api_protocol_defaults_to_anthropic_messages():
 def test_config_fields_are_optional_strings():
     for field in CONFIG_FIELDS:
         assert _properties()[field]["type"] == "string"
+
+
+def test_context_window_and_max_output_tokens_are_integers_with_defaults():
+    properties = _properties()
+    context_window = properties["contextWindow"]
+    max_output_tokens = properties["maxOutputTokens"]
+
+    assert context_window["type"] == "integer"
+    assert context_window["default"] == 128000
+    assert context_window["minimum"] == 8192
+    assert max_output_tokens["type"] == "integer"
+    assert max_output_tokens["default"] == 8192
+    assert max_output_tokens["minimum"] == 1
+
+
+def test_context_window_minimum_is_not_below_default_output_tokens():
+    # A context window smaller than the default max output would let the schema
+    # describe an illegal backend state (max_output_tokens > context_window).
+    properties = _properties()
+    assert (
+        properties["contextWindow"]["minimum"]
+        >= properties["maxOutputTokens"]["default"]
+    )
+
+
+def test_schema_rejects_context_window_below_output_token_default():
+    jsonschema = pytest.importorskip("jsonschema")
+
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance={"contextWindow": 4096}, schema=_schema())
 
 
 def test_descriptions_do_not_claim_claude_sdk_exclusivity():

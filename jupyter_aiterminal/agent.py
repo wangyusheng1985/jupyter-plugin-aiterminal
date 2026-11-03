@@ -287,18 +287,38 @@ class AgentSession:
             return
         if event_type == "dsh/v1/activity":
             activity_id = str(event.get("activityId", ""))
+            if event.get("label") == "thinking":
+                # Thinking shares the activity envelope but projects onto the
+                # legacy thinking event so the transcript can render it
+                # alongside text instead of as a tool card. The projector's
+                # phase drives the legacy state: started/updated stream as
+                # ``started`` (Thinking/Running) and finished as ``finished``
+                # (Thought/Completed).
+                phase = event.get("phase")
+                state = "finished" if phase == "finished" else "started"
+                await self._emit_event(event)
+                await self._emit_event(
+                    {
+                        "type": "thinking",
+                        "id": activity_id,
+                        "state": state,
+                        "text": str(event.get("outputSummary") or ""),
+                    }
+                )
+                return
             tool_name = event.get("toolName")
             if isinstance(tool_name, str) and tool_name:
                 self._tool_names[activity_id] = tool_name
             await self._emit_event(event)
             phase = event.get("phase")
             if phase == "started":
+                raw_input = event.get("rawInput")
                 await self._emit_event(
                     {
                         "type": "tool_start",
                         "id": activity_id,
                         "name": self._tool_names.get(activity_id, ""),
-                        "input": {},
+                        "input": raw_input if raw_input is not None else {},
                         "startedAt": round(time.time() * 1000),
                     }
                 )
@@ -789,6 +809,7 @@ def _events_from_block(
                 "type": "thinking",
                 "id": f"{message_id}:{block_index}",
                 "state": "finished",
+                "text": thinking,
             }
         ]
     return []

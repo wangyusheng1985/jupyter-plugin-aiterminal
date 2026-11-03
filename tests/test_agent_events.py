@@ -28,7 +28,7 @@ def test_tool_use_and_text_blocks():
     assert isinstance(events[1]["startedAt"], int)
 
 
-def test_thinking_block_does_not_expose_reasoning_text():
+def test_thinking_block_carries_reasoning_text():
     message = SimpleNamespace(
         message_id="message-2",
         content=[SimpleNamespace(thinking="private reasoning", signature="sig")],
@@ -38,6 +38,7 @@ def test_thinking_block_does_not_expose_reasoning_text():
             "type": "thinking",
             "id": "message-2:0",
             "state": "finished",
+            "text": "private reasoning",
         }
     ]
 

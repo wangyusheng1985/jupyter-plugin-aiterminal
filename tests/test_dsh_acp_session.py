@@ -557,12 +557,89 @@ def test_yaml_block_scalars_restore_exact_values() -> None:
     )
 
 
+def test_block_has_scalar_expands_paths_only_for_path_keys() -> None:
+    # A path spelling must be normalized only where a path is expected. A
+    # non-path scalar such as ``policy`` stays literal, so an unrelated value
+    # cannot match because it resolves to the same filesystem location.
+    block = "    policy: ./ask"
+    assert session_module._block_has_scalar(block, "policy", {"ask"}) is False
+    assert session_module._block_has_scalar(block, "policy", {"./ask"}) is True
+
+    path_block = "    workspaceRoot: ./docs"
+    expected = {os.path.abspath("docs")}
+    assert (
+        session_module._block_has_scalar(
+            path_block, "workspaceRoot", expected, is_path=True
+        )
+        is True
+    )
+    assert (
+        session_module._block_has_scalar(path_block, "workspaceRoot", expected)
+        is False
+    )
+
+
 def test_start_accepts_quoted_short_workspace_root(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     async def scenario() -> None:
         session, _ = _make_session(tmp_path, monkeypatch)
         _fake_preflight.result = (0, _preflight_dump(session.cwd), "")
+        await session.start()
+        try:
+            assert session.session_id == "acp-session-new"
+        finally:
+            await session.close()
+
+    _run(scenario)
+
+
+def test_start_accepts_unicode_escaped_workspace_root(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    async def scenario() -> None:
+        session, _ = _make_session(tmp_path, monkeypatch)
+        cwd = os.fspath(session.cwd)
+        # A non-ASCII path is dumped as \uXXXX escapes when the runtime's YAML
+        # emitter is ascii-only; every character must decode back to the cwd.
+        escaped = "".join(f"\\u{ord(ch):04x}" for ch in cwd)
+        dump = (
+            "- id: approval\n"
+            "  config:\n"
+            "    policy: ask\n"
+            "- id: sandbox-policy\n"
+            "  config:\n"
+            f'    workspaceRoot: "{escaped}"\n'
+        )
+        _fake_preflight.result = (0, dump, "")
+        await session.start()
+        try:
+            assert session.session_id == "acp-session-new"
+        finally:
+            await session.close()
+
+    _run(scenario)
+
+
+def test_start_accepts_realpath_workspace_root(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    async def scenario() -> None:
+        session, _ = _make_session(tmp_path, monkeypatch)
+        real = session.cwd
+        link = tmp_path / "linked-workspace"
+        link.symlink_to(real, target_is_directory=True)
+        # The runtime may canonicalize through a symlink; the pinned root still
+        # refers to the same directory and must validate.
+        dump = (
+            "- id: approval\n"
+            "  config:\n"
+            "    policy: ask\n"
+            "- id: sandbox-policy\n"
+            "  config:\n"
+            f"    workspaceRoot: {link}\n"
+        )
+        _fake_preflight.result = (0, dump, "")
         await session.start()
         try:
             assert session.session_id == "acp-session-new"

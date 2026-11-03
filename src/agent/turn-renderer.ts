@@ -311,9 +311,20 @@ function renderActivityDetails(
         renderMarkdownSource(body, activity.text, options.rendermime ?? null);
       }
       break;
-    case 'thinking':
-      body.textContent = 'Reasoning activity';
+    case 'thinking': {
+      const content = document.createElement('div');
+      content.className = 'jp-AgentWorkspace-thoughtContent';
+      const text = activity.text.trim();
+      if (text) {
+        content.textContent = text;
+      } else {
+        content.classList.add('is-placeholder');
+        content.textContent =
+          activity.status === 'started' ? 'Thinking…' : 'Reasoning completed';
+      }
+      body.append(content);
       break;
+    }
     case 'install':
     case 'denied':
     case 'error':
@@ -483,7 +494,7 @@ function activitySummary(activity: TurnActivity): {
     case 'thinking':
       return {
         title: activity.status === 'started' ? 'Thinking' : 'Thought',
-        detail: ''
+        detail: activity.text ? firstLine(activity.text) : ''
       };
     case 'tool':
       return {

@@ -33,6 +33,7 @@ export interface ThinkingActivity {
   id: string;
   blockId: string;
   status: 'started' | 'finished';
+  text: string;
 }
 
 export interface ToolActivity {
@@ -312,7 +313,8 @@ export function timelineFromBlocks(blocks: ChatBlock[]): TurnActivity[] {
           kind: 'thinking',
           id: `activity-${block.id}`,
           blockId: block.id,
-          status: block.status
+          status: block.status,
+          text: block.text || ''
         });
         break;
       case 'tool':

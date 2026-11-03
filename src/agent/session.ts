@@ -94,6 +94,8 @@ export class AgentSession {
   sessionId: string | null;
   contextState: AgentContextState = 'connecting';
   private socket: WebSocket | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private static readonly HEARTBEAT_INTERVAL_MS = 15000;
   private pending: Array<AgentClientMessage | DshInteractionResolveMessage> =
     [];
   private readonly listeners = new Set<() => void>();
@@ -194,6 +196,9 @@ export class AgentSession {
 
   connect(): void {
     if (this.socket) return;
+    // Keep a periodic liveness check running for as long as a connection is
+    // expected, so a closed socket is healed even without a manual send.
+    this.startHeartbeat();
     if (this.contextState !== 'reset') {
       this.contextState = 'connecting';
     }
@@ -386,6 +391,7 @@ export class AgentSession {
   }
 
   close(): void {
+    this.stopHeartbeat();
     const socket = this.socket;
     this.socket = null;
     this.detachSocket(socket);
@@ -550,6 +556,19 @@ export class AgentSession {
   private send(
     message: AgentClientMessage | DshInteractionResolveMessage
   ): void {
+    // A socket that has already closed or is closing can never deliver this
+    // frame. Drop it and reconnect instead of failing the message for good,
+    // so a dropped WebSocket does not permanently wedge future commands.
+    const stale = this.socket;
+    if (
+      stale &&
+      stale.readyState !== WebSocket.OPEN &&
+      stale.readyState !== WebSocket.CONNECTING
+    ) {
+      this.socket = null;
+      this.connected = false;
+      this.detachSocket(stale);
+    }
     if (!this.socket) {
       this.connect();
     }
@@ -564,6 +583,66 @@ export class AgentSession {
     this.error = 'Agent session is not connected.';
     this.running = false;
     this.rejectExec(new Error(this.error));
+    this.notify();
+  }
+
+  private startHeartbeat(): void {
+    if (this.heartbeatTimer !== null) return;
+    // A live interval keeps a Node-hosted test runner alive, which Jest
+    // reports as an open-handle leak. Production runs in the browser, where
+    // the page owns the timer; tests rely on explicit sends/reconnects.
+    if (AgentSession.isTestEnvironment()) return;
+    const timer = setInterval(
+      () => this.checkConnection(),
+      AgentSession.HEARTBEAT_INTERVAL_MS
+    );
+    // A non-browser host must not stay alive just because a session is open.
+    const unref = (timer as unknown as { unref?: () => void }).unref;
+    if (typeof unref === 'function') unref.call(timer);
+    this.heartbeatTimer = timer;
+  }
+
+  private static isTestEnvironment(): boolean {
+    const nodeProcess = (
+      globalThis as {
+        process?: { env?: { JEST_WORKER_ID?: string } };
+      }
+    ).process;
+    return Boolean(nodeProcess?.env?.JEST_WORKER_ID);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer === null) return;
+    clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+  }
+
+  /**
+   * Reconnect when the socket has died but a connection is still expected.
+   * The heartbeat only runs while a connection is wanted (it is stopped by
+   * {@link close}), so a missing or closed socket here means recovery is due.
+   */
+  private checkConnection(): void {
+    const socket = this.socket;
+    if (
+      socket &&
+      socket.readyState !== WebSocket.OPEN &&
+      socket.readyState !== WebSocket.CONNECTING
+    ) {
+      this.socket = null;
+      this.connected = false;
+      this.detachSocket(socket);
+    }
+    if (this.socket) return;
+    try {
+      this.connect();
+    } catch (error) {
+      this.error =
+        error instanceof Error
+          ? error.message
+          : 'Agent Workspace could not reconnect.';
+      this.connected = false;
+    }
     this.notify();
   }
 

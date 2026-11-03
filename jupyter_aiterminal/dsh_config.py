@@ -46,8 +46,8 @@ DSH_STATIC_PROFILE_PATH = Path(__file__).resolve().with_name("dsh_profile.yml")
 # Conservative metadata defaults. These are safe values for the provider
 # snapshot, not a measurement of the real model context window and not a live
 # percentage of it.
-DEFAULT_CONTEXT_WINDOW = 8192
-DEFAULT_MAX_OUTPUT_TOKENS = 4096
+DEFAULT_CONTEXT_WINDOW = 128000
+DEFAULT_MAX_OUTPUT_TOKENS = 8192
 
 _REQUIRED_SETTING_KEYS = ("baseUrl", "model", "token")
 
@@ -186,9 +186,10 @@ def parse_dsh_provider_config(
     """Validate a raw Jupyter Settings mapping into a provider snapshot.
 
     ``raw`` carries ``apiProtocol`` (optional), ``baseUrl``, ``model``, and
-    ``token``. The output limits are explicit arguments so a host can choose
-    its snapshot values; the defaults are conservative metadata, not a measured
-    context window.
+    ``token``. It may also carry ``contextWindow`` and ``maxOutputTokens``;
+    when present, those raw values take precedence over the corresponding
+    arguments. The arguments let a host choose its snapshot values, and the
+    defaults are conservative metadata, not a measured context window.
     """
     if not isinstance(raw, Mapping):
         raise AgentConfigError("DSH provider settings must be a mapping.")
@@ -203,10 +204,22 @@ def parse_dsh_provider_config(
         )
 
     base_url = _validate_base_url(values["baseUrl"])
-    context_window = _validate_positive_int("context_window", context_window)
-    max_output_tokens = _validate_positive_int(
-        "max_output_tokens", max_output_tokens
-    )
+    if "contextWindow" in raw:
+        context_window = _validate_positive_int(
+            "contextWindow", raw["contextWindow"]
+        )
+    else:
+        context_window = _validate_positive_int(
+            "context_window", context_window
+        )
+    if "maxOutputTokens" in raw:
+        max_output_tokens = _validate_positive_int(
+            "maxOutputTokens", raw["maxOutputTokens"]
+        )
+    else:
+        max_output_tokens = _validate_positive_int(
+            "max_output_tokens", max_output_tokens
+        )
     if max_output_tokens > context_window:
         raise AgentConfigError(
             "max_output_tokens must not exceed context_window"

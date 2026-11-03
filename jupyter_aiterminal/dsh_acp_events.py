@@ -41,6 +41,13 @@ Projection rules:
   tool call id. Tool naming is fixed by the first trusted ``tool_call``;
   later updates cannot silently rename an activity. ``outputSummary`` is
   bounded text from the standard content blocks and never the raw input.
+* ``thought``/``agent_thought_chunk`` updates (and ``agent_message_chunk``
+  payloads whose content type is ``thinking``/``thought``, plus plain text
+  content blocks addressed to a thought update) become thinking activity keyed
+  by a stable thought id. The accumulated reasoning text is carried in
+  ``outputSummary`` with ``label: "thinking"`` so the host can project it onto
+  the legacy thinking event. ACP has no thought-complete signal, so any still
+  open thought is closed with ``phase: finished`` at the run boundary.
 * Unknown update kinds and unknown methods are ignored safely. ACP does not
   expose artifact presentation/change events through this surface, so no
   artifact event is fabricated. Questions and permissions are host-owned; this
@@ -62,13 +69,19 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-OUTPUT_SUMMARY_MAX_CHARACTERS = 400
+# Long search results and file reads must survive into the transcript, so the
+# summary cap is intentionally generous; only pathological payloads truncate.
+OUTPUT_SUMMARY_MAX_CHARACTERS = 4096
 _TRUNCATION_SUFFIX = "\u2026"
 
 _SESSION_UPDATE_METHOD = "session/update"
 _FINISHED_TOOL_STATUSES = {"completed": "ok", "failed": "error"}
 _NON_TERMINAL_TOOL_STATUSES = {"pending", "in_progress"}
 _PROMPT_SUCCESS_STATUSES = {"end_turn": "completed", "cancelled": "cancelled"}
+_THOUGHT_UPDATE_KINDS = {"thought", "agent_thought", "agent_thought_chunk"}
+_THINKING_CONTENT_TYPES = {"thinking", "thought"}
+# Thought updates accept the plain ACP text ContentBlock as well.
+_THOUGHT_CONTENT_TYPES = _THINKING_CONTENT_TYPES | {"text"}
 
 
 def _non_empty_string(value: Any) -> bool:
@@ -79,6 +92,36 @@ def _bounded_output_summary(text: str) -> str:
     if len(text) <= OUTPUT_SUMMARY_MAX_CHARACTERS:
         return text
     return text[:OUTPUT_SUMMARY_MAX_CHARACTERS] + _TRUNCATION_SUFFIX
+
+
+def _is_thinking_content(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("type") in _THINKING_CONTENT_TYPES
+    )
+
+
+def _thinking_text(update: Mapping[str, Any]) -> str | None:
+    """Extract committed thinking text from a thought update, if present.
+
+    Thought updates are routed here regardless of content type, so a plain
+    text ContentBlock (``{"type": "text", "text": ...}``) is as valid as a
+    ``thinking``/``thought`` block. Only those shapes are read, so an
+    unrelated block type cannot leak non-reasoning payloads.
+    """
+    content = update.get("content")
+    if isinstance(content, Mapping) and content.get("type") in _THOUGHT_CONTENT_TYPES:
+        for key in ("text", "thinking", "thought"):
+            text = content.get(key)
+            if isinstance(text, str) and text:
+                return text
+    if isinstance(content, str) and content:
+        return content
+    for key in ("text", "delta"):
+        text = update.get(key)
+        if isinstance(text, str) and text:
+            return text
+    return None
 
 
 def _content_text(value: Any) -> str | None:
@@ -121,6 +164,11 @@ class DshAcpEventProjector:
         self._synthetic_message_ordinal = 0
         self._tool_names: dict[str, str] = {}
         self._finished_activities: set[str] = set()
+        self._thought_ids: set[str] = set()
+        self._thought_texts: dict[str, str] = {}
+        self._open_thought_ids: list[str] = []
+        self._thought_ordinal = 0
+        self._synthetic_thought_id: str | None = None
         self._run_started = False
         self._run_finished = False
 
@@ -139,7 +187,7 @@ class DshAcpEventProjector:
         return [{"type": "dsh/v1/run.started", **self._scope()}]
 
     def finish(self, prompt_result: Any) -> list[dict[str, Any]]:
-        """Emit one terminal event from an ACP ``session/prompt`` response."""
+        """Emit the terminal event, plus any still-open thought finalizers."""
         stop_reason = (
             prompt_result.get("stopReason")
             if isinstance(prompt_result, Mapping)
@@ -153,7 +201,11 @@ class DshAcpEventProjector:
         return self._finish(status or "failed")
 
     def finish_error(self, error: Any = None) -> list[dict[str, Any]]:
-        """Emit a ``failed`` terminal when the host caught an out-of-band error."""
+        """Emit a ``failed`` terminal when the host caught an out-of-band error.
+
+        Still-open thoughts are closed as ``finished`` before the terminal is
+        reported so an aborted run never leaves a permanently-streaming row.
+        """
         # ``error`` is intentionally ignored: exception text can contain raw
         # payloads or credentials and must never reach the product event.
         return self._finish("failed")
@@ -162,7 +214,33 @@ class DshAcpEventProjector:
         if self._run_finished:
             return []
         self._run_finished = True
-        return [{"type": "dsh/v1/run.finished", **self._scope(), "status": status}]
+        return [
+            {"type": "dsh/v1/run.finished", **self._scope(), "status": status},
+            *self._finalize_thoughts(),
+        ]
+
+    def _finalize_thoughts(self) -> list[dict[str, Any]]:
+        """Close every still-streaming thought so its state can reach finished.
+
+        ACP has no explicit thought-complete notification, so the run boundary
+        is where an open thought stops streaming. The lifecycle stays ordered:
+        ``run.finished`` is first so the host can read the terminal status, and
+        the ``finished`` thought activities follow it.
+        """
+        events: list[dict[str, Any]] = []
+        for activity_id in self._open_thought_ids:
+            events.append(
+                {
+                    "type": "dsh/v1/activity",
+                    **self._scope(),
+                    "activityId": activity_id,
+                    "phase": "finished",
+                    "label": "thinking",
+                    "outputSummary": self._thought_texts.get(activity_id, ""),
+                }
+            )
+        self._open_thought_ids.clear()
+        return events
 
     def project_notification(
         self, method: Any, params: Any
@@ -179,7 +257,11 @@ class DshAcpEventProjector:
             return []
         kind = update.get("sessionUpdate")
         if kind == "agent_message_chunk":
+            if _is_thinking_content(update.get("content")):
+                return self._project_thought(update)
             return self._project_message_chunk(update)
+        if kind in _THOUGHT_UPDATE_KINDS:
+            return self._project_thought(update)
         if kind == "tool_call":
             return self._project_tool_call(update)
         if kind == "tool_call_update":
@@ -222,6 +304,56 @@ class DshAcpEventProjector:
         # each one so repeated words are never mistaken for a duplicate.
         return [{"type": "dsh/v1/text.delta", **common, "delta": text}]
 
+    def _thought_ref(self, update: Mapping[str, Any]) -> str:
+        """Resolve a stable activity id for one streamed thinking block.
+
+        Mirrors ``_message_ref``: when the runtime omits an explicit id, one
+        synthetic reference is reused for the run until the next tool
+        boundary. Reusing it keeps the accumulated reasoning in a single row
+        instead of fragmenting one thought into a new row per chunk.
+        """
+        for key in ("messageId", "thoughtId", "thought_id"):
+            value = update.get(key)
+            if _non_empty_string(value):
+                return f"thought:{value}"
+        if self._synthetic_thought_id is None:
+            self._thought_ordinal += 1
+            self._synthetic_thought_id = (
+                f"{self._run_id}:thought#{self._thought_ordinal}"
+            )
+        return self._synthetic_thought_id
+
+    def _project_thought(
+        self, update: Mapping[str, Any]
+    ) -> list[dict[str, Any]]:
+        text = _thinking_text(update)
+        if text is None:
+            return []
+        activity_id = self._thought_ref(update)
+        first = activity_id not in self._thought_ids
+        if first:
+            self._thought_ids.add(activity_id)
+            self._open_thought_ids.append(activity_id)
+        # Thinking streams are committed increments just like assistant text.
+        previous = self._thought_texts.get(activity_id, "")
+        if text == previous:
+            accumulated = previous
+        elif text.startswith(previous):
+            accumulated = text
+        else:
+            accumulated = previous + text
+        self._thought_texts[activity_id] = accumulated
+        return [
+            {
+                "type": "dsh/v1/activity",
+                **self._scope(),
+                "activityId": activity_id,
+                "phase": "started" if first else "updated",
+                "label": "thinking",
+                "outputSummary": accumulated,
+            }
+        ]
+
     def _project_tool_call(
         self, update: Mapping[str, Any]
     ) -> list[dict[str, Any]]:
@@ -232,21 +364,28 @@ class DshAcpEventProjector:
         if not _non_empty_string(tool_name):
             return []
         self._tool_names[tool_call_id] = tool_name
-        # A tool call starts a new assistant message; a late call after its
-        # terminal update must enrich the name, not regress the activity.
+        # A tool call starts a new assistant message and a new thought block;
+        # a late call after its terminal update must enrich the name, not
+        # regress the activity.
         self._synthetic_message_id = None
+        self._synthetic_thought_id = None
         if tool_call_id in self._finished_activities:
             return []
-        return [
-            {
-                "type": "dsh/v1/activity",
-                **self._scope(),
-                "activityId": tool_call_id,
-                "phase": "started",
-                "toolCallId": tool_call_id,
-                "toolName": tool_name,
-            }
-        ]
+        event: dict[str, Any] = {
+            "type": "dsh/v1/activity",
+            **self._scope(),
+            "activityId": tool_call_id,
+            "phase": "started",
+            "toolCallId": tool_call_id,
+            "toolName": tool_name,
+        }
+        # Forward the tool arguments untouched so hosts can render the real
+        # call input; mapping-shaped values are the normal ACP shape, while a
+        # non-mapping rawInput is passed through as received.
+        raw_input = update.get("rawInput")
+        if raw_input is not None:
+            event["rawInput"] = raw_input
+        return [event]
 
     def _project_tool_call_update(
         self, update: Mapping[str, Any]
@@ -270,6 +409,7 @@ class DshAcpEventProjector:
             # an outcome, and never fabricate a duration for the missing field.
             return []
         self._synthetic_message_id = None
+        self._synthetic_thought_id = None
         event: dict[str, Any] = {
             "type": "dsh/v1/activity",
             **self._scope(),

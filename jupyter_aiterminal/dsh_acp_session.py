@@ -159,6 +159,79 @@ def _row_block(dump: str, row_id: str) -> str | None:
 # fits its single-line width.
 _BLOCK_SCALAR_HEADER = re.compile(r"[>|][1-9]?[+-]?|[>|][+-][1-9]?")
 
+# YAML double-quoted escapes (JSON-compatible ones plus YAML extras). The DSH
+# runtime dumps a non-ASCII workspace root either literally or as ``\uXXXX``
+# sequences; both must decode to the same filesystem path.
+_YAML_ESCAPE = re.compile(
+    r"\\(u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|x[0-9a-fA-F]{2}|.)", re.DOTALL
+)
+_YAML_SIMPLE_ESCAPES = {
+    "0": "\0",
+    "a": "\a",
+    "b": "\b",
+    "t": "\t",
+    "\t": "\t",
+    "n": "\n",
+    "v": "\v",
+    "f": "\f",
+    "r": "\r",
+    "e": "\x1b",
+    " ": " ",
+    '"': '"',
+    "/": "/",
+    "\\": "\\",
+    "_": "\u00a0",
+    "N": "\u0085",
+    "L": "\u2028",
+    "P": "\u2029",
+}
+
+
+def _decode_yaml_double_quoted(inner: str) -> str:
+    """Decode the escapes a YAML double-quoted scalar may contain."""
+
+    def replace(match: re.Match[str]) -> str:
+        token = match.group(1)
+        if token[0] in "uUx" and len(token) > 1:
+            try:
+                return chr(int(token[1:], 16))
+            except ValueError:
+                return match.group(0)
+        return _YAML_SIMPLE_ESCAPES.get(token, match.group(0))
+
+    return _YAML_ESCAPE.sub(replace, inner)
+
+
+def _yaml_scalar_text(raw: str) -> str:
+    """Return a scalar's text with literal quoting and escapes resolved."""
+    text = raw.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        if text[0] == '"':
+            return _decode_yaml_double_quoted(text[1:-1])
+        return text[1:-1].replace("''", "'")
+    return text
+
+
+def _path_variants(value: str) -> set[str]:
+    """Return equivalent spellings of one filesystem path.
+
+    The runtime may print ``workspaceRoot`` through ``realpath`` while the
+    host keeps an unresolved ``cwd`` (or vice versa), and macOS resolves
+    ``/var`` to ``/private/var``. Comparing every spelling keeps the overlay
+    check correct across those quirks without weakening the pin.
+    """
+    variants = {value}
+    for normalize in (os.path.abspath, os.path.realpath):
+        try:
+            variants.add(normalize(value))
+        except (OSError, ValueError):
+            pass
+    try:
+        variants.add(os.fspath(Path(value).resolve()))
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return variants
+
 
 def _yaml_key_pattern(key: str) -> re.Pattern[str]:
     return re.compile(rf"^(?P<indent> *){re.escape(key)}:[ \t]*(?P<value>.*?)[ \t]*$")
@@ -207,7 +280,7 @@ def _yaml_key_values(block: str, key: str) -> list[str] | None:
             continue
         inline = match.group("value")
         if not _BLOCK_SCALAR_HEADER.fullmatch(inline):
-            values.append(inline.strip().strip("\"'").strip())
+            values.append(_yaml_scalar_text(inline))
             index += 1
             continue
         key_indent = len(match.group("indent"))
@@ -236,9 +309,26 @@ def _yaml_key_values(block: str, key: str) -> list[str] | None:
     return values
 
 
-def _block_has_scalar(block: str, key: str, expected: set[str]) -> bool:
+def _block_has_scalar(
+    block: str, key: str, expected: set[str], *, is_path: bool = False
+) -> bool:
     values = _yaml_key_values(block, key)
-    return values is not None and values[0] in expected
+    if values is None:
+        return False
+    actual = values[0]
+    if actual in expected:
+        return True
+    if not is_path:
+        return False
+    # Filesystem paths may be dumped with a different but equivalent
+    # normalization (realpath vs. resolve, escaped non-ASCII). Compare every
+    # spelling so a valid overlay is never rejected for cosmetic differences.
+    # Scalars such as ``policy`` must stay literal; path expansion there could
+    # make an unrelated value match after normalization.
+    actual_variants = _path_variants(actual)
+    return any(
+        actual_variants & _path_variants(candidate) for candidate in expected
+    )
 
 
 async def _stop_preflight_process(proc: asyncio.subprocess.Process) -> None:
@@ -607,12 +697,16 @@ class DshAcpSession:
             )
         approval = _row_block(stdout, ACP_ROW_APPROVAL)
         sandbox = _row_block(stdout, ACP_ROW_SANDBOX_POLICY)
-        roots = {os.fspath(self._cwd), os.fspath(self._cwd.resolve())}
+        roots = {
+            os.fspath(self._cwd),
+            os.fspath(self._cwd.resolve()),
+            os.path.realpath(os.fspath(self._cwd)),
+        }
         approval_ask = approval is not None and _block_has_scalar(
             approval, "policy", {"ask"}
         )
         root_pinned = sandbox is not None and _block_has_scalar(
-            sandbox, "workspaceRoot", roots
+            sandbox, "workspaceRoot", roots, is_path=True
         )
         if not approval_ask or not root_pinned:
             raise DshAcpSessionError(

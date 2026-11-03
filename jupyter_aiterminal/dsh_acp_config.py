@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from .dsh_config import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
     DSH_API_KEY_ENV,
     DSH_PLUGIN_ID,
     DSH_PROVIDER_ID,
@@ -55,10 +56,10 @@ from .settings import AgentConfigError
 
 ACP_PROFILE = "acp"
 
-# Conservative cap for the ACP overlay. The value is metadata for the provider
-# snapshot, not a measured model window, and is intentionally not raised above
-# the provider default.
-ACP_MAX_OUTPUT_TOKENS_CAP = 4096
+# Cap for the ACP overlay. The value is metadata for the provider snapshot, not
+# a measured model window. It must not sit below the provider default, or a
+# default or user-supplied 8192-token limit would be silently clamped down.
+ACP_MAX_OUTPUT_TOKENS_CAP = DEFAULT_MAX_OUTPUT_TOKENS
 
 # Rows that exist in the shipped ACP profile. Only these ids are patched; the
 # module never inserts a row, so a typo cannot create a new plugin.
