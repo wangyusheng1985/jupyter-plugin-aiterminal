@@ -5,12 +5,15 @@ import {
   AGENT_WS_PATH,
   DSH_EVENT_NAMESPACE,
   applyServerEvent,
+  parseConfigurationReport,
   parseDshProductEvent,
   type AgentClientMessage,
+  type AgentConfigurationRequestMessage,
   type AgentExecDoneEvent,
   type AgentServerEvent,
   type AgentContextState,
   type ChatBlock,
+  type ConfigurationReport,
   type DshCapabilityManifest,
   type DshInteractionResolution,
   type DshProductEvent,
@@ -23,7 +26,8 @@ export function agentSocketUrl(
   settings: ServerConnection.ISettings = ServerConnection.makeSettings(),
   cwd?: string,
   sessionId?: string | null,
-  dshSessionId?: string | null
+  dshSessionId?: string | null,
+  workspacePath?: string | null
 ): string {
   let url = URLExt.join(settings.wsUrl, AGENT_WS_PATH);
   if (cwd) url += `?cwd=${encodeURIComponent(cwd)}`;
@@ -47,6 +51,11 @@ export function agentSocketUrl(
       dshSessionId
     )}`;
   }
+  if (workspacePath) {
+    url += `${url.includes('?') ? '&' : '?'}workspacePath=${encodeURIComponent(
+      workspacePath
+    )}`;
+  }
   if (settings.appendToken && settings.token) {
     const token = URLExt.objectToQueryString({ token: settings.token });
     url += `${url.includes('?') ? '&' : ''}${token.replace(/^\?/, '')}`;
@@ -59,6 +68,14 @@ export interface ExecResult {
   returncode: number;
   cwd: string;
 }
+
+/**
+ * Fixed frontend copy for a non-fatal configuration refresh failure. The
+ * backend's own message is never rendered: it could carry settings or
+ * credential text, so only this constant reaches the DOM.
+ */
+const CONFIGURATION_ERROR_MESSAGE =
+  'AI Terminal configuration could not be refreshed; the current turn keeps running. Save the fix, then start a new runtime to apply it.';
 
 /**
  * Identity of the interaction a decision belongs to. `sessionId`/`runtimeId`
@@ -88,10 +105,12 @@ export class AgentSession {
   error: string | null = null;
   running = false;
   activeTurnId: string | null = null;
+  activeCellId: string | null = null;
   acceptedTurnId: string | null = null;
   execCwd: string | null = null;
   execOutput = '';
   sessionId: string | null;
+  workspacePath: string | null = null;
   contextState: AgentContextState = 'connecting';
   private socket: WebSocket | null = null;
   private pending: Array<AgentClientMessage | DshInteractionResolveMessage> =
@@ -111,6 +130,8 @@ export class AgentSession {
     resolve: (result: ExecResult) => void;
     reject: (error: Error) => void;
   }> = [];
+  private configuration: ConfigurationReport | null = null;
+  private configurationErrorState: string | null = null;
 
   constructor(
     private readonly settings: ServerConnection.ISettings = ServerConnection.makeSettings(),
@@ -161,6 +182,23 @@ export class AgentSession {
   get dshCapabilityManifest(): DshCapabilityManifest | null {
     return this.dshCapabilities;
   }
+  /**
+   * Latest validated effective-configuration report, or `null` until the
+   * runtime sends one. Read-only: only validated `configuration` events from
+   * the current socket may update it, and it is never derived from a turn.
+   */
+  get configurationReport(): ConfigurationReport | null {
+    return this.configuration;
+  }
+
+  /**
+   * Non-fatal configuration refresh failure, or `null`. It never modifies
+   * blocks, turn, running, error, or context state, and it is cleared by the
+   * next successfully validated configuration report.
+   */
+  get configurationError(): string | null {
+    return this.configurationErrorState;
+  }
 
   /**
    * Bind the expected durable DSH session before connecting. The value is
@@ -179,6 +217,13 @@ export class AgentSession {
     this.dshAttachedRuntime = null;
   }
 
+  configureWorkspacePath(workspacePath: string | null): void {
+    if (this.socket) {
+      throw new Error('Workspace path must be configured before connecting.');
+    }
+    this.workspacePath = workspacePath;
+  }
+
   /** Terminal teardown: closes the socket and drops every subscriber. */
   dispose(): void {
     this.close();
@@ -190,6 +235,8 @@ export class AgentSession {
     this.dshAttachedRuntime = null;
     this.dshCapabilities = null;
     this.dshRetiredRuntimes.clear();
+    this.configuration = null;
+    this.configurationErrorState = null;
   }
 
   connect(): void {
@@ -203,7 +250,13 @@ export class AgentSession {
     this.dshPhase = null;
     this.dshCapabilities = null;
     const socket = new this.settings.WebSocket(
-      agentSocketUrl(this.settings, this.cwd, this.sessionId, this.dshSession)
+      agentSocketUrl(
+        this.settings,
+        this.cwd,
+        this.sessionId,
+        this.dshSession,
+        this.workspacePath
+      )
     );
     this.socket = socket;
     socket.onopen = () => {
@@ -226,6 +279,20 @@ export class AgentSession {
       }
       const payload = raw as AgentServerEvent | null;
       if (!payload) return;
+      if (payload.type === 'configuration-error') {
+        // Non-fatal side channel: surface a fixed frontend message and return
+        // before turn projection so blocks/turn/running/error/context are
+        // untouched. This must also never fall through to applyServerEvent.
+        this.configurationErrorState = CONFIGURATION_ERROR_MESSAGE;
+        this.notify();
+        return;
+      }
+      if (payload.type === 'configuration') {
+        // Configuration is a side channel: it is validated on its own and
+        // never reaches turn projection, busy state, context, or session id.
+        this.applyConfigurationEvent(raw);
+        return;
+      }
       if (
         this.activeTurnId &&
         isTurnScopedEvent(payload) &&
@@ -304,6 +371,7 @@ export class AgentSession {
       type: 'user',
       turnId,
       text: trimmed,
+      ...(this.activeCellId ? { cellId: this.activeCellId } : {}),
       ...(historyBridge ? { historyBridge } : {})
     });
     this.notify();
@@ -385,6 +453,35 @@ export class AgentSession {
     return Promise.resolve();
   }
 
+  /**
+   * Ask the runtime for its current safe configuration report.
+   *
+   * Delivery is best effort and out-of-band: this never starts a turn, never
+   * opens a connection, never creates or resumes a context, and is never
+   * queued while the socket is missing or still connecting. Returns `true`
+   * only when the frame was handed to an open socket, `false` when it was
+   * dropped, so callers never report a false success.
+   */
+  requestConfiguration(): boolean | void {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    const message: AgentConfigurationRequestMessage = { type: 'configuration' };
+    socket.send(JSON.stringify(message));
+    return true;
+  }
+
+  private applyConfigurationEvent(raw: unknown): void {
+    if (typeof raw !== 'object' || raw === null) return;
+    const report = parseConfigurationReport(
+      (raw as { report?: unknown }).report
+    );
+    if (!report) return;
+    this.configuration = report;
+    // A validated report proves the refresh path works again.
+    this.configurationErrorState = null;
+    this.notify();
+  }
+
   close(): void {
     const socket = this.socket;
     this.socket = null;
@@ -398,6 +495,13 @@ export class AgentSession {
 
   resetContext(): void {
     const socket = this.socket;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      try {
+        socket.send(JSON.stringify({ type: 'shutdown' }));
+      } catch {
+        // Best effort
+      }
+    }
     this.socket = null;
     this.detachSocket(socket);
     this.pending = [];
@@ -418,6 +522,8 @@ export class AgentSession {
     this.dshPhase = null;
     this.dshAttachedRuntime = null;
     this.dshCapabilities = null;
+    this.configuration = null;
+    this.configurationErrorState = null;
     this.contextState = 'reset';
     this.connect();
     this.notify();
@@ -609,6 +715,7 @@ type TurnScopedAgentEvent = Exclude<
   | { type: 'exec_output' }
   | { type: 'exec_done' }
   | { type: 'exec_error' }
+  | { type: 'configuration' }
 >;
 
 function isTurnScopedEvent(
@@ -618,6 +725,7 @@ function isTurnScopedEvent(
     event.type === 'ready' ||
     event.type === 'exec_output' ||
     event.type === 'exec_done' ||
-    event.type === 'exec_error'
+    event.type === 'exec_error' ||
+    event.type === 'configuration'
   );
 }

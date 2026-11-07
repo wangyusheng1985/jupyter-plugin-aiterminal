@@ -251,20 +251,20 @@ def test_unknown_tool_status_is_ignored() -> None:
 
 
 @pytest.mark.parametrize(
-    ("prompt_result", "status"),
+    ("prompt_result", "status", "reason"),
     [
-        ({"stopReason": "end_turn"}, "completed"),
-        ({"stopReason": "cancelled"}, "cancelled"),
-        ({"stopReason": "max_tokens"}, "failed"),
-        ({"stopReason": "max_turn_requests"}, "failed"),
-        ({"stopReason": "refusal"}, "failed"),
-        ({"stopReason": "future_reason"}, "failed"),
-        ({}, "failed"),
-        (None, "failed"),
+        ({"stopReason": "end_turn"}, "completed", "completed"),
+        ({"stopReason": "cancelled"}, "cancelled", "cancelled"),
+        ({"stopReason": "max_tokens"}, "failed", "budget-exhausted"),
+        ({"stopReason": "max_turn_requests"}, "failed", "failed"),
+        ({"stopReason": "refusal"}, "failed", "failed"),
+        ({"stopReason": "future_reason"}, "failed", "failed"),
+        ({}, "failed", "failed"),
+        (None, "failed", "failed"),
     ],
 )
-def test_finish_maps_stop_reason_to_terminal_status(
-    prompt_result: object, status: str
+def test_finish_maps_stop_reason_to_terminal_status_and_reason(
+    prompt_result: object, status: str, reason: str
 ) -> None:
     projector = _projector()
     assert projector.finish(prompt_result) == [
@@ -274,14 +274,48 @@ def test_finish_maps_stop_reason_to_terminal_status(
             "runtimeId": RUNTIME_ID,
             "runId": RUN_ID,
             "status": status,
+            "reason": reason,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "status", "reason"),
+    [
+        ("end_turn", "completed", "completed"),
+        ("cancelled", "cancelled", "cancelled"),
+        ("max_tokens", "failed", "budget-exhausted"),
+        ("future_reason", "failed", "failed"),
+    ],
+)
+def test_finish_distinguishes_each_terminal_reason(
+    stop_reason: str, status: str, reason: str
+) -> None:
+    terminal = _projector().finish({"stopReason": stop_reason})
+    event = terminal[0]
+    assert event["type"] == "dsh/v1/run.finished"
+    assert event["status"] == status
+    assert event["reason"] == reason
+    assert "stopReason" not in event
+
+
+def test_unknown_secret_like_stop_reason_never_enters_event() -> None:
+    sentinel = "sk-live-SECRET-7f9a2c-do-not-leak"
+    terminal = _projector().finish({"stopReason": sentinel})
+    event = terminal[0]
+    assert event["reason"] == "failed"
+    assert event["status"] == "failed"
+    assert "stopReason" not in event
+    serialized = json.dumps(terminal)
+    assert sentinel not in serialized
 
 
 def test_finish_error_is_failed_terminal_and_terminal_is_idempotent() -> None:
     projector = _projector()
     terminal = projector.finish_error(RuntimeError("boom with raw payload"))
     assert terminal[0]["status"] == "failed"
+    assert terminal[0]["reason"] == "failed"
+    assert "stopReason" not in terminal[0]
     assert "boom" not in json.dumps(terminal)
     assert projector.finish({"stopReason": "end_turn"}) == []
     assert projector.finish_error() == []

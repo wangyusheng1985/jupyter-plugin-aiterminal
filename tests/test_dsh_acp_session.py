@@ -14,6 +14,7 @@ import json
 import os
 import stat
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,12 @@ import pytest
 import jupyter_aiterminal.dsh_acp_session as session_module
 from jupyter_aiterminal.dsh_acp_session import DshAcpSession, DshAcpSessionError
 from jupyter_aiterminal.dsh_acp_transport import DshAcpError
-from jupyter_aiterminal.dsh_config import DshProviderConfig
+from jupyter_aiterminal.dsh_config import (
+    DerivedBudget,
+    DshProviderConfig,
+    _validate_config_snapshot,
+)
+from jupyter_aiterminal.settings import AgentConfigError
 
 SECRET = "dsh-acp-session-unit-secret-never-render"
 TIMEOUT = 10.0
@@ -60,6 +66,7 @@ class FakeTransport:
         )
         self.requests: list[tuple[str, Any]] = []
         self.notifications: list[tuple[str, Any]] = []
+        self.listeners: dict[str, dict[str, Any]] = {}
         self.closed = False
         self.started = False
         self.prompt_started = asyncio.Event()
@@ -99,6 +106,12 @@ class FakeTransport:
     async def close(self) -> None:
         self.closed = True
 
+    def add_listener(self, key: str, **kwargs: Any) -> None:
+        self.listeners[key] = dict(kwargs)
+
+    def remove_listener(self, key: str) -> None:
+        self.listeners.pop(key, None)
+
     async def call_server_request(self, message: dict[str, Any]) -> Any:
         return await self.kwargs["on_server_request"](message)
 
@@ -121,21 +134,74 @@ async def _fake_preflight(
     return 0, _preflight_dump(cwd), ""
 
 
-def _preflight_dump(cwd: Path) -> str:
-    # Real 0.2.1rc2 dump shape: top-level `- id:` rows with nested config.
-    # workspaceRoot is quoted to exercise quoted scalar handling.
+def _budget() -> DerivedBudget:
+    return _validate_config_snapshot(_config())
+
+
+def _token_meter_row_dump(*, disabled: bool | None = None) -> str:
+    # The overlay never patches token-meter; this row only proves the shipped
+    # row still exists and is enabled.
+    if disabled is None:
+        return "- id: token-meter\n"
     return (
-        '- id: approval\n'
-        '  config:\n'
-        '    policy: ask\n'
-        '- id: sandbox-policy\n'
-        '  config:\n'
-        '    mode: "workspace-write"\n'
-        f'    workspaceRoot: "{cwd}"\n'
+        "- id: token-meter\n"
+        f"  disabled: {'true' if disabled else 'false'}\n"
     )
 
 
-def _folded_preflight_dump(cwd: Path, root: str | None = None) -> str:
+def _compaction_row_dump(
+    budget: DerivedBudget, *, fields: dict[str, str] | None = None
+) -> str:
+    if fields is None:
+        fields = {
+            "auto": "true" if budget.compaction_enabled else "false",
+            "thresholdRatio": repr(budget.threshold_ratio),
+            "headroomTokens": str(budget.headroom),
+            "retainRatio": repr(budget.retain_ratio),
+            "maxTokens": str(budget.summary_max_tokens),
+        }
+    body = "".join(f"    {key}: {value}\n" for key, value in fields.items())
+    return f"- id: compaction-basic\n  config:\n{body}"
+
+
+def _preflight_dump(
+    cwd: Path,
+    *,
+    budget: DerivedBudget | None = None,
+    include_token_meter: bool = True,
+    include_compaction: bool = True,
+    token_meter_disabled: bool | None = None,
+    compaction_fields: dict[str, str] | None = None,
+) -> str:
+    # Real 0.2.1rc2 dump shape: top-level `- id:` rows with nested config.
+    # workspaceRoot is quoted to exercise quoted scalar handling.
+    rows = [
+        '- id: approval\n'
+        '  config:\n'
+        '    policy: ask\n',
+        '- id: sandbox-policy\n'
+        '  config:\n'
+        '    mode: "workspace-write"\n'
+        f'    workspaceRoot: "{cwd}"\n',
+    ]
+    if include_token_meter:
+        rows.append(_token_meter_row_dump(disabled=token_meter_disabled))
+    if include_compaction:
+        rows.append(
+            _compaction_row_dump(
+                budget if budget is not None else _budget(),
+                fields=compaction_fields,
+            )
+        )
+    return "".join(rows)
+
+
+def _folded_preflight_dump(
+    cwd: Path,
+    root: str | None = None,
+    *,
+    budget: DerivedBudget | None = None,
+) -> str:
     # Real 0.2.1rc2 emits a folded block scalar (`>-` plus an indented
     # continuation line) once workspaceRoot grows past the dumper's line
     # width, e.g. a macOS temp root under /private/var/folders.
@@ -149,6 +215,8 @@ def _folded_preflight_dump(cwd: Path, root: str | None = None) -> str:
         '    mode: "workspace-write"\n'
         '    workspaceRoot: >-\n'
         f'      {value}\n'
+        + _token_meter_row_dump()
+        + _compaction_row_dump(budget if budget is not None else _budget())
     )
 
 
@@ -187,10 +255,11 @@ def _make_session(
     cwd.mkdir(exist_ok=True)
     emitted: list[dict[str, Any]] = []
     emit = kwargs.pop("emit", emitted.append)
+    config = kwargs.pop("config", None)
     kwargs.setdefault("runtime_version", lambda: _PINNED_RUNTIME_VERSION)
     kwargs.setdefault("policy_preflight", _fake_preflight)
     session = DshAcpSession(
-        config=_config(),
+        config=_config() if config is None else config,
         cwd=cwd,
         storage_root=tmp_path / "storage",
         emit=emit,
@@ -568,6 +637,208 @@ def test_start_accepts_quoted_short_workspace_root(
             assert session.session_id == "acp-session-new"
         finally:
             await session.close()
+
+    _run(scenario)
+
+
+def test_preflight_dump_carries_default_derived_compaction_values() -> None:
+    budget = _budget()
+    dump = _preflight_dump(Path("/tmp/workspace"))
+    block = session_module._row_block(dump, "compaction-basic")
+    assert block is not None
+    expected = {
+        "auto": budget.compaction_enabled,
+        "thresholdRatio": budget.threshold_ratio,
+        "headroomTokens": budget.headroom,
+        "retainRatio": budget.retain_ratio,
+        "maxTokens": budget.summary_max_tokens,
+    }
+    for key, value in expected.items():
+        assert session_module._scalar_equals(block, key, value), key
+
+
+def test_start_accepts_token_meter_row_with_disabled_false(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    async def scenario() -> None:
+        session, _ = _make_session(tmp_path, monkeypatch)
+        _fake_preflight.result = (
+            0,
+            _preflight_dump(session.cwd, token_meter_disabled=False),
+            "",
+        )
+        await session.start()
+        try:
+            assert session.session_id == "acp-session-new"
+            assert session.config_preflight_proven is True
+        finally:
+            await session.close()
+
+    _run(scenario)
+
+
+def test_start_accepts_compaction_row_with_auto_false(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    async def scenario() -> None:
+        budget = DerivedBudget(
+            context_window=8192,
+            max_output_tokens=4096,
+            compaction_enabled=False,
+            threshold_ratio=0.8,
+            headroom=1024,
+            retain_ratio=0.16,
+            summary_max_tokens=1024,
+        )
+        config = replace(_config(), budget=budget)
+        session, _ = _make_session(tmp_path, monkeypatch, config=config)
+        _fake_preflight.result = (
+            0,
+            _preflight_dump(session.cwd, budget=budget),
+            "",
+        )
+        await session.start()
+        try:
+            assert session.session_id == "acp-session-new"
+            assert session.config_preflight_proven is True
+        finally:
+            await session.close()
+
+    _run(scenario)
+
+
+def test_start_fails_closed_when_token_meter_row_is_missing(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    async def scenario() -> None:
+        session, emitted = _make_session(tmp_path, monkeypatch)
+        _fake_preflight.result = (
+            0,
+            _preflight_dump(session.cwd, include_token_meter=False),
+            "",
+        )
+        with pytest.raises(AgentConfigError, match="token-meter"):
+            await session.start()
+        assert session.config_preflight_proven is False
+        assert emitted == []
+        assert FakeTransport.instances[-1].started is False
+
+    _run(scenario)
+
+
+def test_start_fails_closed_when_token_meter_row_is_disabled(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    async def scenario() -> None:
+        session, _ = _make_session(tmp_path, monkeypatch)
+        _fake_preflight.result = (
+            0,
+            _preflight_dump(session.cwd, token_meter_disabled=True),
+            "",
+        )
+        with pytest.raises(AgentConfigError, match="token-meter.*disabled"):
+            await session.start()
+        assert session.config_preflight_proven is False
+
+    _run(scenario)
+
+
+def test_start_fails_closed_when_compaction_row_is_missing(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    async def scenario() -> None:
+        session, _ = _make_session(tmp_path, monkeypatch)
+        _fake_preflight.result = (
+            0,
+            _preflight_dump(session.cwd, include_compaction=False),
+            "",
+        )
+        with pytest.raises(AgentConfigError, match="compaction-basic"):
+            await session.start()
+        assert session.config_preflight_proven is False
+
+    _run(scenario)
+
+
+def test_start_fails_closed_when_compaction_field_is_missing(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    async def scenario() -> None:
+        session, _ = _make_session(tmp_path, monkeypatch)
+        budget = _budget()
+        fields = {
+            "auto": "true",
+            "thresholdRatio": repr(budget.threshold_ratio),
+            "headroomTokens": str(budget.headroom),
+            "retainRatio": repr(budget.retain_ratio),
+        }
+        _fake_preflight.result = (
+            0,
+            _preflight_dump(session.cwd, compaction_fields=fields),
+            "",
+        )
+        with pytest.raises(AgentConfigError, match="compaction-basic.*maxTokens"):
+            await session.start()
+        assert session.config_preflight_proven is False
+
+    _run(scenario)
+
+
+def test_start_fails_closed_when_compaction_value_is_wrong(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    async def scenario() -> None:
+        session, _ = _make_session(tmp_path, monkeypatch)
+        budget = _budget()
+        fields = {
+            "auto": "true",
+            "thresholdRatio": "0.5",
+            "headroomTokens": str(budget.headroom),
+            "retainRatio": repr(budget.retain_ratio),
+            "maxTokens": str(budget.summary_max_tokens),
+        }
+        _fake_preflight.result = (
+            0,
+            _preflight_dump(session.cwd, compaction_fields=fields),
+            "",
+        )
+        with pytest.raises(AgentConfigError, match="thresholdRatio"):
+            await session.start()
+        assert session.config_preflight_proven is False
+
+    _run(scenario)
+
+
+def test_config_preflight_proven_is_cleared_on_close(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    async def scenario() -> None:
+        session, _ = _make_session(tmp_path, monkeypatch)
+        assert session.config_preflight_proven is False
+        await session.start()
+        assert session.config_preflight_proven is True
+        await session.close()
+        assert session.config_preflight_proven is False
+
+    _run(scenario)
+
+
+def test_supplied_transport_is_reused_without_preflight(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    async def scenario() -> None:
+        fake = FakeTransport()
+        session, _ = _make_session(tmp_path, monkeypatch, transport=fake)
+        await session.start()
+        try:
+            assert _fake_preflight.calls == []
+            assert session.config_preflight_proven is False
+            assert fake.started is False
+            assert fake.request_methods() == ["session/new"]
+        finally:
+            await session.close()
+        # A shared transport is not owned, so closing this session leaves it up.
+        assert fake.closed is False
 
     _run(scenario)
 

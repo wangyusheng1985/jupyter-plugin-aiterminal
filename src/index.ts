@@ -9,6 +9,7 @@ import type { DocumentWidget } from '@jupyterlab/docregistry';
 import { IDefaultFileBrowser } from '@jupyterlab/filebrowser';
 import { ILauncher } from '@jupyterlab/launcher';
 import { IRenderMimeRegistry } from '@jupyterlab/rendermime';
+import { ISettingRegistry } from '@jupyterlab/settingregistry';
 import { ITranslator } from '@jupyterlab/translation';
 import { terminalIcon } from '@jupyterlab/ui-components';
 
@@ -109,7 +110,8 @@ export function activate(
   rendermime: IRenderMimeRegistry,
   docManager: IDocumentManager,
   restorer: ILayoutRestorer | null = null,
-  fileBrowser: IDefaultFileBrowser | null = null
+  fileBrowser: IDefaultFileBrowser | null = null,
+  settingRegistry: ISettingRegistry | null = null
 ): void {
   const trans = translator.load(TRANSLATION_DOMAIN);
   const tracker = new WidgetTracker<AgentDocument>({
@@ -138,6 +140,25 @@ export function activate(
       markWorkspaceClosed(widget.context.path);
     });
   });
+  if (settingRegistry) {
+    // JupyterLab front-end plugins have no deactivate hook and the
+    // registry-owned settings instance is shared, so this stays a single
+    // plugin-lifetime subscription: on save, push the current configuration
+    // to every live widget without connecting, resetting, or rebuilding it.
+    void settingRegistry
+      .load(PLUGIN_ID)
+      .then(settings => {
+        settings.changed.connect(() => {
+          tracker.forEach(widget => {
+            if (widget.isDisposed) {
+              return;
+            }
+            widget.content.session.requestConfiguration();
+          });
+        });
+      })
+      .catch(() => undefined);
+  }
   app.commands.addCommand(AGENT_RESTORE_COMMAND_ID, {
     describedBy: {
       args: {
@@ -269,7 +290,7 @@ const plugin: JupyterFrontEndPlugin<void> = {
     'Adds AI Terminal (Agent Workspace) to the JupyterLab Launcher and file browser.',
   autoStart: true,
   requires: [ILauncher, ITranslator, IRenderMimeRegistry, IDocumentManager],
-  optional: [ILayoutRestorer, IDefaultFileBrowser],
+  optional: [ILayoutRestorer, IDefaultFileBrowser, ISettingRegistry],
   activate
 };
 

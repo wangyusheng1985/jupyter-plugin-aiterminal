@@ -5,6 +5,20 @@ import sys
 from jupyter_aiterminal.shell import PersistentShell
 
 
+def test_closing_shell_does_not_stop_shared_ai_runtime(tmp_path):
+    """Command-cell teardown stays local to its bash process."""
+
+    async def run():
+        shell = PersistentShell(str(tmp_path))
+        await shell.start()
+        bash_pid = shell._proc.pid
+        await shell.close()
+        assert shell._proc is None
+        assert bash_pid
+
+    asyncio.run(run())
+
+
 def test_pwd_and_cd_persist(tmp_path):
     async def run():
         shell = PersistentShell(str(tmp_path))

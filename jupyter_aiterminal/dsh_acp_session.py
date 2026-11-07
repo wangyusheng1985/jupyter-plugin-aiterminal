@@ -48,13 +48,15 @@ from typing import Any
 
 from .dsh_acp_config import (
     ACP_ROW_APPROVAL,
+    ACP_ROW_COMPACTION,
     ACP_ROW_SANDBOX_POLICY,
     build_acp_session_params,
     build_acp_subprocess_env,
     render_acp_profile_patch,
 )
 from .dsh_acp_transport import DshAcpError, DshAcpTransport
-from .dsh_config import DshProviderConfig
+from .dsh_config import DerivedBudget, DshProviderConfig, _validate_config_snapshot
+from .settings import AgentConfigError
 
 __all__ = ["DshAcpSession", "DshAcpSessionError"]
 
@@ -81,6 +83,23 @@ _PATCH_WARNING_MARKERS = (
 _NOT_FOUND_MARKER = "not found"
 _PREFLIGHT_OUTPUT_LIMIT = 4 * 1024 * 1024
 _PREFLIGHT_STREAM_LIMIT = 64 * 1024
+
+# ``token-meter`` is enabled by the shipped ACP profile and is never given a
+# config patch (the pinned runtime rejects one against its empty schema). It
+# only has to prove the row still exists and is not disabled.
+_ACP_ROW_TOKEN_METER = "token-meter"
+
+# The compaction fields this preflight checks, in the order the pinned runtime
+# dumps them. This is a known-field check, not a general schema validation:
+# ``--dump-config`` only prints the synthesized config and does not validate
+# it against the runtime's schemas.
+_COMPACTION_FIELDS = (
+    "auto",
+    "thresholdRatio",
+    "headroomTokens",
+    "retainRatio",
+    "maxTokens",
+)
 
 PolicyPreflight = Callable[
     [tuple[str, ...], Path, Mapping[str, str], float],
@@ -241,6 +260,98 @@ def _block_has_scalar(block: str, key: str, expected: set[str]) -> bool:
     return values is not None and values[0] in expected
 
 
+def _scalar_equals(block: str, key: str, expected: object) -> bool:
+    """Compare one dumped scalar with a budget value by its declared kind."""
+    values = _yaml_key_values(block, key)
+    if values is None:
+        return False
+    raw = values[0].strip()
+    if isinstance(expected, bool):
+        return raw.lower() in ({"true"} if expected else {"false"})
+    if isinstance(expected, int):
+        try:
+            return int(raw) == expected
+        except ValueError:
+            return False
+    if isinstance(expected, float):
+        try:
+            return float(raw) == expected
+        except ValueError:
+            return False
+    return raw == str(expected)
+
+
+def _verify_token_meter_row(dump: str) -> None:
+    """Fail unless the shipped ``token-meter`` row exists and is enabled."""
+    block = _row_block(dump, _ACP_ROW_TOKEN_METER)
+    if block is None:
+        raise AgentConfigError(
+            "DSH runtime dump-config is missing the "
+            f"{_ACP_ROW_TOKEN_METER!r} config row; refusing to start"
+        )
+    if not any(
+        _yaml_key_pattern("disabled").match(line) for line in block.splitlines()
+    ):
+        return
+    values = _yaml_key_values(block, "disabled")
+    if values is None:
+        raise AgentConfigError(
+            "DSH runtime dump-config row "
+            f"{_ACP_ROW_TOKEN_METER!r} has an ambiguous 'disabled' setting; "
+            "refusing to start"
+        )
+    raw = values[0].strip().lower()
+    if raw in {"true", "yes", "on"}:
+        raise AgentConfigError(
+            "DSH runtime dump-config row "
+            f"{_ACP_ROW_TOKEN_METER!r} is disabled; refusing to start"
+        )
+    if raw not in {"false", "no", "off"}:
+        raise AgentConfigError(
+            "DSH runtime dump-config row "
+            f"{_ACP_ROW_TOKEN_METER!r} has an unrecognized 'disabled' value; "
+            "refusing to start"
+        )
+
+
+def _verify_compaction_row(dump: str, budget: DerivedBudget) -> None:
+    """Fail unless ``compaction-basic`` carries the derived budget values.
+
+    Only the fields this overlay writes are checked; the dumped config is not
+    validated as a whole. Every failure names the row id so a cell can point at
+    the row the runtime ignored.
+    """
+    block = _row_block(dump, ACP_ROW_COMPACTION)
+    if block is None:
+        raise AgentConfigError(
+            "DSH runtime dump-config is missing the "
+            f"{ACP_ROW_COMPACTION!r} config row; refusing to start"
+        )
+    expected = {
+        "auto": budget.compaction_enabled,
+        "thresholdRatio": budget.threshold_ratio,
+        "headroomTokens": budget.headroom,
+        "retainRatio": budget.retain_ratio,
+        "maxTokens": budget.summary_max_tokens,
+    }
+    for key in _COMPACTION_FIELDS:
+        if _yaml_key_values(block, key) is None:
+            raise AgentConfigError(
+                f"DSH runtime dump-config row {ACP_ROW_COMPACTION!r} is "
+                f"missing field {key!r}; refusing to start"
+            )
+        if not _scalar_equals(block, key, expected[key]):
+            raise AgentConfigError(
+                f"DSH runtime dump-config row {ACP_ROW_COMPACTION!r} field "
+                f"{key!r} does not match the effective budget; refusing to start"
+            )
+
+
+def _verify_config_rows(dump: str, budget: DerivedBudget) -> None:
+    _verify_token_meter_row(dump)
+    _verify_compaction_row(dump, budget)
+
+
 async def _stop_preflight_process(proc: asyncio.subprocess.Process) -> None:
     if proc.returncode is None:
         try:
@@ -389,6 +500,8 @@ class DshAcpSession:
         close_timeout: float = 5.0,
         runtime_version: Callable[[], str] | None = None,
         policy_preflight: PolicyPreflight | None = None,
+        transport: DshAcpTransport | None = None,
+        owns_transport: bool | None = None,
     ) -> None:
         if not isinstance(config, DshProviderConfig):
             raise DshAcpSessionError("config must be a DshProviderConfig instance")
@@ -416,6 +529,16 @@ class DshAcpSession:
         self._close_timeout = _positive("close_timeout", close_timeout)
         self._runtime_version = runtime_version or _installed_runtime_version
         self._policy_preflight = policy_preflight or _run_policy_preflight
+        # Set only when this session's own dump-config preflight proved every
+        # configured row landed. A supplied transport has no such evidence, so
+        # this stays False and no effective report may claim the budget applied.
+        self._config_preflight_proven = False
+        self._supplied_transport = transport
+        # A caller-supplied transport is a shared runtime. This session must
+        # not terminate it when the browser detaches or the session closes.
+        self._owns_transport = (
+            transport is None if owns_transport is None else owns_transport
+        )
 
         if resume_session_id is not None:
             resume_session_id = _non_empty_text("resume_session_id", resume_session_id)
@@ -432,6 +555,7 @@ class DshAcpSession:
         self._run_lock = asyncio.Lock()
         self._active_run_id: str | None = None
         self._prompt_done: asyncio.Future[None] | None = None
+        self._pending_listener_key = f"pending-{uuid.uuid4().hex}"
 
         self._workspace_dir: Path | None = None
         self._session_root: Path | None = None
@@ -486,6 +610,18 @@ class DshAcpSession:
     def dsh_home(self) -> Path | None:
         return self._dsh_home
 
+    @property
+    def config_preflight_proven(self) -> bool:
+        """Whether this live session's preflight proved the configured rows.
+
+        ``True`` only after a successful ``--dump-config`` check of the
+        approval, sandbox, ``token-meter``, and ``compaction-basic`` rows. It is
+        cleared when the session closes or fails to start, and it is always
+        ``False`` for a caller-supplied transport, which this host never
+        preflights.
+        """
+        return self._config_preflight_proven
+
     # -- lifecycle -----------------------------------------------------------
 
     async def start(self) -> None:
@@ -506,19 +642,27 @@ class DshAcpSession:
                 dsh_home=self._dsh_home,
                 config=self._config,
             )
-            self._transport = DshAcpTransport(
-                patch_path=self._patch_path,
-                cwd=self._cwd,
-                env=env,
-                on_notification=self._handle_notification,
-                on_server_request=self._handle_server_request,
-                default_request_timeout=self._request_timeout,
-                startup_timeout=self._startup_timeout,
-                close_timeout=self._close_timeout,
-            )
-            await self._verify_policy_overlay(env)
-            await self._transport.start()
-            await self._initialize()
+            if self._supplied_transport is None:
+                self._transport = DshAcpTransport(
+                    patch_path=self._patch_path,
+                    cwd=self._cwd,
+                    env=env,
+                    on_notification=self._handle_notification,
+                    on_server_request=self._handle_server_request,
+                    default_request_timeout=self._request_timeout,
+                    startup_timeout=self._startup_timeout,
+                    close_timeout=self._close_timeout,
+                )
+                await self._verify_policy_overlay(env)
+                await self._transport.start()
+                await self._initialize()
+            else:
+                self._transport = self._supplied_transport
+                self._transport.add_listener(
+                    self._session_id or self._pending_listener_key,
+                    on_notification=self._handle_notification,
+                    on_server_request=self._handle_server_request,
+                )
             self._assert_policy_stderr_clean()
             if self._resume:
                 await self._resume_session()
@@ -529,6 +673,11 @@ class DshAcpSession:
             await self._cleanup_start_failure()
             raise
         except DshAcpSessionError:
+            await self._cleanup_start_failure()
+            raise
+        except AgentConfigError:
+            # The dump-config row checks are configuration failures, not runtime
+            # spawn failures; keep that classification visible to the caller.
             await self._cleanup_start_failure()
             raise
         except Exception as exc:
@@ -583,9 +732,11 @@ class DshAcpSession:
     async def _verify_policy_overlay(self, env: Mapping[str, str]) -> None:
         """Fail closed unless a standalone dump proves the overlay applied.
 
-        The patch sets ``approval.policy: ask`` and the workspace sandbox root.
-        Both are asserted from the dumped config; a runtime that ignores a
-        patch row either prints a ``not found`` warning or omits the value.
+        The patch sets ``approval.policy: ask``, the workspace sandbox root, and
+        the ``compaction-basic`` config values. All are asserted from the
+        dumped config; a runtime that ignores a patch row either prints a
+        ``not found`` warning or omits the value. ``token-meter`` must still be
+        present and enabled, but it never carries a config patch.
         """
         transport = self._transport
         assert transport is not None
@@ -618,6 +769,9 @@ class DshAcpSession:
             raise DshAcpSessionError(
                 "DSH runtime did not apply the ACP policy overlay; refusing to start"
             )
+        budget = _validate_config_snapshot(self._config)
+        _verify_config_rows(stdout, budget)
+        self._config_preflight_proven = True
 
     def _assert_policy_stderr_clean(self) -> None:
         # Defence in depth behind the preflight. ACP stderr is asynchronous, so
@@ -661,6 +815,13 @@ class DshAcpSession:
         if not isinstance(session_id, str) or not session_id.strip():
             raise DshAcpSessionError("session/new did not return a sessionId")
         self._session_id = session_id
+        if self._supplied_transport is not None:
+            self._transport.remove_listener(self._pending_listener_key)
+            self._transport.add_listener(
+                self._session_id,
+                on_notification=self._handle_notification,
+                on_server_request=self._handle_server_request,
+            )
         self._write_index()
 
     async def _resume_session(self) -> None:
@@ -676,6 +837,13 @@ class DshAcpSession:
             raise DshAcpSessionError(
                 f"failed to resume ACP session {session_id!r}: {exc}"
             ) from exc
+        if self._supplied_transport is not None:
+            self._transport.remove_listener(self._pending_listener_key)
+            self._transport.add_listener(
+                self._session_id,
+                on_notification=self._handle_notification,
+                on_server_request=self._handle_server_request,
+            )
         self._write_index()
 
     async def close(self) -> None:
@@ -712,13 +880,16 @@ class DshAcpSession:
                     # shutdown below is still the authoritative release.
                     pass
         finally:
-            if transport is not None:
+            if transport is not None and self._owns_transport:
                 try:
                     await transport.close()
                 except Exception:
                     pass
+            elif transport is not None:
+                transport.remove_listener(self._session_id)
             self._transport = None
             self._started = False
+            self._config_preflight_proven = False
 
     async def _cleanup_start_failure(self) -> None:
         transport = self._transport
@@ -733,12 +904,16 @@ class DshAcpSession:
                     )
                 except Exception:
                     pass
-            try:
-                await transport.close()
-            except Exception:
-                pass
+            if self._owns_transport:
+                try:
+                    await transport.close()
+                except Exception:
+                    pass
+            else:
+                transport.remove_listener(self._session_id)
         if self._created_session_root and self._session_root is not None:
             shutil.rmtree(self._session_root, ignore_errors=True)
+        self._config_preflight_proven = False
 
     # -- prompt and cancel ---------------------------------------------------
 

@@ -28,6 +28,49 @@
       "title": "API Token",
       "description": "API token or key sent to the configured provider. Stored in server-side JupyterLab user settings and shown in this Settings UI.",
       "default": ""
+    },
+    "contextWindow": {
+      "type": "integer",
+      "minimum": 1,
+      "title": "Context Window",
+      "description": "Declared context window in input tokens for the configured model. This is configuration metadata, not a measurement of any model's real capacity. Must be a positive integer. Takes effect when the shared runtime next starts."
+    },
+    "maxOutputTokens": {
+      "type": "integer",
+      "minimum": 1,
+      "title": "Maximum Output Tokens",
+      "description": "Maximum output tokens allowed for a single model turn. Must be a positive integer and is used as configured, without a narrower implicit cap. Takes effect when the shared runtime next starts."
+    },
+    "compactionEnabled": {
+      "type": "boolean",
+      "title": "Automatic Compaction",
+      "description": "Enable automatic context compaction in the shared runtime. Takes effect when the shared runtime next starts."
+    },
+    "compactionThresholdRatio": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 1,
+      "title": "Compaction Threshold Ratio",
+      "description": "Fraction of the usable message budget at which compaction triggers. Must be greater than 0 and at most 1, and greater than the retain ratio. Takes effect when the shared runtime next starts."
+    },
+    "compactionRetainRatio": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 1,
+      "title": "Compaction Retain Ratio",
+      "description": "Fraction of the message budget kept after compaction. Must be greater than 0, at most 1, and strictly below the threshold ratio. Takes effect when the shared runtime next starts."
+    },
+    "compactionHeadroom": {
+      "type": "integer",
+      "minimum": 0,
+      "title": "Compaction Headroom Tokens",
+      "description": "Tokens reserved below the message budget before compaction may trigger. Must be 0 or more and leave a positive pressure value. Takes effect when the shared runtime next starts."
+    },
+    "compactionSummaryMaxTokens": {
+      "type": "integer",
+      "minimum": 1,
+      "title": "Compaction Summary Output Tokens",
+      "description": "Output token budget for the compaction summary. Must be a positive integer. Takes effect when the shared runtime next starts."
     }
   }
 }

@@ -60,6 +60,7 @@
     "@jupyterlab/launcher": "~4.5.0",
     "@jupyterlab/rendermime": "~4.5.0",
     "@jupyterlab/services": "~7.5.0",
+    "@jupyterlab/settingregistry": "~4.6.0",
     "@jupyterlab/translation": "~4.5.0",
     "@jupyterlab/ui-components": "~4.5.0",
     "@lumino/widgets": "^2.7.1"
@@ -127,6 +128,10 @@
         "singleton": true
       },
       "@jupyterlab/rendermime": {
+        "bundled": false,
+        "singleton": true
+      },
+      "@jupyterlab/settingregistry": {
         "bundled": false,
         "singleton": true
       },

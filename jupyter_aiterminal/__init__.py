@@ -13,9 +13,26 @@ def _jupyter_server_extension_points():
 
 
 def _load_jupyter_server_extension(server_app):
+    from .dsh_runtime_host import SharedDshRuntime
     from .handlers import setup_handlers
+    from .session_registry import SessionRegistry
 
     contents = getattr(server_app, "contents_manager", None)
     cwd = getattr(contents, "root_dir", None) or getattr(server_app, "root_dir", ".")
-    setup_handlers(server_app.web_app, cwd)
+    web_app = server_app.web_app
+    web_app.settings.setdefault("aiterminal_sessions", SessionRegistry())
+    web_app.settings.setdefault("aiterminal_runtime", SharedDshRuntime())
+    setup_handlers(web_app, cwd)
+
+    async def _close_ai_runtime() -> None:
+        registry = web_app.settings.get("aiterminal_sessions")
+        runtime = web_app.settings.get("aiterminal_runtime")
+        if isinstance(registry, SessionRegistry):
+            await registry.close()
+        if isinstance(runtime, SharedDshRuntime):
+            await runtime.close()
+
+    cleanup = getattr(server_app, "cleanup_functions", None)
+    if isinstance(cleanup, list):
+        cleanup.append(_close_ai_runtime)
     server_app.log.info("Registered jupyter-aiterminal AI Terminal")

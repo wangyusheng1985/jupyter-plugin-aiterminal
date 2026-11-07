@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
+from typing import Any
 
 from jupyter_core.utils import ensure_async
 from jupyter_server.auth.decorator import ws_authenticated
@@ -13,6 +15,7 @@ from tornado.ioloop import IOLoop
 
 from .agent import AgentSession
 from .history_bridge import compose_bridged_prompt, validate_history_bridge
+from .session_registry import SessionRegistry
 from .shell import PersistentShell
 
 # DSH session ids are opaque ACP strings. They are never used as filesystem
@@ -23,6 +26,16 @@ _MAX_REQUEST_ID_CHARS = 256
 _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9._:@-]+\Z")
 _PERMISSION_RESOLUTIONS = ("approved", "rejected")
 _PERMISSION_SCOPE_KEYS = ("sessionId", "runtimeId", "runId")
+# Configuration refresh is a side channel: a missing session is reported on
+# its own non-fatal channel instead of the generic fatal runtime error.
+_NO_SESSION_CONFIGURATION_MESSAGE = (
+    "AI session is not connected; the configuration report could not be "
+    "refreshed. Reload the workspace to reconnect."
+)
+_CONFIGURATION_REFRESH_ERROR_MESSAGE = (
+    "AI Terminal configuration could not be refreshed; the current session "
+    "keeps running."
+)
 
 
 class AgentWebSocketHandler(JupyterHandler, websocket.WebSocketHandler):
@@ -33,6 +46,9 @@ class AgentWebSocketHandler(JupyterHandler, websocket.WebSocketHandler):
         self.session: AgentSession | None = None
         self.shell: PersistentShell | None = None
         self._exec_running = False
+        self._attached_session_id: str | None = None
+        self._registry: SessionRegistry | None = None
+        self._is_closed = False
 
     async def pre_get(self):
         user = self.current_user
@@ -53,6 +69,7 @@ class AgentWebSocketHandler(JupyterHandler, websocket.WebSocketHandler):
         requested = self.get_query_argument("cwd", default="")
         requested_session = self.get_query_argument("sessionId", default="")
         requested_dsh_session = self.get_query_argument("dshSessionId", default="")
+        requested_workspace_path = self.get_query_argument("workspacePath", default="")
         cwd = _resolve_workspace_cwd(self.cwd, requested)
         if cwd is None:
             IOLoop.current().spawn_callback(
@@ -77,15 +94,68 @@ class AgentWebSocketHandler(JupyterHandler, websocket.WebSocketHandler):
                 },
             )
             return
-        self.session = AgentSession(cwd, self.emit, dsh_session_id)
+        registry = self.settings.get("aiterminal_sessions")
+        self._registry = registry if isinstance(registry, SessionRegistry) else None
+        self.session = self._existing_session(dsh_session_id)
+        workspace_file = _resolve_workspace_file(self.cwd, requested_workspace_path)
+        if self.session is None:
+            registry = self._registry
+
+            def _on_ready(sess: AgentSession) -> None:
+                if registry is not None and sess.session_id:
+                    registry.remember(sess)
+                    if not self._is_closed and self.ws_connection is not None:
+                        registry.attach(sess.session_id, self.emit)
+                        self._attached_session_id = sess.session_id
+
+            session = AgentSession(
+                cwd,
+                self.emit,
+                dsh_session_id,
+                runtime=self.settings.get("aiterminal_runtime"),
+                workspace_file=workspace_file,
+                is_detached=lambda: not registry.attached(session.session_id)
+                if registry and session.session_id
+                else False,
+                on_session_id_ready=_on_ready,
+            )
+            self.session = session
+            if registry is not None and session.session_id:
+                registry.remember(session)
+                if not self._is_closed and self.ws_connection is not None:
+                    registry.attach(session.session_id, self.emit)
+                    self._attached_session_id = session.session_id
+            IOLoop.current().spawn_callback(self.session.start)
+        else:
+            self._attached_session_id = dsh_session_id
+            if workspace_file:
+                self.session.workspace_file = workspace_file
+
+            async def _reattach_flow(sess: AgentSession, emit: Any) -> None:
+                await sess.reemit_handshake(emit)
+                if sess.is_running and sess.turn_events:
+                    for ev in list(sess.turn_events):
+                        try:
+                            res = emit(ev)
+                            if res is not None and inspect.isawaitable(res):
+                                await res
+                        except Exception:
+                            pass
+
+            IOLoop.current().spawn_callback(_reattach_flow, self.session, self.emit)
         self.shell = PersistentShell(cwd)
-        IOLoop.current().spawn_callback(self.session.start)
         IOLoop.current().spawn_callback(self._start_shell)
 
     async def emit(self, event: dict) -> None:
+        """Deliver one event. A closed browser must not fail the AI turn."""
         if self.ws_connection is None:
             return
-        self.write_message(json.dumps(event))
+        try:
+            self.write_message(json.dumps(event))
+        except Exception:
+            # WebSocketClosedError arrives while the socket is closing. The
+            # session keeps running and persists its result without a viewer.
+            return
 
     def on_message(self, message):
         if isinstance(message, bytes):
@@ -115,8 +185,21 @@ class AgentWebSocketHandler(JupyterHandler, websocket.WebSocketHandler):
         kind = payload.get("type")
         if kind == "user":
             if self.session is None:
+                self._recover_session()
+            if self.session is None:
+                IOLoop.current().spawn_callback(
+                    self.emit,
+                    {
+                        "type": "error",
+                        "code": "runtime",
+                        "message": (
+                            "AI session is not connected. Please reload the workspace."
+                        ),
+                    },
+                )
                 return
             turn_id = str(payload.get("turnId", "")) or None
+            cell_id = str(payload.get("cellId", "")) or None
             prompt = str(payload.get("text", ""))
             if "historyBridge" in payload:
                 try:
@@ -136,7 +219,12 @@ class AgentWebSocketHandler(JupyterHandler, websocket.WebSocketHandler):
                 self.session.query,
                 prompt,
                 turn_id,
+                cell_id,
             )
+        elif kind == "shutdown":
+            IOLoop.current().spawn_callback(self._shutdown_workspace)
+        elif kind == "configuration":
+            IOLoop.current().spawn_callback(self.refresh_configuration)
         elif kind == "interrupt":
             if self.session is None:
                 return
@@ -149,6 +237,47 @@ class AgentWebSocketHandler(JupyterHandler, websocket.WebSocketHandler):
             IOLoop.current().spawn_callback(self._exec_interrupt)
         elif kind == "dsh/v1/interaction.resolve":
             self._schedule_interaction_resolution(payload)
+
+    def _recover_session(self) -> None:
+        """Reattach to a known registry session after a lost connection."""
+        registry = self._registry
+        session_id = self._attached_session_id
+        if not isinstance(registry, SessionRegistry) or not session_id:
+            return
+        if registry.get(session_id) is None:
+            return
+        self.session = registry.attach(session_id, self.emit)
+
+    async def refresh_configuration(self) -> None:
+        """Emit the current safe configuration report for the attached session.
+
+        This is a read-only side channel: it never calls ``query``/``start``,
+        opens a runtime or connection, creates a context, or changes the busy
+        state. ``AgentSession._configuration_events`` is the existing builder;
+        it is private to the session, so this handler calls it directly rather
+        than duplicating the report logic in ``agent.py``.
+        """
+        session = self.session
+        if session is None:
+            await self.emit(
+                {
+                    "type": "configuration-error",
+                    "message": _NO_SESSION_CONFIGURATION_MESSAGE,
+                }
+            )
+            return
+        try:
+            events = await ensure_async(session._configuration_events())
+        except Exception:  # noqa: BLE001 - fixed message, never echo internals
+            await self.emit(
+                {
+                    "type": "configuration-error",
+                    "message": _CONFIGURATION_REFRESH_ERROR_MESSAGE,
+                }
+            )
+            return
+        for event in events:
+            await self.emit(event)
 
     def _schedule_interaction_resolution(self, payload: dict) -> None:
         """Validate a permission decision, then route it to the tracked request.
@@ -252,10 +381,37 @@ class AgentWebSocketHandler(JupyterHandler, websocket.WebSocketHandler):
         if self.shell is not None:
             await self.shell.interrupt()
 
+    def _existing_session(self, session_id: str | None) -> AgentSession | None:
+        if not session_id or not isinstance(self._registry, SessionRegistry):
+            return None
+        if self._registry.get(session_id) is None:
+            return None
+        return self._registry.attach(session_id, self.emit)
+
+    async def _shutdown_workspace(self) -> None:
+        session = self.session
+        registry = self._registry
+        session_id = getattr(session, "session_id", None)
+        self.session = None
+        self._attached_session_id = None
+        if isinstance(registry, SessionRegistry) and isinstance(session_id, str):
+            await registry.shutdown(session_id)
+        elif session is not None:
+            await session.close()
+
     def on_close(self):
-        if self.session is not None:
-            IOLoop.current().spawn_callback(self.session.close)
-            self.session = None
+        self._is_closed = True
+        # Browser disconnect detaches the viewer. The AI session and its
+        # runtime stay alive until explicit workspace shutdown.
+        if self._registry is not None and self._attached_session_id:
+            self._registry.detach(self._attached_session_id, self.emit)
+        elif self.session is not None and self.session.session_id:
+            registry = self._registry
+            if isinstance(registry, SessionRegistry):
+                registry.remember(self.session)
+                registry.detach(self.session.session_id, self.emit)
+        self.session = None
+        self._attached_session_id = None
         if self.shell is not None:
             IOLoop.current().spawn_callback(self.shell.close)
             self.shell = None
@@ -263,6 +419,7 @@ class AgentWebSocketHandler(JupyterHandler, websocket.WebSocketHandler):
 
 def setup_handlers(web_app, cwd: str) -> None:
     base_url = web_app.settings["base_url"]
+    web_app.settings.setdefault("aiterminal_sessions", SessionRegistry())
     web_app.add_handlers(
         ".*$",
         [
@@ -273,6 +430,21 @@ def setup_handlers(web_app, cwd: str) -> None:
             )
         ],
     )
+
+
+def _resolve_workspace_file(root: str, requested: str) -> str | None:
+    """Resolve a client-relative workspace file without escaping root."""
+    if not requested:
+        return None
+    root_path = os.path.realpath(root)
+    candidate = os.path.realpath(os.path.join(root_path, requested))
+    try:
+        inside_root = os.path.commonpath((root_path, candidate)) == root_path
+    except ValueError:
+        inside_root = False
+    if not inside_root or not os.path.isfile(candidate):
+        return None
+    return candidate
 
 
 def _resolve_workspace_cwd(root: str, requested: str) -> str | None:

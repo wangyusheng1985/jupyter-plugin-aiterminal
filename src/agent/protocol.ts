@@ -28,7 +28,8 @@ export type AgentClientMessage =
   | AgentUserMessage
   | AgentInterruptMessage
   | AgentExecMessage
-  | AgentExecInterruptMessage;
+  | AgentExecInterruptMessage
+  | AgentConfigurationRequestMessage;
 
 export interface AgentReadyEvent {
   type: 'ready';
@@ -101,11 +102,21 @@ export interface AgentDeniedEvent {
   reason: string;
 }
 
+/**
+ * Stable terminal outcome of a runtime result. The backend emits exactly these
+ * values; missing reasons are tolerated for older documents, unknown values
+ * are never trusted.
+ */
+export type TerminalReason =
+  'completed' | 'cancelled' | 'budget-exhausted' | 'failed';
+
 export interface AgentResultEvent {
   type: 'result';
   turnId?: string;
   text: string;
   isError?: boolean;
+  /** How the run ended; absent on legacy/partial results. */
+  reason?: TerminalReason;
   apiDurationMs?: number;
   durationMs?: number;
   numTurns?: number;
@@ -133,6 +144,123 @@ export interface AgentExecErrorEvent {
   message: string;
 }
 
+/* ---------------------------------------------------------------------------
+ * Effective configuration report.
+ *
+ * The runtime reports what configuration is actually active, what the saved
+ * settings desire, and where they differ. Every field here is presentation
+ * data: the backend projects snapshots onto a fixed safe-report whitelist, so
+ * raw settings (provider URL, token, arbitrary keys) can never travel in a
+ * report. The parser below still validates that shape instead of trusting it,
+ * because a malformed payload must be ignored, not projected into the DOM.
+ * ------------------------------------------------------------------------- */
+
+/** Provenance of one resolved budget field (`DerivedBudget` sources). */
+export type BudgetSource = 'user' | 'default' | 'derived' | 'inherited';
+
+/** Budget field names that may appear as provenance keys or leaf arrays. */
+export type BudgetFieldName =
+  | 'context_window'
+  | 'max_output_tokens'
+  | 'compaction_enabled'
+  | 'threshold_ratio'
+  | 'headroom'
+  | 'retain_ratio'
+  | 'summary_max_tokens'
+  | 'message_budget'
+  | 'pressure'
+  | 'threshold'
+  | 'retain';
+
+export interface BudgetProvenanceEntry {
+  source: BudgetSource;
+  /** Budget field names this value was derived from, when recorded. */
+  derivedFrom?: BudgetFieldName[];
+}
+
+export interface BudgetCompactionSnapshot {
+  enabled?: boolean;
+  thresholdRatio?: number;
+  headroom?: number;
+  retainRatio?: number;
+  summaryMaxTokens?: number;
+}
+
+export interface BudgetComputedSnapshot {
+  messageBudget?: number;
+  pressure?: number;
+  threshold?: number;
+  retain?: number;
+}
+
+/** Presentation-safe budget snapshot (`DerivedBudget.safe_report()` shape). */
+export interface BudgetSnapshot {
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  compaction?: BudgetCompactionSnapshot;
+  computed?: BudgetComputedSnapshot;
+  provenance?: Partial<Record<BudgetFieldName, BudgetProvenanceEntry>>;
+}
+
+/**
+ * One leaf of a reported configuration difference. Values are limited to
+ * scalars, known enum strings, and arrays of known budget field names so the
+ * report can never smuggle an unknown key or opaque payload to a renderer.
+ */
+export type ConfigurationDifferenceValue =
+  | null
+  | boolean
+  | number
+  | string
+  | BudgetFieldName[]
+  | { [key: string]: ConfigurationDifferenceValue };
+
+export interface ConfigurationDifference {
+  active: ConfigurationDifferenceValue;
+  desired: ConfigurationDifferenceValue;
+}
+
+export type ConfigurationState =
+  'active' | 'pending-next-runtime' | 'not-started' | 'snapshot-unavailable';
+
+/** Only a proven observation may ever leave the `not-observable` default. */
+export type ConfigurationCompactionState = 'disabled' | 'not-observable';
+
+/** Safe, read-only effective-configuration report emitted by the runtime. */
+export interface ConfigurationReport {
+  /** Identity of the Jupyter-server runtime lifetime (not a credential). */
+  runtimeLifetime: string;
+  /** Monotonic configuration generation within that lifetime. */
+  generation: number;
+  state: ConfigurationState;
+  active: BudgetSnapshot | null;
+  desired: BudgetSnapshot | null;
+  differences: Record<string, ConfigurationDifference>;
+  compaction: ConfigurationCompactionState;
+  preflightApplied: boolean;
+}
+
+export interface AgentConfigurationEvent {
+  type: 'configuration';
+  report: ConfigurationReport;
+}
+
+/**
+ * Non-fatal configuration refresh failure. The runtime emits this on a side
+ * channel when settings cannot be read; it must not be projected as a turn
+ * error, block, or busy-state change. Any server-supplied message is ignored so
+ * an arbitrary (possibly secret-bearing) string never reaches the DOM; the UI
+ * renders a fixed frontend string instead.
+ */
+export interface AgentConfigurationErrorEvent {
+  type: 'configuration-error';
+}
+
+/** Client request for a fresh configuration report; never a turn message. */
+export interface AgentConfigurationRequestMessage {
+  type: 'configuration';
+}
+
 export type AgentServerEvent =
   | AgentReadyEvent
   | AgentAcceptedEvent
@@ -146,7 +274,9 @@ export type AgentServerEvent =
   | AgentResultEvent
   | AgentExecOutputEvent
   | AgentExecDoneEvent
-  | AgentExecErrorEvent;
+  | AgentExecErrorEvent
+  | AgentConfigurationEvent
+  | AgentConfigurationErrorEvent;
 
 export type ChatBlock =
   | { kind: 'user'; id: string; text: string }
@@ -311,6 +441,14 @@ export function applyServerEvent(
     case 'exec_output':
     case 'exec_done':
     case 'exec_error':
+    case 'configuration':
+    case 'configuration-error':
+      return blocks;
+    // Runtime boundary: an unexpected payload from a newer backend must be
+    // ignored, never treated as a valid event or allowed to replace `blocks`
+    // with `undefined`. Keep the cases above exhaustive so declared events
+    // stay type-checked; this fallback only guards unknown wire data.
+    default:
       return blocks;
   }
 }
@@ -726,6 +864,344 @@ function optionalBoolean<K extends string>(
     throw new DshPayloadError(key);
   }
   return { [key]: value } as Record<K, boolean>;
+}
+
+const BUDGET_SOURCES: readonly BudgetSource[] = [
+  'user',
+  'default',
+  'derived',
+  'inherited'
+];
+const BUDGET_FIELD_NAMES: readonly BudgetFieldName[] = [
+  'context_window',
+  'max_output_tokens',
+  'compaction_enabled',
+  'threshold_ratio',
+  'headroom',
+  'retain_ratio',
+  'summary_max_tokens',
+  'message_budget',
+  'pressure',
+  'threshold',
+  'retain'
+];
+const CONFIGURATION_STATES: readonly ConfigurationState[] = [
+  'active',
+  'pending-next-runtime',
+  'not-started',
+  'snapshot-unavailable'
+];
+const CONFIGURATION_COMPACTION_STATES: readonly ConfigurationCompactionState[] =
+  ['disabled', 'not-observable'];
+const BUDGET_SNAPSHOT_KEYS: ReadonlySet<string> = new Set([
+  'contextWindow',
+  'maxOutputTokens',
+  'compaction',
+  'computed',
+  'provenance'
+]);
+const COMPACTION_KEYS: ReadonlySet<string> = new Set([
+  'enabled',
+  'thresholdRatio',
+  'headroom',
+  'retainRatio',
+  'summaryMaxTokens'
+]);
+const COMPUTED_KEYS: ReadonlySet<string> = new Set([
+  'messageBudget',
+  'pressure',
+  'threshold',
+  'retain'
+]);
+// The only key vocabulary a difference path or nested difference value may
+// use. Anything else means the payload carries an unknown configuration key,
+// which is dropped at the boundary instead of reaching a renderer.
+const CONFIGURATION_KEYS: ReadonlySet<string> = new Set<string>([
+  ...BUDGET_FIELD_NAMES,
+  ...BUDGET_SNAPSHOT_KEYS,
+  ...COMPACTION_KEYS,
+  ...COMPUTED_KEYS,
+  'source',
+  'derivedFrom'
+]);
+const RUNTIME_LIFETIME_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+const MAX_DERIVED_FROM = 32;
+const MAX_DIFFERENCES = 256;
+const MAX_DIFFERENCE_DEPTH = 6;
+
+function requireNonNegativeInteger(
+  source: Record<string, unknown>,
+  key: string
+): number {
+  const value = source[key];
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new DshPayloadError(key);
+  }
+  return value;
+}
+
+function requireNonNegativeNumber(
+  source: Record<string, unknown>,
+  key: string
+): number {
+  const value = source[key];
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new DshPayloadError(key);
+  }
+  return value;
+}
+
+function readBudgetFieldNames(value: unknown, key: string): BudgetFieldName[] {
+  if (!Array.isArray(value) || value.length > MAX_DERIVED_FROM) {
+    throw new DshPayloadError(key);
+  }
+  const names: BudgetFieldName[] = [];
+  for (const item of value) {
+    if (
+      typeof item !== 'string' ||
+      !BUDGET_FIELD_NAMES.includes(item as BudgetFieldName)
+    ) {
+      throw new DshPayloadError(key);
+    }
+    names.push(item as BudgetFieldName);
+  }
+  return names;
+}
+
+function readProvenanceEntry(value: unknown): BudgetProvenanceEntry {
+  if (!isRecord(value)) {
+    throw new DshPayloadError('provenance');
+  }
+  const source = requireEnum(value, 'source', BUDGET_SOURCES);
+  const derivedFrom = value.derivedFrom;
+  if (derivedFrom === undefined) {
+    return { source };
+  }
+  return {
+    source,
+    derivedFrom: readBudgetFieldNames(derivedFrom, 'derivedFrom')
+  };
+}
+
+function readCompactionSnapshot(value: unknown): BudgetCompactionSnapshot {
+  if (!isRecord(value)) {
+    throw new DshPayloadError('compaction');
+  }
+  for (const key of Object.keys(value)) {
+    if (!COMPACTION_KEYS.has(key)) {
+      throw new DshPayloadError(key);
+    }
+  }
+  const snapshot: BudgetCompactionSnapshot = {};
+  if (value.enabled !== undefined) {
+    if (typeof value.enabled !== 'boolean') {
+      throw new DshPayloadError('enabled');
+    }
+    snapshot.enabled = value.enabled;
+  }
+  if (value.thresholdRatio !== undefined) {
+    snapshot.thresholdRatio = requireNonNegativeNumber(value, 'thresholdRatio');
+  }
+  if (value.headroom !== undefined) {
+    snapshot.headroom = requireNonNegativeInteger(value, 'headroom');
+  }
+  if (value.retainRatio !== undefined) {
+    snapshot.retainRatio = requireNonNegativeNumber(value, 'retainRatio');
+  }
+  if (value.summaryMaxTokens !== undefined) {
+    snapshot.summaryMaxTokens = requireNonNegativeInteger(
+      value,
+      'summaryMaxTokens'
+    );
+  }
+  return snapshot;
+}
+
+function readComputedSnapshot(value: unknown): BudgetComputedSnapshot {
+  if (!isRecord(value)) {
+    throw new DshPayloadError('computed');
+  }
+  for (const key of Object.keys(value)) {
+    if (!COMPUTED_KEYS.has(key)) {
+      throw new DshPayloadError(key);
+    }
+  }
+  const snapshot: BudgetComputedSnapshot = {};
+  for (const key of COMPUTED_KEYS) {
+    if (value[key] !== undefined) {
+      snapshot[key as keyof BudgetComputedSnapshot] = requireNonNegativeInteger(
+        value,
+        key
+      );
+    }
+  }
+  return snapshot;
+}
+
+function readBudgetSnapshot(value: unknown): BudgetSnapshot {
+  if (!isRecord(value)) {
+    throw new DshPayloadError('budget');
+  }
+  for (const key of Object.keys(value)) {
+    if (!BUDGET_SNAPSHOT_KEYS.has(key)) {
+      throw new DshPayloadError(key);
+    }
+  }
+  const snapshot: BudgetSnapshot = {};
+  if (value.contextWindow !== undefined) {
+    snapshot.contextWindow = requireNonNegativeInteger(value, 'contextWindow');
+  }
+  if (value.maxOutputTokens !== undefined) {
+    snapshot.maxOutputTokens = requireNonNegativeInteger(
+      value,
+      'maxOutputTokens'
+    );
+  }
+  if (value.compaction !== undefined) {
+    snapshot.compaction = readCompactionSnapshot(value.compaction);
+  }
+  if (value.computed !== undefined) {
+    snapshot.computed = readComputedSnapshot(value.computed);
+  }
+  if (value.provenance !== undefined) {
+    if (!isRecord(value.provenance)) {
+      throw new DshPayloadError('provenance');
+    }
+    const provenance: Partial<Record<BudgetFieldName, BudgetProvenanceEntry>> =
+      {};
+    for (const [name, entry] of Object.entries(value.provenance)) {
+      if (!BUDGET_FIELD_NAMES.includes(name as BudgetFieldName)) {
+        throw new DshPayloadError(name);
+      }
+      provenance[name as BudgetFieldName] = readProvenanceEntry(entry);
+    }
+    snapshot.provenance = provenance;
+  }
+  return snapshot;
+}
+
+function readDifferenceValue(
+  value: unknown,
+  depth: number
+): ConfigurationDifferenceValue {
+  if (value === null || typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || value < 0) {
+      throw new DshPayloadError('difference');
+    }
+    return value;
+  }
+  if (typeof value === 'string') {
+    if (
+      !BUDGET_SOURCES.includes(value as BudgetSource) &&
+      !BUDGET_FIELD_NAMES.includes(value as BudgetFieldName)
+    ) {
+      throw new DshPayloadError('difference');
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return readBudgetFieldNames(value, 'difference');
+  }
+  if (isRecord(value)) {
+    if (depth >= MAX_DIFFERENCE_DEPTH) {
+      throw new DshPayloadError('difference');
+    }
+    const nested: Record<string, ConfigurationDifferenceValue> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      if (!CONFIGURATION_KEYS.has(key)) {
+        throw new DshPayloadError(key);
+      }
+      nested[key] = readDifferenceValue(entry, depth + 1);
+    }
+    return nested;
+  }
+  throw new DshPayloadError('difference');
+}
+
+function isConfigurationPath(path: string): boolean {
+  if (path === '') return true;
+  return path.split('.').every(segment => CONFIGURATION_KEYS.has(segment));
+}
+
+function readDifferences(
+  value: unknown
+): Record<string, ConfigurationDifference> {
+  if (!isRecord(value)) {
+    throw new DshPayloadError('differences');
+  }
+  const paths = Object.keys(value);
+  if (paths.length > MAX_DIFFERENCES) {
+    throw new DshPayloadError('differences');
+  }
+  const differences: Record<string, ConfigurationDifference> = {};
+  for (const path of paths) {
+    if (!isConfigurationPath(path)) {
+      throw new DshPayloadError(path);
+    }
+    const entry = value[path];
+    if (!isRecord(entry) || !('active' in entry) || !('desired' in entry)) {
+      throw new DshPayloadError(path);
+    }
+    if (Object.keys(entry).length !== 2) {
+      throw new DshPayloadError(path);
+    }
+    differences[path] = {
+      active: readDifferenceValue(entry.active, 0),
+      desired: readDifferenceValue(entry.desired, 0)
+    };
+  }
+  return differences;
+}
+
+function readConfigurationReport(raw: unknown): ConfigurationReport {
+  if (!isRecord(raw)) {
+    throw new DshPayloadError('report');
+  }
+  const runtimeLifetime = raw.runtimeLifetime;
+  if (
+    typeof runtimeLifetime !== 'string' ||
+    !RUNTIME_LIFETIME_PATTERN.test(runtimeLifetime)
+  ) {
+    throw new DshPayloadError('runtimeLifetime');
+  }
+  if (!('active' in raw) || !('desired' in raw)) {
+    throw new DshPayloadError('active');
+  }
+  const preflightApplied = raw.preflightApplied;
+  if (typeof preflightApplied !== 'boolean') {
+    throw new DshPayloadError('preflightApplied');
+  }
+  return {
+    runtimeLifetime,
+    generation: requireNonNegativeInteger(raw, 'generation'),
+    state: requireEnum(raw, 'state', CONFIGURATION_STATES),
+    active: raw.active === null ? null : readBudgetSnapshot(raw.active),
+    desired: raw.desired === null ? null : readBudgetSnapshot(raw.desired),
+    differences: readDifferences(raw.differences),
+    compaction: requireEnum(raw, 'compaction', CONFIGURATION_COMPACTION_STATES),
+    preflightApplied
+  };
+}
+
+/**
+ * Validate an untrusted `configuration` report payload. Returns `null` for any
+ * malformed, unknown-key, or non-enum value so a bad report is ignored instead
+ * of being partially forwarded; it never throws.
+ */
+export function parseConfigurationReport(
+  raw: unknown
+): ConfigurationReport | null {
+  try {
+    return readConfigurationReport(raw);
+  } catch (error) {
+    if (error instanceof DshPayloadError) {
+      return null;
+    }
+    throw error;
+  }
 }
 
 /**

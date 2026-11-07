@@ -5,11 +5,14 @@ import {
 
 import type { ChatBlock } from './protocol';
 import {
+  applyTurnEvent,
   createTurn,
   deriveTurn,
+  restoreTurn,
   setTurnStatus,
   toggleActivity,
   toggleTrace,
+  toPersistedTurn,
   type ChatTurn
 } from './turn';
 import { renderTurn, turnSummary } from './turn-renderer';
@@ -414,6 +417,234 @@ describe('renderTurn', () => {
         '.jp-AgentWorkspace-retryTurn'
       )
     ).toBeNull();
+  });
+});
+
+describe('terminal reason notice', () => {
+  function turnWithReason(
+    id: string,
+    reason: ChatTurn['terminalReason'],
+    blocks: ChatBlock[] = [],
+    status: ChatTurn['status'] = 'done'
+  ): ChatTurn {
+    const base = setTurnStatus(createTurn(id), status, blocks);
+    return { ...base, terminalReason: reason };
+  }
+
+  it.each(['cancelled', 'budget-exhausted', 'failed'] as const)(
+    'shows a standalone accessible notice for a %s turn beside the partial answer',
+    reason => {
+      const turn = turnWithReason(
+        'run-1',
+        reason,
+        [{ kind: 'text', id: 'text-1', text: 'Partial answer text.' }],
+        'interrupted'
+      );
+      const node = renderTurn(turn, { handlers: handlers() });
+      const notice = node.querySelector<HTMLElement>(
+        '.jp-AgentWorkspace-terminalNotice'
+      );
+
+      expect(notice?.getAttribute('role')).toBe('status');
+      expect(notice?.dataset.terminalReason).toBe(reason);
+      expect(notice?.textContent?.length).toBeGreaterThan(0);
+
+      // The partial answer stays the outcome; the notice never replaces it.
+      const outcome = node.querySelector('.jp-AgentWorkspace-outcomeBody');
+      expect(outcome?.textContent).toContain('Partial answer text.');
+      expect(outcome?.textContent).not.toContain(notice?.textContent ?? '');
+    }
+  );
+
+  it('states explicit completion when a completed turn produced no response', () => {
+    const node = renderTurn(turnWithReason('run-1', 'completed'), {
+      handlers: handlers()
+    });
+    const notice = node.querySelector<HTMLElement>(
+      '.jp-AgentWorkspace-terminalNotice'
+    );
+
+    expect(notice?.getAttribute('role')).toBe('status');
+    expect(notice?.textContent).toContain(
+      'completed without producing a response'
+    );
+    expect(node.querySelector('.jp-AgentWorkspace-outcome')).toBeNull();
+  });
+
+  it('does not add a notice to a completed turn that produced a response', () => {
+    const turn = turnWithReason('run-1', 'completed', [
+      { kind: 'text', id: 'text-1', text: 'Final answer.' }
+    ]);
+    expect(
+      renderTurn(turn, { handlers: handlers() }).querySelector(
+        '.jp-AgentWorkspace-terminalNotice'
+      )
+    ).toBeNull();
+  });
+
+  it('leaves legacy turns without a terminal reason unchanged', () => {
+    const legacy = completedTurn([
+      { kind: 'text', id: 'text-1', text: 'Legacy answer.' }
+    ]);
+    expect(legacy.terminalReason).toBeUndefined();
+    expect(
+      renderTurn(legacy, { handlers: handlers() }).querySelector(
+        '.jp-AgentWorkspace-terminalNotice'
+      )
+    ).toBeNull();
+  });
+
+  it('re-renders the same notice after a persistence round-trip', () => {
+    const original = turnWithReason('run-1', 'cancelled');
+    const restored = restoreTurn(toPersistedTurn(original));
+    expect(restored).not.toBeNull();
+    expect(restored?.terminalReason).toBe('cancelled');
+
+    const before = renderTurn(original, { handlers: handlers() }).querySelector(
+      '.jp-AgentWorkspace-terminalNotice'
+    );
+    const after = renderTurn(restored as ChatTurn, {
+      handlers: handlers()
+    }).querySelector<HTMLElement>('.jp-AgentWorkspace-terminalNotice');
+
+    expect(after?.textContent).toBe(before?.textContent);
+    expect(after?.dataset.terminalReason).toBe('cancelled');
+  });
+
+  it('never renders arbitrary text for an unknown terminal reason', () => {
+    const turn: ChatTurn = {
+      ...setTurnStatus(createTurn('run-1'), 'done', []),
+      terminalReason: 'mystery' as unknown as ChatTurn['terminalReason']
+    };
+    expect(
+      renderTurn(turn, { handlers: handlers() }).querySelector(
+        '.jp-AgentWorkspace-terminalNotice'
+      )
+    ).toBeNull();
+  });
+
+  describe('real ACP event sequence where result text stays empty', () => {
+    function streamedTurn(
+      reason: ChatTurn['terminalReason'],
+      text: string
+    ): { turn: ChatTurn; blocks: ChatBlock[] } {
+      const blocks: ChatBlock[] = [{ kind: 'text', id: 'text-1', text }];
+      let turn = createTurn('run-1');
+      turn = applyTurnEvent(turn, blocks, {
+        type: 'text',
+        turnId: 'run-1',
+        text
+      });
+      turn = applyTurnEvent(turn, blocks, {
+        type: 'result',
+        turnId: 'run-1',
+        text: '',
+        reason
+      });
+      return { turn, blocks };
+    }
+
+    it('does not claim a completed run produced no response when text streamed', () => {
+      const { turn } = streamedTurn('completed', 'Streamed answer.');
+      expect(turn.resultText).toBe('');
+      expect(turn.outcomeKind).toBe('assistant');
+      const node = renderTurn(turn, { handlers: handlers() });
+      expect(
+        node.querySelector('.jp-AgentWorkspace-terminalNotice')
+      ).toBeNull();
+      expect(
+        node.querySelector('.jp-AgentWorkspace-outcomeBody')?.textContent
+      ).toContain('Streamed answer.');
+    });
+
+    it.each(['cancelled', 'budget-exhausted', 'failed'] as const)(
+      'states the stop reason without the no-response wording for a %s turn with streamed text',
+      reason => {
+        const { turn } = streamedTurn(reason, 'Partial streamed answer.');
+        expect(turn.resultText).toBe('');
+        const node = renderTurn(turn, { handlers: handlers() });
+        const notice = node.querySelector<HTMLElement>(
+          '.jp-AgentWorkspace-terminalNotice'
+        );
+        expect(notice?.dataset.terminalReason).toBe(reason);
+        expect(notice?.textContent).not.toContain('without producing a response');
+        expect(notice?.textContent).not.toContain(
+          'before producing a response'
+        );
+        expect(
+          node.querySelector('.jp-AgentWorkspace-outcomeBody')?.textContent
+        ).toContain('Partial streamed answer.');
+      }
+    );
+
+    it('keeps the streamed answer and notice after a persistence round-trip', () => {
+      const { turn, blocks } = streamedTurn('failed', 'Streamed answer.');
+      const restored = restoreTurn(toPersistedTurn(turn));
+      expect(restored).not.toBeNull();
+      const reopened = deriveTurn(restored as ChatTurn, blocks);
+      expect(reopened.resultText).toBe('');
+      expect(reopened.outcomeKind).toBe('assistant');
+
+      const node = renderTurn(reopened, { handlers: handlers() });
+      expect(
+        node.querySelector<HTMLElement>('.jp-AgentWorkspace-terminalNotice')
+          ?.textContent
+      ).toBe('Run failed before finishing.');
+      expect(
+        node.querySelector('.jp-AgentWorkspace-outcomeBody')?.textContent
+      ).toContain('Streamed answer.');
+    });
+
+    it('does not count tool output as a response for a completed turn', () => {
+      const blocks: ChatBlock[] = [toolBlock('tool-1')];
+      let turn = createTurn('run-1');
+      turn = applyTurnEvent(turn, blocks, {
+        type: 'tool_end',
+        turnId: 'run-1',
+        id: 'tool-1',
+        name: 'Bash',
+        output: '/tmp\n'
+      });
+      turn = applyTurnEvent(turn, blocks, {
+        type: 'result',
+        turnId: 'run-1',
+        text: '',
+        reason: 'completed'
+      });
+      expect(turn.resultText).toBe('');
+      expect(turn.outcomeKind).toBe('tool');
+      expect(
+        renderTurn(turn, { handlers: handlers() }).querySelector<HTMLElement>(
+          '.jp-AgentWorkspace-terminalNotice'
+        )?.textContent
+      ).toContain('completed without producing a response');
+    });
+
+    it('does not count thinking as a response for a completed turn', () => {
+      const blocks: ChatBlock[] = [
+        { kind: 'thinking', id: 'think-1', status: 'finished' }
+      ];
+      let turn = createTurn('run-1');
+      turn = applyTurnEvent(turn, blocks, {
+        type: 'thinking',
+        turnId: 'run-1',
+        id: 'think-1',
+        state: 'finished'
+      });
+      turn = applyTurnEvent(turn, blocks, {
+        type: 'result',
+        turnId: 'run-1',
+        text: '',
+        reason: 'completed'
+      });
+      expect(turn.resultText).toBe('');
+      expect(turn.outcomeKind).toBe('none');
+      expect(
+        renderTurn(turn, { handlers: handlers() }).querySelector<HTMLElement>(
+          '.jp-AgentWorkspace-terminalNotice'
+        )?.textContent
+      ).toContain('completed without producing a response');
+    });
   });
 });
 

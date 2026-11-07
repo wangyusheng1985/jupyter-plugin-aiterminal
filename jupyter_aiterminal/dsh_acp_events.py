@@ -50,11 +50,16 @@ Projection rules:
   different session is dropped; ``run_id`` is never derived from ``session_id``.
 
 Terminal handling is idempotent. ``finish`` maps the ACP prompt response's
-``stopReason`` (``end_turn`` -> ``completed``, ``cancelled`` -> ``cancelled``,
-``max_tokens`` and any other non-success value -> ``failed``), while
-``finish_error`` lets the host close the run as ``failed`` when an exception
-occurred outside a prompt response. Only the first terminal event is emitted;
-late notifications are ignored.
+``stopReason`` onto ``dsh/v1/run.finished`` as a stable terminal ``reason``
+(``end_turn`` -> ``completed``, ``cancelled`` -> ``cancelled``, ``max_tokens``
+-> ``budget-exhausted``, any other or missing value -> ``failed``) while
+keeping the existing ``status`` for backward compatibility. The raw
+``stopReason`` is never echoed onto the event: an unknown or arbitrary value
+collapses to ``failed`` without entering the event or docs. ``finish_error``
+closes the run as ``failed`` when an exception occurred outside a prompt
+response. Only the first terminal event is emitted;
+late notifications are ignored. No automatic retry or continuation is ever
+triggered.
 """
 
 from __future__ import annotations
@@ -68,7 +73,15 @@ _TRUNCATION_SUFFIX = "\u2026"
 _SESSION_UPDATE_METHOD = "session/update"
 _FINISHED_TOOL_STATUSES = {"completed": "ok", "failed": "error"}
 _NON_TERMINAL_TOOL_STATUSES = {"pending", "in_progress"}
+# Legacy terminal ``status`` values, kept for clients that only read status.
 _PROMPT_SUCCESS_STATUSES = {"end_turn": "completed", "cancelled": "cancelled"}
+# Stable terminal ``reason`` values carried alongside status. ``max_tokens`` is
+# a budget-limited stop, not a generic failure.
+_TERMINAL_REASONS = {
+    "end_turn": "completed",
+    "cancelled": "cancelled",
+    "max_tokens": "budget-exhausted",
+}
 
 
 def _non_empty_string(value: Any) -> bool:
@@ -145,24 +158,32 @@ class DshAcpEventProjector:
             if isinstance(prompt_result, Mapping)
             else None
         )
-        status = (
-            _PROMPT_SUCCESS_STATUSES.get(stop_reason)
-            if isinstance(stop_reason, str)
-            else None
-        )
-        return self._finish(status or "failed")
+        if isinstance(stop_reason, str):
+            status = _PROMPT_SUCCESS_STATUSES.get(stop_reason, "failed")
+            reason = _TERMINAL_REASONS.get(stop_reason, "failed")
+        else:
+            status = "failed"
+            reason = "failed"
+        return self._finish(status, reason)
 
     def finish_error(self, error: Any = None) -> list[dict[str, Any]]:
         """Emit a ``failed`` terminal when the host caught an out-of-band error."""
         # ``error`` is intentionally ignored: exception text can contain raw
         # payloads or credentials and must never reach the product event.
-        return self._finish("failed")
+        return self._finish("failed", "failed")
 
-    def _finish(self, status: str) -> list[dict[str, Any]]:
+    def _finish(self, status: str, reason: str) -> list[dict[str, Any]]:
         if self._run_finished:
             return []
         self._run_finished = True
-        return [{"type": "dsh/v1/run.finished", **self._scope(), "status": status}]
+        return [
+            {
+                "type": "dsh/v1/run.finished",
+                **self._scope(),
+                "status": status,
+                "reason": reason,
+            }
+        ]
 
     def project_notification(
         self, method: Any, params: Any

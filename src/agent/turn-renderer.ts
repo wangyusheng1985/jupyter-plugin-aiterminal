@@ -4,6 +4,7 @@ import { renderMarkdownSource } from './markdown';
 import { formatToolInput } from './tool';
 import {
   isTraceExpanded,
+  terminalReasonMessage,
   type ChatTurn,
   type TurnActivity,
   type TurnDiagnostic
@@ -39,6 +40,10 @@ export function renderTurn(
   if (turn.outcome) {
     root.append(renderOutcome(turn, options));
   }
+  const terminalNotice = renderTerminalReasonNotice(turn);
+  if (terminalNotice) {
+    root.append(terminalNotice);
+  }
   if (turn.timeline.length) {
     root.append(renderAuditSummary(turn, options));
   }
@@ -46,6 +51,20 @@ export function renderTurn(
     root.append(renderRetryControl(turn, options));
   }
   return root;
+}
+
+function renderTerminalReasonNotice(turn: ChatTurn): HTMLElement | null {
+  const message = terminalReasonMessage(turn);
+  if (!message) return null;
+  const notice = document.createElement('div');
+  notice.className = `jp-AgentWorkspace-terminalNotice is-${turn.terminalReason}`;
+  notice.setAttribute('role', 'status');
+  notice.dataset.terminalReason = turn.terminalReason ?? '';
+  const text = document.createElement('span');
+  text.className = 'jp-AgentWorkspace-terminalNoticeText';
+  text.textContent = message;
+  notice.append(text);
+  return notice;
 }
 
 function renderRetryControl(

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import shutil
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +54,47 @@ def _is_not_connected_error(exc: BaseException) -> bool:
     return False
 
 
+_TERMINAL_REASON_FALLBACKS = {
+    "completed": "completed",
+    "cancelled": "cancelled",
+    "failed": "failed",
+}
+
+
+def _terminal_reason(finished: dict[str, Any]) -> str:
+    """Read the projector's stable terminal reason, falling back to status."""
+    reason = finished.get("reason")
+    if isinstance(reason, str) and reason:
+        return reason
+    status = finished.get("status")
+    if isinstance(status, str):
+        return _TERMINAL_REASON_FALLBACKS.get(status, "failed")
+    return "failed"
+
+
+class _NullTransportStartup:
+    """Bootstrap view when there is no shared host runtime."""
+
+    transport = None
+    owns_bootstrap = True
+
+
+@asynccontextmanager
+async def _transport_startup(runtime: Any | None) -> Any:
+    """Hold the shared host's bootstrap transaction, or a null one.
+
+    A runtime that exposes ``transport_startup`` serializes the check for a
+    shared transport, the first session's ``start``, and its adoption. Runtimes
+    without that seam keep the previous per-instance behavior.
+    """
+    startup = getattr(runtime, "transport_startup", None)
+    if not callable(startup):
+        yield _NullTransportStartup()
+        return
+    async with startup() as view:
+        yield view
+
+
 def normalize_session_id(value: object) -> str | None:
     if not isinstance(value, str) or len(value) != 36:
         return None
@@ -59,6 +102,57 @@ def normalize_session_id(value: object) -> str | None:
         return str(uuid.UUID(value))
     except (ValueError, AttributeError):
         return None
+
+
+def _apply_server_event(
+    blocks: list[dict[str, Any]], event: dict[str, Any]
+) -> list[dict[str, Any]]:
+    event_type = event.get("type")
+    if event_type == "text":
+        msg_id = event.get("messageId")
+        text = str(event.get("text", ""))
+        if msg_id:
+            for b in blocks:
+                if b.get("kind") == "text" and b.get("messageId") == msg_id:
+                    b["text"] = text
+                    return blocks
+        blocks.append(
+            {
+                "kind": "text",
+                "id": f"text-{msg_id or uuid.uuid4().hex[:8]}",
+                "text": text,
+                "messageId": msg_id,
+            }
+        )
+        return blocks
+    if event_type == "tool_start":
+        blocks.append(
+            {
+                "kind": "tool",
+                "id": event.get("id"),
+                "name": event.get("name", ""),
+                "input": event.get("input", {}),
+                "output": "",
+                "status": "running",
+                "startedAt": event.get("startedAt"),
+            }
+        )
+        return blocks
+    if event_type == "tool_end":
+        tool_id = event.get("id")
+        for b in blocks:
+            if b.get("kind") == "tool" and b.get("id") == tool_id:
+                b["output"] = str(event.get("output", ""))
+                b["status"] = "error" if event.get("isError") else "done"
+                if "durationMs" in event:
+                    b["durationMs"] = event["durationMs"]
+                if "lineCount" in event:
+                    b["lineCount"] = event["lineCount"]
+                if "byteCount" in event:
+                    b["byteCount"] = event["byteCount"]
+                break
+        return blocks
+    return blocks
 
 
 class AgentSession:
@@ -70,9 +164,22 @@ class AgentSession:
     but production never calls them.
     """
 
-    def __init__(self, cwd: str, emit: Emit, resume_session_id: str | None = None):
+    def __init__(
+        self,
+        cwd: str,
+        emit: Emit,
+        resume_session_id: str | None = None,
+        runtime: Any | None = None,
+        workspace_file: str | None = None,
+        is_detached: Callable[[], bool] | None = None,
+        on_session_id_ready: Callable[[AgentSession], None] | None = None,
+    ):
         self.cwd = cwd
         self.emit = emit
+        self._runtime = runtime
+        self.workspace_file = workspace_file
+        self._is_detached = is_detached
+        self._on_session_id_ready = on_session_id_ready
         self.session_id: str | None = None
         self.runtime_id: str | None = None
         self.model = ""
@@ -87,12 +194,25 @@ class AgentSession:
         self._closed = False
         self._running = False
         self._active_turn_id: str | None = None
+        self.active_cell_id: str | None = None
+        self.turn_events: list[dict[str, Any]] = []
+        self.blocks: list[dict[str, Any]] = []
+        self._last_turn_error = False
         self._projector: DshAcpEventProjector | None = None
         self._legacy_text: dict[str, str] = {}
         self._tool_names: dict[str, str] = {}
         # Pending approval scopes keyed by the ACP request id, so a future
         # handler can route a decision without reconstructing runtime identity.
         self._permission_scopes: dict[str, dict[str, str]] = {}
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    def is_detached(self) -> bool:
+        if self._is_detached:
+            return bool(self._is_detached())
+        return False
 
     async def start(self) -> None:
         await self._ensure_session()
@@ -149,15 +269,64 @@ class AgentSession:
 
             acp: DshAcpSession | None = None
             try:
-                acp = DshAcpSession(
-                    config=config,
-                    cwd=self.cwd,
-                    storage_root=root,
-                    emit=self._on_acp_event,
-                    on_notification=self._handle_notification,
-                    resume_session_id=self._resume_session_id,
+                # The host bootstrap lock covers the whole transaction: seeing
+                # whether a shared transport exists, starting the first session
+                # (which spawns the only child), and adopting that transport.
+                # Two concurrent first starts therefore cannot each spawn one.
+                async with _transport_startup(self._runtime) as startup:
+                    shared_transport = startup.transport
+                    owns_transport = startup.owns_bootstrap
+                    acp = DshAcpSession(
+                        config=config,
+                        cwd=self.cwd,
+                        storage_root=root,
+                        emit=self._on_acp_event,
+                        on_notification=self._handle_notification,
+                        resume_session_id=self._resume_session_id,
+                        transport=shared_transport,
+                        owns_transport=owns_transport,
+                    )
+                    await acp.start()
+                    if (
+                        self._runtime is not None
+                        and owns_transport
+                        and acp._transport is not None
+                    ):
+                        # The first session already completed this transport's
+                        # ACP ``initialize`` handshake, so the shared runtime
+                        # adopts it instead of starting or initializing a
+                        # second time. Its budget snapshot is recorded once; a
+                        # later session on the same runtime shares the first
+                        # snapshot and must not replace it with its own desired
+                        # settings.
+                        adopted = self._runtime.adopt_initialized_transport(
+                            acp._transport,
+                            snapshot=config.budget,
+                            preflight_proven=acp.config_preflight_proven,
+                        )
+                        if adopted is not acp._transport:
+                            # Never release ownership of a child this runtime
+                            # did not install: that would leave a second
+                            # process alive with no owner.
+                            raise DshAcpSessionError(
+                                "shared runtime did not adopt this session's "
+                                "initialized transport"
+                            )
+                        acp._owns_transport = False
+            except AgentConfigError as exc:
+                # A dump-config row preflight failure is a configuration
+                # problem, not a generic runtime spawn failure; keep that
+                # classification and never echo a credential.
+                if acp is not None:
+                    await self._close_quietly(acp)
+                await self._emit_event(
+                    {
+                        "type": "error",
+                        "code": "config",
+                        "message": self._safe_message(exc),
+                    }
                 )
-                await acp.start()
+                return None
             except DshAcpSessionError as exc:
                 if acp is not None:
                     await self._close_quietly(acp)
@@ -201,6 +370,11 @@ class AgentSession:
             self._acp = acp
             self.session_id = acp.session_id
             self.runtime_id = acp.runtime_id
+            if self._on_session_id_ready:
+                try:
+                    self._on_session_id_ready(self)
+                except Exception:
+                    pass
             await self._emit_event(
                 {
                     "type": "ready",
@@ -210,7 +384,99 @@ class AgentSession:
                     "cwd": self.cwd,
                 }
             )
+            for event in self._configuration_events():
+                await self._emit_event(event)
             return acp
+
+    async def reemit_handshake(self, target_emit: Emit | None = None) -> None:
+        """Re-emit handshake events to a newly attached websocket."""
+        emit = target_emit or self.emit
+        if not self.session_id or not self.runtime_id:
+            return
+        try:
+            await emit(
+                {
+                    "type": "ready",
+                    "sessionId": self.session_id,
+                    "contextState": "resumed",
+                    "model": self.model,
+                    "cwd": self.cwd,
+                }
+            )
+            await emit(
+                {
+                    "type": "dsh/v1/connection",
+                    "runtimeId": self.runtime_id,
+                    "phase": "connected",
+                }
+            )
+            await emit(
+                {
+                    "type": "dsh/v1/session",
+                    "sessionId": self.session_id,
+                    "runtimeId": self.runtime_id,
+                    "phase": "resumed",
+                }
+            )
+            await emit(
+                {
+                    "type": "dsh/v1/capabilities",
+                    "runtimeId": self.runtime_id,
+                    "capabilities": {
+                        "cancel": {"status": "available"},
+                        "approval": {
+                            "status": "unavailable",
+                            "reason": "approval is handled automatically by the runtime host",
+                        },
+                    },
+                }
+            )
+            for event in self._configuration_events():
+                await emit(event)
+        except Exception:
+            pass
+
+    def _configuration_events(self) -> list[dict[str, Any]]:
+        """Build the effective-configuration refresh for the shared runtime.
+
+        The desired snapshot is re-read from settings every time so a saved
+        change is reported as ``pending-next-runtime`` without hot-reconfiguring,
+        restarting, or replacing the running runtime. A desired-settings read
+        failure is surfaced on a dedicated non-fatal ``configuration-error``
+        channel so it does not terminate an already-active turn, and the message
+        is a fixed, actionable string that never echoes the exception or token.
+        """
+        runtime = self._runtime
+        if runtime is None:
+            return []
+        events: list[dict[str, Any]] = []
+        desired: Any = None
+        try:
+            desired = load_dsh_settings().budget
+        except Exception:  # noqa: BLE001 - never echo a raw settings payload
+            # A refresh failure is never fatal to a running turn, and it is not
+            # the same channel as a startup ``config`` error (which the frontend
+            # treats as fatal). Use a fixed message so no exception detail or
+            # credential can leak.
+            events.append(
+                {
+                    "type": "configuration-error",
+                    "message": (
+                        "AI Terminal provider settings could not be refreshed; "
+                        "the current turn keeps running. Save the fix, then "
+                        "start a new runtime to apply it."
+                    ),
+                }
+            )
+        try:
+            report = runtime.configuration_report(desired=desired)
+        except Exception:  # noqa: BLE001 - fall back to active-only report
+            try:
+                report = runtime.configuration_report()
+            except Exception:  # noqa: BLE001 - configuration is best-effort
+                return events
+        events.insert(0, {"type": "configuration", "report": report})
+        return events
 
     # -- ACP event adapters --------------------------------------------------
 
@@ -320,7 +586,12 @@ class AgentSession:
 
     # -- prompt and cancel ---------------------------------------------------
 
-    async def query(self, text: str, turn_id: str | None = None) -> None:
+    async def query(
+        self,
+        text: str,
+        turn_id: str | None = None,
+        cell_id: str | None = None,
+    ) -> None:
         prompt = text.strip()
         if not prompt:
             return
@@ -334,9 +605,15 @@ class AgentSession:
             )
             return
 
+        had_session = self._acp is not None
         acp = await self._ensure_session()
         if acp is None:
             return
+        if had_session:
+            # Refresh the effective configuration for an already-running
+            # session without restarting or replacing the shared runtime.
+            for event in self._configuration_events():
+                await self._emit_event(event)
         session_id = acp.session_id
         runtime_id = acp.runtime_id
         if not session_id or not runtime_id:
@@ -351,11 +628,18 @@ class AgentSession:
 
         self._running = True
         self._active_turn_id = turn_id
+        self.active_cell_id = cell_id
+        self.turn_events = []
+        self.blocks = []
+        self._last_turn_error = False
         run_id = turn_id or f"turn-{uuid.uuid4().hex}"
         projector = DshAcpEventProjector(session_id, runtime_id, run_id)
         self._projector = projector
         self._legacy_text = {}
         self._tool_names = {}
+        # Persisted with a detached turn so a reopened document can render the
+        # real terminal reason instead of inferring one from status.
+        terminal_reason = "failed"
         try:
             await self._emit_event({"type": "accepted", "sessionId": session_id})
             for event in projector.begin():
@@ -364,20 +648,28 @@ class AgentSession:
             terminal = projector.finish(result)
             for event in terminal:
                 await self._emit_product_event(event)
-            status = terminal[0].get("status") if terminal else "failed"
+            finished = terminal[0] if terminal else {}
+            status = finished.get("status", "failed")
+            terminal_reason = _terminal_reason(finished)
+            self._last_turn_error = status != "completed"
             await self._emit_event(
                 {
                     "type": "result",
                     "text": "",
-                    "isError": status != "completed",
+                    "isError": self._last_turn_error,
+                    "reason": terminal_reason,
                     "sessionId": session_id,
                 }
             )
         except asyncio.CancelledError:
+            terminal_reason = "cancelled"
+            self._last_turn_error = True
             for event in projector.finish_error(None):
                 await self._emit_product_event(event)
             raise
         except DshAcpSessionError as exc:
+            terminal_reason = "failed"
+            self._last_turn_error = True
             for event in projector.finish_error(exc):
                 await self._emit_product_event(event)
             await self._emit_event(
@@ -389,6 +681,8 @@ class AgentSession:
             )
             await self._discard_session(acp)
         except Exception as exc:  # noqa: BLE001 - surface safely
+            terminal_reason = "failed"
+            self._last_turn_error = True
             for event in projector.finish_error(exc):
                 await self._emit_product_event(event)
             await self._emit_event(
@@ -401,7 +695,22 @@ class AgentSession:
             await self._discard_session(acp)
         finally:
             self._running = False
+            if self.workspace_file and self.is_detached():
+                try:
+                    from .detached_document import save_detached_turn
+
+                    save_detached_turn(
+                        self.workspace_file,
+                        cell_id=self.active_cell_id,
+                        turn_id=self._active_turn_id,
+                        blocks=self.blocks,
+                        status="error" if self._last_turn_error else "done",
+                        reason=terminal_reason,
+                    )
+                except Exception:
+                    pass
             self._active_turn_id = None
+            self.active_cell_id = None
             self._projector = None
             self._legacy_text = {}
             self._tool_names = {}
@@ -500,7 +809,15 @@ class AgentSession:
             and not event_type.startswith("dsh/")
         ):
             event = {**event, "turnId": self._active_turn_id}
-        await self.emit(event)
+        if self._running:
+            self.turn_events.append(event)
+            self.blocks = _apply_server_event(self.blocks, event)
+        try:
+            outcome = self.emit(event)
+            if outcome is not None and inspect.isawaitable(outcome):
+                await outcome
+        except Exception:
+            pass
 
 
 def dsh_storage_root() -> Path:

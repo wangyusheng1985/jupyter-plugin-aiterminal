@@ -17,7 +17,6 @@ from pathlib import Path
 import pytest
 
 from jupyter_aiterminal.dsh_acp_config import (
-    ACP_MAX_OUTPUT_TOKENS_CAP,
     PASSTHROUGH_ENV_KEYS,
     build_acp_profile_patches,
     build_acp_session_params,
@@ -29,6 +28,7 @@ from jupyter_aiterminal.dsh_config import (
     DSH_API_KEY_ENV,
     PROTOCOL_ANTHROPIC_MESSAGES,
     PROTOCOL_OPENAI_COMPLETIONS,
+    build_provider_insert_patch,
     parse_dsh_provider_config,
 )
 from jupyter_aiterminal.settings import AgentConfigError
@@ -158,6 +158,7 @@ OVERLAY_ROW_IDS = {
     "approval",
     "sandbox-policy",
     "tool-fs",
+    "compaction-basic",
     "tool-web",
     "web",
     "web-search-deepseek",
@@ -252,16 +253,17 @@ def test_both_protocols_produce_expected_real_rows(tmp_path: Path):
         assert provider["api"] == protocol
         assert provider["baseURL"] == BASE_SETTINGS["baseUrl"]
         assert provider["apiKeyEnv"] == DSH_API_KEY_ENV
-        expected_max = min(4096, ACP_MAX_OUTPUT_TOKENS_CAP)
+        budget = config.budget
+        assert budget is not None
         assert provider["models"] == [
             {
                 "id": BASE_SETTINGS["model"],
                 "name": BASE_SETTINGS["model"],
-                "contextWindow": 8192,
-                "maxTokens": expected_max,
+                "contextWindow": budget.context_window,
+                "maxTokens": budget.max_output_tokens,
             }
         ]
-        assert provider["defaultMaxTokens"] == expected_max
+        assert provider["defaultMaxTokens"] == budget.max_output_tokens
         assert provider["retryPolicy"] == {"mode": "normal", "maxRetries": 0}
 
         assert by_id["agent-default-model"]["config"] == {
@@ -284,11 +286,60 @@ def test_both_protocols_produce_expected_real_rows(tmp_path: Path):
             "edit": True,
             "applyPatch": False,
         }
+        assert by_id["compaction-basic"]["config"] == {
+            "auto": budget.compaction_enabled,
+            "thresholdRatio": budget.threshold_ratio,
+            "headroomTokens": budget.headroom,
+            "retainRatio": budget.retain_ratio,
+            "maxTokens": budget.summary_max_tokens,
+        }
+        # token-meter stays enabled and receives no config: the runtime rejects
+        # a config patch against its empty schema.
+        assert "token-meter" not in by_id
 
         for row_id in DISABLED_ROW_IDS:
             assert by_id[row_id] == {"id": row_id, "disabled": True}
         # tool-bash is not patched, so the shipped platform gate survives.
         assert "tool-bash" not in by_id
+
+
+def test_provider_budget_matches_insert_patch_and_is_not_clamped(tmp_path: Path):
+    # 8192 max output tokens is above the removed 4096 cap and must pass through.
+    config = _config(contextWindow=32768, maxOutputTokens=8192)
+    budget = config.budget
+    assert budget is not None
+    assert budget.max_output_tokens == 8192
+
+    rows = _rows_by_id(build_acp_profile_patches(config, workspace_root=tmp_path))
+    provider = rows["llm-pi-ai"]["config"]["providers"]["jupyter-aiterminal"]
+    acp_model = provider["models"][0]
+    assert acp_model["contextWindow"] == 32768
+    assert acp_model["maxTokens"] == 8192
+    assert provider["defaultMaxTokens"] == 8192
+
+    # The existing provider insert patch and the ACP patch share one config and
+    # must report identical C/O values.
+    insert_row = build_provider_insert_patch(config)["insert"][0]
+    insert_provider = insert_row["config"]["providers"]["jupyter-aiterminal"]
+    insert_model = insert_provider["models"][0]
+    assert insert_model["contextWindow"] == acp_model["contextWindow"]
+    assert insert_model["maxTokens"] == acp_model["maxTokens"]
+
+
+def test_compaction_disabled_patches_auto_false(tmp_path: Path):
+    config = _config(compactionEnabled=False)
+    rows = _rows_by_id(build_acp_profile_patches(config, workspace_root=tmp_path))
+    assert rows["compaction-basic"]["config"]["auto"] is False
+
+
+def test_compaction_patch_never_inserts_a_new_row(tmp_path: Path):
+    rows = build_acp_profile_patches(
+        _config(contextWindow=32768, maxOutputTokens=8192),
+        workspace_root=tmp_path,
+    )
+    assert all("insert" not in row for row in rows)
+    assert "compaction-basic" in {row["id"] for row in rows}
+    assert "token-meter" not in {row["id"] for row in rows}
 
 
 def test_overlay_never_inserts_or_names_unknown_rows(tmp_path: Path):
