@@ -84,7 +84,7 @@ jobs:
       # pythonpath = ["."], and an editable install would trigger a
       # development labextension build that pollutes later jobs.
       - name: Install test dependencies
-        run: python -m pip install "jupyter_core>=5" "pytest>=8"
+        run: python -m pip install "jupyter_core>=5" "jupyter_server>=2.0" "pytest>=8"
 
       - name: Run Python tests
         run: python -m pytest -q

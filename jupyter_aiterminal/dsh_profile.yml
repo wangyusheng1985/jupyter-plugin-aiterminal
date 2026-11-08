@@ -1,0 +1,54 @@
+# Controlled overlay for the Jupyter AI Terminal agent runtime.
+#
+# This file is a patch list layered over the shipped `sdk-minimal` bundle
+# (packages/bundle/sdk-minimal/cordis.patch.yml), which stays the source of truth
+# for which plugins exist. Apply it with
+# `dsh --profile sdk-minimal --patch jupyter_aiterminal/dsh_profile.yml`, or
+# through the Python SDK's `DeepSeekHarnessConfig.patches`. Only narrow rows that
+# already exist in the base tree are patched: nothing is inserted, and no
+# browser/computer/office/schedule plugin is named here. The base tree does ship
+# `mcp-resources`; it is left untouched and registers no tools on its own (only an
+# MCP server row would). This layer is not a complete isolation boundary: a home
+# patch can still insert rows, so deployment must pin DSH_HOME to a controlled
+# directory with no user patches and reject user-supplied profiles/patches.
+#
+# Permission posture: fail closed. The pinned 0.2.1rc2 runtime has no approval
+# channel, so a tool call that requests wider `sandbox_permissions` is refused
+# outright instead of being silently allowed (see tests/test_dsh_policy.py).
+# This profile therefore grants the least access that still lets the agent edit
+# the user's workspace, and adds no allow/deny lists: the published sandbox-policy
+# config exposes only `mode` and `workspaceRoot`.
+#
+# No credentials and no model gateway live here. The base profile's
+# `llm-deepseek` row reads its key from the environment; deployment injects the
+# provider and key later.
+
+# Narrow filesystem writes to the workspace. `workspace-write` is the narrowest
+# built-in mode that still permits editing files in the workspace;
+# `danger-full-access` is deliberately not reachable from this layer.
+#
+# Boundary semantics: for a normal agent session the runtime uses the session
+# header cwd as the workspace root. `workspaceRoot` below is only the fallback for
+# agentless sessions, and `!!js process.cwd()` is the *runtime* process cwd. A
+# production wiring that sets `runtime_cwd` different from `cwd` would therefore
+# widen that fallback, so keep `runtime_cwd == cwd` (the tests assert this).
+- id: sandbox-policy
+  config:
+    mode: workspace-write
+    workspaceRoot: !!js process.cwd()
+
+# Re-enable the file tools the base profile ships disabled, using exactly the
+# fields the base `dsh-tool-fs` row declares.
+- id: tool-fs
+  config:
+    read: true
+    readImage: true
+    write: true
+    edit: true
+
+# Keep the platform's shell pair enabled: the model-facing persistent tool
+# (`persistent-bash` / `persistent-pwsh`) plus the PTY backend it spawns
+# (`terminal-bash` / `terminal-pwsh`). The base tree already gates each pair by
+# platform. These are not duplicate command surfaces: `terminal-*` only calls
+# `ctx.terminals.registerBackend(...)`, and the persistent tool fails at its first
+# call if its backend is disabled. Do not disable either row here.

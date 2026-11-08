@@ -23,6 +23,44 @@ export type KeyAction =
   | { type: 'run-advance' }
   | { type: 'run-stay' };
 
+export interface HistoryKeyContext {
+  editable: boolean;
+  value: string;
+  selectionStart: number;
+  selectionEnd: number;
+}
+
+export type HistoryKeyAction =
+  { type: 'history-previous' } | { type: 'history-next' };
+
+export function mapHistoryKey(
+  stroke: KeyStroke,
+  context: HistoryKeyContext
+): HistoryKeyAction | null {
+  if (
+    !context.editable ||
+    stroke.shiftKey ||
+    stroke.ctrlKey ||
+    stroke.metaKey ||
+    context.selectionStart !== context.selectionEnd
+  ) {
+    return null;
+  }
+  if (
+    stroke.key === 'ArrowUp' &&
+    context.value.lastIndexOf('\n', context.selectionStart - 1) === -1
+  ) {
+    return { type: 'history-previous' };
+  }
+  if (
+    stroke.key === 'ArrowDown' &&
+    context.value.indexOf('\n', context.selectionEnd) === -1
+  ) {
+    return { type: 'history-next' };
+  }
+  return null;
+}
+
 export function mapWorkspaceKey(
   stroke: KeyStroke,
   surface: WorkspaceSurface,

@@ -1,8 +1,27 @@
 import type { ChatBlock, WorkspaceMode } from './protocol';
+import type { HistoryBridgeCapsule } from './history-bridge';
+import type { ChatTurn } from './turn';
 
 export type CellKind = WorkspaceMode;
-export type CellStatus = 'idle' | 'running' | 'done' | 'interrupted';
+export type CellStatus = 'idle' | 'queued' | 'running' | 'done' | 'interrupted';
 export type EditorMode = 'command' | 'edit';
+
+export interface RunRequest {
+  id: string;
+  cellId: string;
+  kind: CellKind;
+  source: string;
+  executionSource: string;
+  advance: boolean;
+  historyBridge?: HistoryBridgeCapsule;
+  agentContextGeneration: number | null;
+  contextCommitted: boolean;
+}
+
+export interface AgentContextBridge {
+  generation: number;
+  cellIds: string[];
+}
 
 export interface WorkspaceCell {
   id: string;
@@ -10,22 +29,27 @@ export interface WorkspaceCell {
   source: string;
   output: string;
   blocks: ChatBlock[];
+  turn: ChatTurn | null;
   status: CellStatus;
   executionCount: number | null;
   outputCollapsed: boolean;
+  agentContextGeneration: number | null;
 }
 
-let cellCounter = 0;
-let executionCounter = 0;
+let standaloneCellCounter = 0;
 
-export function restoreCounters(cells: WorkspaceCell[]): void {
+export function restoreCounters(
+  cells: WorkspaceCell[],
+  notebook?: WorkspaceNotebook
+): void {
+  if (notebook) {
+    notebook.restoreCounters(cells);
+    return;
+  }
   cells.forEach(cell => {
     const match = /^cell-(\d+)$/.exec(cell.id);
     if (match) {
-      cellCounter = Math.max(cellCounter, Number(match[1]));
-    }
-    if (typeof cell.executionCount === 'number') {
-      executionCounter = Math.max(executionCounter, cell.executionCount);
+      standaloneCellCounter = Math.max(standaloneCellCounter, Number(match[1]));
     }
   });
 }
@@ -35,22 +59,129 @@ export function createWorkspaceCell(
   source = ''
 ): WorkspaceCell {
   return {
-    id: `cell-${++cellCounter}`,
+    id: `cell-${++standaloneCellCounter}`,
     kind,
     source,
     output: '',
     blocks: [],
+    turn: null,
     status: 'idle',
     executionCount: null,
-    outputCollapsed: false
+    outputCollapsed: false,
+    agentContextGeneration: null
+  };
+}
+
+/**
+ * A cell may only be edited before it has run. Queued drafts are still part of
+ * the current input, while running or finished cells are workspace history and
+ * must stay immutable.
+ */
+export function isCellEditable(cell: WorkspaceCell): boolean {
+  return (
+    cell.executionCount === null &&
+    (cell.status === 'idle' || cell.status === 'queued')
+  );
+}
+
+export function isShellEscapeSource(source: string): boolean {
+  return /^\s*!/.test(source);
+}
+
+export function stripShellEscape(source: string): string {
+  const trimmed = source.trim();
+  const match = /^\s*!\s*(.*)$/s.exec(trimmed);
+  return match ? match[1] : trimmed;
+}
+
+export function resolveRunExecution(
+  source: string,
+  preferredKind: CellKind = 'ai'
+): { kind: CellKind; executionSource: string } | null {
+  const trimmed = source.trim();
+  if (!trimmed) return null;
+
+  if (isShellEscapeSource(trimmed)) {
+    const stripped = stripShellEscape(trimmed);
+    if (!stripped) return null;
+    return {
+      kind: 'command',
+      executionSource: stripped
+    };
+  }
+
+  if (preferredKind === 'command') {
+    return {
+      kind: 'command',
+      executionSource: trimmed
+    };
+  }
+
+  return {
+    kind: 'ai',
+    executionSource: trimmed
   };
 }
 
 export class WorkspaceNotebook {
-  cells: WorkspaceCell[] = [createWorkspaceCell('ai')];
+  cells: WorkspaceCell[];
   active = 0;
   mode: EditorMode = 'edit';
-  insertKind: CellKind = 'ai';
+  agentSessionId: string | null = null;
+  agentContextGeneration = 0;
+  agentContextBridges: AgentContextBridge[] = [];
+  private runQueue: RunRequest[] = [];
+  private activeRequest: RunRequest | null = null;
+  private cellCounter = 0;
+  private executionCounter = 0;
+  private runCounter = 0;
+  // Cells whose draft kind was chosen explicitly (e.g. the composer Shell
+  // toggle). Untracked drafts derive their kind from an `!` marker so editing
+  // the source can flip them back to AI without changing the document format.
+  private readonly explicitDraftKinds = new Set<string>();
+
+  constructor() {
+    this.cells = [this.createCell('ai')];
+  }
+
+  createCell(kind: CellKind = 'ai', source = ''): WorkspaceCell {
+    return {
+      id: `cell-${++this.cellCounter}`,
+      kind,
+      source,
+      output: '',
+      blocks: [],
+      turn: null,
+      status: 'idle',
+      executionCount: null,
+      outputCollapsed: false,
+      agentContextGeneration: null
+    };
+  }
+
+  restoreCounters(cells: WorkspaceCell[] = this.cells): void {
+    let maxCell = 0;
+    let maxExecution = 0;
+    cells.forEach(cell => {
+      const match = /^cell-(\d+)$/.exec(cell.id);
+      if (match) {
+        maxCell = Math.max(maxCell, Number(match[1]));
+      }
+      if (typeof cell.executionCount === 'number') {
+        maxExecution = Math.max(maxExecution, cell.executionCount);
+      }
+    });
+    this.cellCounter = maxCell;
+    this.executionCounter = maxExecution;
+  }
+
+  get activeRun(): RunRequest | null {
+    return this.activeRequest;
+  }
+
+  get queuedRuns(): readonly RunRequest[] {
+    return this.runQueue;
+  }
 
   get current(): WorkspaceCell {
     if (this.empty) {
@@ -63,6 +194,11 @@ export class WorkspaceNotebook {
     return this.cells.length === 0;
   }
 
+  isEditable(index = this.active): boolean {
+    const cell = this.cells[index];
+    return Boolean(cell) && isCellEditable(cell);
+  }
+
   select(index: number): void {
     if (this.cells.length === 0) {
       this.active = 0;
@@ -70,53 +206,37 @@ export class WorkspaceNotebook {
     }
     if (index < 0 || index >= this.cells.length) return;
     this.active = index;
-    this.insertKind = this.current.kind;
   }
 
-  setKind(kind: CellKind): void {
-    this.insertKind = kind;
-    if (this.empty) return;
-    const cell = this.current;
-    if (cell.kind === kind) return;
-    cell.kind = kind;
-    cell.output = '';
-    cell.blocks = [];
-    cell.status = 'idle';
-    cell.executionCount = null;
-    cell.outputCollapsed = false;
-  }
-
-  toggleKind(): CellKind {
+  insertAbove(): WorkspaceCell {
     if (this.empty) {
-      this.insertKind = this.insertKind === 'ai' ? 'command' : 'ai';
-      return this.insertKind;
+      return this.appendCell();
     }
-    const kind = this.current.kind === 'ai' ? 'command' : 'ai';
-    this.setKind(kind);
-    return kind;
-  }
-
-  insertAbove(kind: CellKind = this.insertKind): WorkspaceCell {
-    if (this.empty) {
-      return this.appendCell(kind);
-    }
-    const cell = createWorkspaceCell(kind);
+    const cell = this.createCell();
     this.cells.splice(this.active, 0, cell);
     this.mode = 'edit';
-    this.insertKind = kind;
     return cell;
   }
 
-  insertBelow(kind: CellKind = this.insertKind): WorkspaceCell {
+  insertBelow(): WorkspaceCell {
     if (this.empty) {
-      return this.appendCell(kind);
+      return this.appendCell();
     }
-    const cell = createWorkspaceCell(kind);
+    const cell = this.createCell();
     this.cells.splice(this.active + 1, 0, cell);
     this.active += 1;
     this.mode = 'edit';
-    this.insertKind = kind;
     return cell;
+  }
+
+  prepareRetry(index = this.active): WorkspaceCell | null {
+    const source = this.cells[index];
+    if (!source || !source.source.trim()) return null;
+    const retry = this.createCell(source.kind, source.source);
+    this.cells.splice(index + 1, 0, retry);
+    this.active = index + 1;
+    this.mode = 'edit';
+    return retry;
   }
 
   deleteActive(): boolean {
@@ -124,34 +244,31 @@ export class WorkspaceNotebook {
       return false;
     }
     const cell = this.current;
-    if (cell.status === 'running') {
+    if (this.activeRequest?.cellId === cell.id) {
       return false;
     }
-    const kind = cell.kind;
+    this.cancelQueuedRuns(cell.id);
     const index = this.active;
     this.cells.splice(index, 1);
     this.mode = 'command';
-    this.insertKind = kind;
     if (this.cells.length === 0) {
       this.active = 0;
       return true;
     }
     this.active = Math.min(index, this.cells.length - 1);
-    this.insertKind = this.current.kind;
     return true;
   }
 
-  appendCell(kind: CellKind = this.insertKind): WorkspaceCell {
-    const cell = createWorkspaceCell(kind);
+  appendCell(): WorkspaceCell {
+    const cell = this.createCell();
     this.cells.push(cell);
     this.active = this.cells.length - 1;
     this.mode = 'edit';
-    this.insertKind = kind;
     return cell;
   }
 
   enterEdit(): void {
-    this.mode = 'edit';
+    this.mode = this.isEditable() ? 'edit' : 'command';
   }
 
   exitEdit(): void {
@@ -159,27 +276,92 @@ export class WorkspaceNotebook {
   }
 
   setSource(source: string): void {
-    if (this.empty) return;
-    this.current.source = source;
+    if (this.empty || !this.isEditable()) return;
+    const cell = this.current;
+    cell.source = source;
+    if (cell.executionCount === null && !this.explicitDraftKinds.has(cell.id)) {
+      cell.kind = isShellEscapeSource(source) ? 'command' : 'ai';
+    }
   }
 
-  beginRun(): WorkspaceCell {
-    if (this.empty) {
-      throw new Error('Workspace notebook has no cells.');
+  setDraftKind(kind: CellKind, index = this.active): WorkspaceCell | null {
+    const cell = this.cells[index];
+    if (!cell) return null;
+    if (cell.status !== 'idle' || cell.executionCount !== null) {
+      return null;
     }
-    const cell = this.current;
-    cell.status = 'running';
-    cell.output = '';
-    cell.blocks = [];
-    cell.executionCount = ++executionCounter;
-    cell.outputCollapsed = false;
+    this.explicitDraftKinds.add(cell.id);
+    cell.kind = kind;
     return cell;
   }
 
-  finishRun(output: string, status: CellStatus = 'done'): void {
-    if (this.empty) return;
-    this.current.output = output;
-    this.current.status = status;
+  enqueueRun(
+    index = this.active,
+    advance = false,
+    historyBridge?: HistoryBridgeCapsule
+  ): RunRequest | null {
+    const cell = this.cells[index];
+    const source = cell?.source.trim();
+    if (!cell || !source) return null;
+    const resolved = resolveRunExecution(source, cell.kind);
+    if (!resolved) return null;
+    const { kind, executionSource: executableSource } = resolved;
+    const request: RunRequest = {
+      id: `run-${++this.runCounter}`,
+      cellId: cell.id,
+      kind,
+      source,
+      executionSource: executableSource,
+      advance,
+      ...(historyBridge ? { historyBridge } : {}),
+      agentContextGeneration:
+        kind === 'ai' ? this.agentContextGeneration : null,
+      contextCommitted: kind !== 'ai'
+    };
+    if (kind === 'command') cell.agentContextGeneration = null;
+    this.runQueue.push(request);
+    if (this.activeRequest?.cellId !== cell.id) {
+      cell.status = 'queued';
+    }
+    return request;
+  }
+
+  promoteNextRun(): RunRequest | null {
+    if (this.activeRequest) return null;
+    while (this.runQueue.length) {
+      const request = this.runQueue.shift() as RunRequest;
+      const cell = this.cells.find(
+        candidate => candidate.id === request.cellId
+      );
+      if (!cell) continue;
+      this.activeRequest = request;
+      cell.kind = request.kind;
+      cell.status = 'running';
+      cell.output = '';
+      cell.blocks = [];
+      cell.turn = null;
+      cell.executionCount = ++this.executionCounter;
+      cell.outputCollapsed = false;
+      return request;
+    }
+    return null;
+  }
+
+  finishRun(
+    requestId: string,
+    output: string,
+    status: CellStatus = 'done'
+  ): boolean {
+    if (this.activeRequest?.id !== requestId) return false;
+    const cell = this.cells.find(
+      candidate => candidate.id === this.activeRequest?.cellId
+    );
+    if (cell) {
+      cell.output = output;
+      cell.status = status;
+    }
+    this.activeRequest = null;
+    return true;
   }
 
   setBlocks(blocks: ChatBlock[]): void {
@@ -187,8 +369,90 @@ export class WorkspaceNotebook {
     this.current.blocks = blocks;
   }
 
+  setTurn(turn: ChatTurn | null): void {
+    if (this.empty) return;
+    this.current.turn = turn;
+  }
+
+  updateTurn(cellId: string, update: (turn: ChatTurn) => ChatTurn): boolean {
+    const cell = this.cells.find(candidate => candidate.id === cellId);
+    if (!cell?.turn) return false;
+    cell.turn = update(cell.turn);
+    return true;
+  }
+
   busy(): boolean {
-    return this.cells.some(cell => cell.status === 'running');
+    return this.activeRequest !== null;
+  }
+
+  clearRuns(): void {
+    this.runQueue = [];
+    this.activeRequest = null;
+    this.cells.forEach(cell => {
+      if (cell.status === 'queued') {
+        cell.status = 'idle';
+      } else if (cell.status === 'running') {
+        cell.status = 'interrupted';
+      }
+    });
+  }
+
+  startNewAgentContext(cellIds: string[] | null = []): number {
+    this.agentContextGeneration += 1;
+    this.agentSessionId = null;
+    if (cellIds !== null) {
+      this.agentContextBridges.push({
+        generation: this.agentContextGeneration,
+        cellIds: [...cellIds]
+      });
+    }
+    return this.agentContextGeneration;
+  }
+
+  setAgentContextBridge(
+    cellIds: string[],
+    generation = this.agentContextGeneration
+  ): void {
+    this.agentContextBridges = this.agentContextBridges.filter(
+      bridge => bridge.generation !== generation
+    );
+    this.agentContextBridges.push({
+      generation,
+      cellIds: [...cellIds]
+    });
+  }
+
+  commitRunContext(requestId: string): boolean {
+    const request = this.activeRequest;
+    if (
+      !request ||
+      request.id !== requestId ||
+      request.kind !== 'ai' ||
+      request.contextCommitted ||
+      request.agentContextGeneration === null
+    ) {
+      return false;
+    }
+    const cell = this.cells.find(candidate => candidate.id === request.cellId);
+    if (!cell) return false;
+    cell.agentContextGeneration = request.agentContextGeneration;
+    if (request.historyBridge) {
+      this.setAgentContextBridge(
+        request.historyBridge.turns.map(turn => turn.cellId),
+        request.agentContextGeneration
+      );
+    }
+    request.contextCommitted = true;
+    return true;
+  }
+
+  cancelQueuedRuns(cellId: string): void {
+    this.runQueue = this.runQueue.filter(request => request.cellId !== cellId);
+    if (this.activeRequest?.cellId === cellId) return;
+    const cell = this.cells.find(candidate => candidate.id === cellId);
+    if (cell?.status === 'queued') {
+      cell.status = 'idle';
+    }
   }
 
   toggleOutputCollapsed(index = this.active): void {
@@ -210,7 +474,7 @@ export class WorkspaceNotebook {
     ) {
       return last;
     }
-    const cell = createWorkspaceCell(last.kind);
+    const cell = this.createCell();
     this.cells.push(cell);
     return cell;
   }
@@ -222,8 +486,7 @@ export class WorkspaceNotebook {
     if (this.active < this.cells.length - 1) {
       this.active += 1;
     }
-    this.mode = 'edit';
-    this.insertKind = this.current.kind;
+    this.enterEdit();
     return this.current;
   }
 }
