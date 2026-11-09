@@ -947,8 +947,8 @@ describe('outcome Markdown copy', () => {
     );
     expect(button).not.toBeNull();
     expect(button!.type).toBe('button');
-    expect(button!.getAttribute('aria-label')).toBe('Copy Markdown');
-    expect(button!.textContent).toBe('Copy Markdown');
+    expect(button!.getAttribute('aria-label')).toBe('Copy');
+    expect(button!.textContent).toBe('Copy');
 
     button!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     await flush();

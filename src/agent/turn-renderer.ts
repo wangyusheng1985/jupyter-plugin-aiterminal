@@ -143,8 +143,8 @@ function renderOutcomeCopyControl(turn: ChatTurn, text: string): HTMLElement {
   button.dataset.turnControl = '';
   button.dataset.copyAction = 'outcome';
   // No translator is available here; mirror the fixed Lab copy wording.
-  button.setAttribute('aria-label', 'Copy Markdown'); // eslint-disable-line jupyter/no-untranslated-string
-  button.textContent = 'Copy Markdown';
+  button.setAttribute('aria-label', 'Copy'); // eslint-disable-line jupyter/no-untranslated-string
+  button.textContent = 'Copy';
 
   const status = document.createElement('span');
   status.className = 'jp-AgentWorkspace-outcomeCopyStatus';
