@@ -415,14 +415,6 @@
   font-family: var(--jp-code-font-family, monospace);
 }
 
-.jp-AgentWorkspace-outcomeBody.is-preview {
-  max-height: 30em;
-  overflow-x: hidden;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  scrollbar-gutter: stable;
-}
-
 .jp-AgentWorkspace-disclosure {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);

@@ -920,7 +920,7 @@ describe('AgentWorkspaceContent queue scheduling', () => {
     content.dispose();
   });
 
-  it('keeps a user-collapsed execution record collapsed across session updates', () => {
+  it('keeps a user-expanded execution record expanded across session updates', () => {
     const content = new AgentWorkspaceContent(null);
     const internals = content as unknown as WorkspaceInternals;
     content.notebook.setSource('first');
@@ -929,7 +929,7 @@ describe('AgentWorkspaceContent queue scheduling', () => {
     const cell = content.notebook.cells[0];
     const turnId = content.notebook.activeRun!.id;
     cell.turn = toggleTrace(setTurnStatus(createTurn(turnId), 'running', []));
-    expect(cell.turn.presentation.trace).toBe('collapsed');
+    expect(cell.turn.presentation.trace).toBe('expanded');
 
     content.session.blocks = [
       { kind: 'text', id: 'text-1', messageId: 'm1', text: 'working' }
@@ -940,14 +940,14 @@ describe('AgentWorkspaceContent queue scheduling', () => {
       content.session.blocks
     );
     internals.onSessionChange();
-    expect(cell.turn?.presentation.trace).toBe('collapsed');
+    expect(cell.turn?.presentation.trace).toBe('expanded');
 
     content.session.running = false;
     content.session.connected = true;
     content.session.error = null;
     internals.onSessionChange();
     expect(cell.status).toBe('done');
-    expect(cell.turn?.presentation.trace).toBe('collapsed');
+    expect(cell.turn?.presentation.trace).toBe('expanded');
 
     content.dispose();
   });
@@ -5034,6 +5034,7 @@ describe('effective configuration report', () => {
       ?.click();
 
     expect(onRefreshConfiguration).toHaveBeenCalledTimes(1);
+    status.dispose();
   });
 
   it('renders the session report and updates after a session change', () => {

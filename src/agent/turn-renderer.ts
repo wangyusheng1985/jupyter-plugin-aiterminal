@@ -14,7 +14,6 @@ export interface TurnRenderHandlers {
   onToggleTrace: (turnId: string) => void;
   onToggleActivity: (turnId: string, activityId: string) => void;
   onToggleEvidence: (turnId: string, activityId: string) => void;
-  onToggleOutcome: (turnId: string) => void;
   onRevealFailure: (turnId: string, activityId: string) => void;
   onRetry: (turnId: string) => void;
 }
@@ -24,8 +23,6 @@ export interface TurnRenderOptions {
   handlers: TurnRenderHandlers;
 }
 
-const OUTCOME_PREVIEW_LENGTH = 1800;
-const OUTCOME_PREVIEW_LINES = 24;
 const RUNNING_ACTIVITY_WINDOW = 3;
 
 export function renderTurn(
@@ -110,33 +107,11 @@ function renderOutcome(
   const section = document.createElement('section');
   section.className = 'jp-AgentWorkspace-outcome';
 
-  const long = isLongOutcome(turn.outcome);
-  const expanded = turn.presentation.outcomeExpanded;
   const body = document.createElement('div');
   body.className = 'jp-AgentWorkspace-outcomeBody';
   body.dataset.turnScrollKey = `outcome:${turn.id}`;
-  if (long && !expanded) {
-    body.classList.add('is-preview');
-    renderMarkdownSource(
-      body,
-      boundedOutcomePreview(turn.outcome),
-      options.rendermime ?? null
-    );
-  } else {
-    renderMarkdownSource(body, turn.outcome, options.rendermime ?? null);
-  }
+  renderMarkdownSource(body, turn.outcome, options.rendermime ?? null);
   section.append(body);
-
-  if (long) {
-    section.append(
-      disclosureButton(
-        expanded ? 'Show less' : 'Show full result',
-        expanded,
-        `outcome:${turn.id}`,
-        () => options.handlers.onToggleOutcome(turn.id)
-      )
-    );
-  }
   return section;
 }
 
@@ -625,24 +600,6 @@ function failureActivityIds(turn: ChatTurn): string[] {
 function firstLine(value: string): string {
   const line = value.trim().split('\n', 1)[0] ?? '';
   return line.length > 120 ? `${line.slice(0, 117)}...` : line;
-}
-
-function isLongOutcome(value: string): boolean {
-  return (
-    value.length > OUTCOME_PREVIEW_LENGTH ||
-    value.split('\n').length > OUTCOME_PREVIEW_LINES
-  );
-}
-
-function boundedOutcomePreview(value: string): string {
-  const lines = value.split('\n');
-  const lineBounded =
-    lines.length > OUTCOME_PREVIEW_LINES
-      ? lines.slice(0, OUTCOME_PREVIEW_LINES).join('\n')
-      : value;
-  return lineBounded.length > OUTCOME_PREVIEW_LENGTH
-    ? lineBounded.slice(0, OUTCOME_PREVIEW_LENGTH)
-    : lineBounded;
 }
 
 function formatDuration(value: number | undefined): string {

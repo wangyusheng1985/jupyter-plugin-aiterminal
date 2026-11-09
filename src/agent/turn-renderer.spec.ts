@@ -26,7 +26,6 @@ function handlers() {
     onToggleTrace: jest.fn(),
     onToggleActivity: jest.fn(),
     onToggleEvidence: jest.fn(),
-    onToggleOutcome: jest.fn(),
     onRevealFailure: jest.fn(),
     onRetry: jest.fn()
   };
@@ -80,6 +79,48 @@ describe('renderTurn', () => {
         ?.getAttribute('aria-expanded')
     ).toBe('false');
     expect(node.querySelector('.jp-AgentWorkspace-executionRecord')).toBeNull();
+  });
+
+  it('renders the complete outcome without preview or disclosure controls', () => {
+    const longText = Array.from(
+      { length: 60 },
+      (_, index) => `line ${index + 1}`
+    ).join('\n');
+    const turn = completedTurn([
+      { kind: 'text', id: 'text-long', text: longText }
+    ]);
+    const node = renderTurn(turn, { handlers: handlers() });
+    const body = node.querySelector('.jp-AgentWorkspace-outcomeBody');
+
+    expect(body?.textContent).toContain('line 1');
+    expect(body?.textContent).toContain('line 60');
+    expect(body?.classList.contains('is-preview')).toBe(false);
+    expect(node.querySelector('[data-turn-focus-key^="outcome:"]')).toBeNull();
+    expect(node.textContent).not.toContain('Show full result');
+    expect(node.textContent).not.toContain('Show less');
+  });
+
+  it('keeps terminal errors visible while the record stays collapsed', () => {
+    const blocks: ChatBlock[] = [
+      toolBlock('tool-1', { status: 'error', output: 'boom\n' })
+    ];
+    const turn = applyTurnEvent(createTurn('run-failed'), blocks, {
+      type: 'result',
+      turnId: 'run-failed',
+      text: '',
+      isError: true,
+      reason: 'failed',
+      durationMs: 900
+    });
+    const node = renderTurn(turn, { handlers: handlers() });
+
+    expect(node.querySelector('.jp-AgentWorkspace-executionRecord')).toBeNull();
+    expect(
+      node.querySelector('.jp-AgentWorkspace-terminalNotice')?.textContent
+    ).toBe('Run failed before producing a response.');
+    expect(node.querySelector('[data-failure-navigation]')?.textContent).toBe(
+      '1 step failed'
+    );
   });
 
   it('keeps representative Markdown semantics inside the scoped outcome', () => {
@@ -304,7 +345,7 @@ describe('renderTurn', () => {
         output: `file ${index + 1}\n`
       })
     );
-    const turn = deriveTurn(createTurn('run-1'), blocks);
+    const turn = toggleTrace(deriveTurn(createTurn('run-1'), blocks));
     const node = renderTurn(turn, { handlers: handlers() });
     const rows = node.querySelectorAll('.jp-AgentWorkspace-activity');
 
@@ -325,7 +366,7 @@ describe('renderTurn', () => {
         input: { file_path: `/tmp/file-${index + 1}.ts` }
       })
     );
-    let turn = deriveTurn(createTurn('run-1'), blocks);
+    let turn = toggleTrace(deriveTurn(createTurn('run-1'), blocks));
     turn = toggleActivity(turn, 'activity-tool-1');
     const node = renderTurn(turn, { handlers: handlers() });
     const first = node.querySelector('[data-activity-id="activity-tool-1"]');
@@ -336,19 +377,28 @@ describe('renderTurn', () => {
     ).not.toBeNull();
   });
 
-  it('collapses an automatic record on completion but preserves explicit expansion', () => {
+  it('defaults new and completed records collapsed but preserves explicit expansion', () => {
     const blocks: ChatBlock[] = [toolBlock('tool-1')];
     const running = deriveTurn(createTurn('run-1'), blocks);
     const completed = setTurnStatus(running, 'done', blocks);
-    const automatic = renderTurn(completed, { handlers: handlers() });
 
+    const runningNode = renderTurn(running, { handlers: handlers() });
+    expect(
+      runningNode.querySelector('.jp-AgentWorkspace-executionRecord')
+    ).toBeNull();
+    expect(
+      runningNode
+        .querySelector('[data-turn-focus-key="trace:run-1"]')
+        ?.getAttribute('aria-expanded')
+    ).toBe('false');
+
+    const automatic = renderTurn(completed, { handlers: handlers() });
     expect(
       automatic.querySelector('.jp-AgentWorkspace-executionRecord')
     ).toBeNull();
 
-    const explicitlyExpanded = toggleTrace(toggleTrace(running));
-    const stillExpanded = setTurnStatus(explicitlyExpanded, 'done', blocks);
-    const explicit = renderTurn(stillExpanded, { handlers: handlers() });
+    const explicitlyExpanded = toggleTrace(completed);
+    const explicit = renderTurn(explicitlyExpanded, { handlers: handlers() });
     expect(
       explicit.querySelector('.jp-AgentWorkspace-executionRecord')
     ).not.toBeNull();
@@ -567,7 +617,9 @@ describe('terminal reason notice', () => {
           '.jp-AgentWorkspace-terminalNotice'
         );
         expect(notice?.dataset.terminalReason).toBe(reason);
-        expect(notice?.textContent).not.toContain('without producing a response');
+        expect(notice?.textContent).not.toContain(
+          'without producing a response'
+        );
         expect(notice?.textContent).not.toContain(
           'before producing a response'
         );
@@ -667,9 +719,11 @@ describe('streaming text rendering', () => {
   });
 
   it('renders the running tail synchronously without Markdown parsing', () => {
-    const turn = deriveTurn(createTurn('run-1'), [
-      { kind: 'text', id: 'text-1', text: 'Hello stream' }
-    ]);
+    const turn = toggleTrace(
+      deriveTurn(createTurn('run-1'), [
+        { kind: 'text', id: 'text-1', text: 'Hello stream' }
+      ])
+    );
     const node = renderTurn(turn, {
       rendermime: {} as IRenderMimeRegistry,
       handlers: handlers()
@@ -683,9 +737,11 @@ describe('streaming text rendering', () => {
   });
 
   it('grows across deltas without duplicating the full text', () => {
-    const first = deriveTurn(createTurn('run-1'), [
-      { kind: 'text', id: 'text-1', text: 'Hello' }
-    ]);
+    const first = toggleTrace(
+      deriveTurn(createTurn('run-1'), [
+        { kind: 'text', id: 'text-1', text: 'Hello' }
+      ])
+    );
     const second = deriveTurn(first, [
       { kind: 'text', id: 'text-1', text: 'Hello world' }
     ]);
@@ -716,10 +772,12 @@ describe('streaming text rendering', () => {
   });
 
   it('turns a trailing text into stable Markdown once a tool starts', () => {
-    let turn = deriveTurn(createTurn('run-1'), [
-      { kind: 'text', id: 'text-1', text: 'Streaming so far' },
-      toolBlock('tool-1', { status: 'running' })
-    ]);
+    let turn = toggleTrace(
+      deriveTurn(createTurn('run-1'), [
+        { kind: 'text', id: 'text-1', text: 'Streaming so far' },
+        toolBlock('tool-1', { status: 'running' })
+      ])
+    );
     turn = toggleActivity(turn, 'activity-text-1');
     const node = renderTurn(turn, {
       rendermime: {} as IRenderMimeRegistry,
@@ -816,9 +874,11 @@ const done = false;</code></pre>
   });
 
   it('renders the running streamed tail as synchronous pre-wrapped text', () => {
-    const turn = deriveTurn(createTurn('run-1'), [
-      { kind: 'text', id: 'text-stream', text: 'Streaming answer.' }
-    ]);
+    const turn = toggleTrace(
+      deriveTurn(createTurn('run-1'), [
+        { kind: 'text', id: 'text-stream', text: 'Streaming answer.' }
+      ])
+    );
     const node = renderTurn(turn, {
       rendermime: {} as IRenderMimeRegistry,
       handlers: handlers()

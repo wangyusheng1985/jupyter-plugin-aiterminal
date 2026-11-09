@@ -8,7 +8,6 @@ import {
   restoreTurn,
   setTurnStatus,
   toggleActivity,
-  toggleOutcome,
   toggleTrace,
   toPersistedTurn
 } from './turn';
@@ -102,18 +101,16 @@ describe('ChatTurn', () => {
     expect(turn.diagnostics[0].tone).toBe('error');
   });
 
-  it('tracks automatic, explicit, activity, and outcome disclosure state', () => {
+  it('defaults the record collapsed and tracks explicit disclosure state', () => {
     const running = createTurn('run-1');
-    expect(isTraceExpanded(running)).toBe(true);
+    expect(isTraceExpanded(running)).toBe(false);
     expect(isTraceExpanded(setTurnStatus(running, 'done', []))).toBe(false);
 
     let turn = toggleTrace(running);
-    expect(turn.presentation.trace).toBe('collapsed');
-    expect(isTraceExpanded(turn)).toBe(false);
+    expect(turn.presentation.trace).toBe('expanded');
+    expect(isTraceExpanded(turn)).toBe(true);
     turn = toggleActivity(turn, 'activity-1');
     expect(turn.presentation.expandedActivityIds).toEqual(['activity-1']);
-    turn = toggleOutcome(turn);
-    expect(turn.presentation.outcomeExpanded).toBe(true);
   });
 
   it('reveals a failed activity and its record atomically', () => {
@@ -134,8 +131,30 @@ describe('ChatTurn', () => {
     expect(restored).toMatchObject({
       id: 'run-1',
       status: 'interrupted',
-      presentation: { trace: 'collapsed' }
+      presentation: { trace: 'expanded' }
     });
+  });
+
+  it('restores legacy auto and outcome disclosure as a collapsed record', () => {
+    const restored = restoreTurn({
+      id: 'legacy-1',
+      status: 'done',
+      resultText: 'old result',
+      resultIsError: false,
+      metrics: {},
+      presentation: {
+        trace: 'auto',
+        expandedActivityIds: [],
+        fullEvidenceActivityIds: [],
+        outcomeExpanded: true
+      } as never
+    });
+    expect(restored?.presentation).toEqual({
+      trace: 'collapsed',
+      expandedActivityIds: [],
+      fullEvidenceActivityIds: []
+    });
+    expect(isTraceExpanded(restored!)).toBe(false);
   });
 
   it('ignores events for another turn', () => {
@@ -149,9 +168,9 @@ describe('ChatTurn', () => {
     ).toBe(turn);
   });
 
-  it('preserves a user collapsed presentation only for the same turn', () => {
+  it('preserves a user expanded presentation only for the same turn', () => {
     const previous = toggleTrace(createTurn('run-1'));
-    expect(previous.presentation.trace).toBe('collapsed');
+    expect(previous.presentation.trace).toBe('expanded');
 
     const incoming = createTurn('run-1');
     expect(preserveTurnPresentation(incoming, previous).presentation).toEqual(
@@ -167,10 +186,10 @@ describe('ChatTurn', () => {
     const incoming = createTurn('run-9');
     expect(
       preserveTurnPresentation(incoming, previous).presentation.trace
-    ).toBe('collapsed');
+    ).toBe('expanded');
   });
 
-  it('leaves an untouched auto presentation alone', () => {
+  it('leaves an untouched default presentation alone', () => {
     const incoming = createTurn('run-1');
     const previous = createTurn('run-1');
     expect(preserveTurnPresentation(incoming, previous)).toBe(incoming);

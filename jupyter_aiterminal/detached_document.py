@@ -88,10 +88,9 @@ def save_detached_turn(
             existing_turn.get("presentation")
             if isinstance(existing_turn, dict) and isinstance(existing_turn.get("presentation"), dict)
             else {
-                "trace": "auto",
+                "trace": "collapsed",
                 "expandedActivityIds": [],
                 "fullEvidenceActivityIds": [],
-                "outcomeExpanded": False,
             }
         )
         turn: dict[str, Any] = {

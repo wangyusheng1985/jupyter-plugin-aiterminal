@@ -11,7 +11,7 @@ import {
   UnsupportedWorkspaceVersionError
 } from './document';
 import { WorkspaceNotebook } from './notebook';
-import { createTurn, setTurnStatus, toggleOutcome, toggleTrace } from './turn';
+import { createTurn, setTurnStatus, toggleTrace } from './turn';
 
 function contextCell(
   id: string,
@@ -633,7 +633,6 @@ describe('Agent Workspace document', () => {
       notebook.cells[0].blocks
     );
     turn = toggleTrace(turn);
-    turn = toggleOutcome(turn);
     turn.metrics = {
       durationMs: 2300,
       numTurns: 4,
@@ -654,8 +653,7 @@ describe('Agent Workspace document', () => {
         costUsd: 0.02
       },
       presentation: {
-        trace: 'expanded',
-        outcomeExpanded: true
+        trace: 'expanded'
       }
     });
 
@@ -666,8 +664,7 @@ describe('Agent Workspace document', () => {
       outcome: 'finished',
       timeline: [],
       presentation: {
-        trace: 'expanded',
-        outcomeExpanded: true
+        trace: 'expanded'
       },
       metrics: {
         durationMs: 2300,

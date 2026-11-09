@@ -2,7 +2,7 @@ import type { AgentServerEvent, ChatBlock, TerminalReason } from './protocol';
 import { presentTool, type ToolPresentation } from './tool-presenter';
 
 export type TurnStatus = 'running' | 'done' | 'interrupted' | 'error';
-export type TraceDisclosure = 'auto' | 'expanded' | 'collapsed';
+export type TraceDisclosure = 'expanded' | 'collapsed';
 export type OutcomeKind = 'result' | 'assistant' | 'tool' | 'none';
 
 export interface TurnMetrics {
@@ -17,7 +17,6 @@ export interface TurnPresentationState {
   trace: TraceDisclosure;
   expandedActivityIds: string[];
   fullEvidenceActivityIds: string[];
-  outcomeExpanded: boolean;
 }
 
 export interface AssistantActivity {
@@ -113,10 +112,9 @@ export function createTurn(id: string): ChatTurn {
     changes: [],
     metrics: {},
     presentation: {
-      trace: 'auto',
+      trace: 'collapsed',
       expandedActivityIds: [],
-      fullEvidenceActivityIds: [],
-      outcomeExpanded: false
+      fullEvidenceActivityIds: []
     },
     resultText: '',
     resultIsError: false,
@@ -201,7 +199,7 @@ export function preserveTurnPresentation(
   if (!previous) return incoming;
   const presentation = previous.presentation;
   const userAdjusted =
-    presentation.trace !== 'auto' ||
+    presentation.trace === 'expanded' ||
     presentation.expandedActivityIds.length > 0 ||
     presentation.fullEvidenceActivityIds.length > 0;
   if (!userAdjusted) return incoming;
@@ -300,9 +298,10 @@ export function terminalReasonMessage(
 }
 
 export function isTraceExpanded(turn: ChatTurn): boolean {
-  if (turn.presentation.trace === 'expanded') return true;
-  if (turn.presentation.trace === 'collapsed') return false;
-  return turn.status === 'running';
+  // The execution record stays hidden until the user explicitly opens it.
+  // Running and failed turns never expand it on their own; terminal errors
+  // stay visible through the terminal notice and the failure summary instead.
+  return turn.presentation.trace === 'expanded';
 }
 
 export function toggleTrace(turn: ChatTurn): ChatTurn {
@@ -343,17 +342,6 @@ export function toggleActivity(turn: ChatTurn, activityId: string): ChatTurn {
     presentation: {
       ...turn.presentation,
       expandedActivityIds: [...expanded]
-    },
-    revision: turn.revision + 1
-  };
-}
-
-export function toggleOutcome(turn: ChatTurn): ChatTurn {
-  return {
-    ...turn,
-    presentation: {
-      ...turn.presentation,
-      outcomeExpanded: !turn.presentation.outcomeExpanded
     },
     revision: turn.revision + 1
   };
@@ -597,12 +585,10 @@ function eventMetrics(
 function normalizePresentation(
   value: TurnPresentationState | null | undefined
 ): TurnPresentationState {
-  const trace =
-    value?.trace === 'expanded' || value?.trace === 'collapsed'
-      ? value.trace
-      : 'auto';
+  // Legacy documents may persist an `auto` trace or an `outcomeExpanded`
+  // flag; both resolve to the current default of a collapsed record.
   return {
-    trace,
+    trace: value?.trace === 'expanded' ? 'expanded' : 'collapsed',
     expandedActivityIds: Array.isArray(value?.expandedActivityIds)
       ? value.expandedActivityIds.filter(
           (id): id is string => typeof id === 'string'
@@ -612,8 +598,7 @@ function normalizePresentation(
       ? value.fullEvidenceActivityIds.filter(
           (id): id is string => typeof id === 'string'
         )
-      : [],
-    outcomeExpanded: Boolean(value?.outcomeExpanded)
+      : []
   };
 }
 

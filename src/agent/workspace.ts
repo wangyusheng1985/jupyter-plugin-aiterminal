@@ -52,7 +52,6 @@ import {
   setTurnStatus,
   toggleActivity,
   toggleEvidence,
-  toggleOutcome,
   toggleTrace,
   type ChatTurn
 } from './turn';
@@ -107,7 +106,6 @@ export interface CellHandlers {
     turnId: string,
     activityId: string
   ) => void;
-  onToggleTurnOutcome?: (cellId: string, turnId: string) => void;
   onRevealTurnFailure?: (
     cellId: string,
     turnId: string,
@@ -216,8 +214,6 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
         this.updateTurn(cellId, turnId, turn =>
           toggleEvidence(turn, activityId)
         ),
-      onToggleTurnOutcome: (cellId, turnId) =>
-        this.updateTurn(cellId, turnId, toggleOutcome),
       onRevealTurnFailure: (cellId, turnId, activityId) =>
         this.revealTurnFailure(cellId, turnId, activityId),
       onRetryTurn: (cellId, turnId) => this.prepareRetry(cellId, turnId),
@@ -612,7 +608,7 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     const scrollTop = scrollNode.scrollTop;
     cell.turn = update(turn);
     // Mirror the user's presentation choice into the session turn so later
-    // events derive from it instead of re-expanding via the 'auto' default.
+    // events derive from it instead of falling back to the collapsed default.
     if (
       this.session.turn &&
       (this.session.turn.id === turnId ||
@@ -1963,8 +1959,6 @@ export class CellView {
         this.handlers.onToggleTurnActivity?.(this.id, turnId, activityId),
       onToggleEvidence: (turnId, activityId) =>
         this.handlers.onToggleTurnEvidence?.(this.id, turnId, activityId),
-      onToggleOutcome: turnId =>
-        this.handlers.onToggleTurnOutcome?.(this.id, turnId),
       onRevealFailure: (turnId, activityId) =>
         this.handlers.onRevealTurnFailure?.(this.id, turnId, activityId),
       onRetry: turnId => this.handlers.onRetryTurn?.(this.id, turnId)
@@ -2758,7 +2752,6 @@ function noopTurnHandlers(): TurnRenderHandlers {
     onToggleTrace: () => undefined,
     onToggleActivity: () => undefined,
     onToggleEvidence: () => undefined,
-    onToggleOutcome: () => undefined,
     onRevealFailure: () => undefined,
     onRetry: () => undefined
   };
