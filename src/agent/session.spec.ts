@@ -1020,3 +1020,135 @@ describe('AgentSession DSH channel', () => {
     expect(session.dshSessionId).toBeNull();
   });
 });
+
+describe('AgentSession configuration channel', () => {
+  function validReport(
+    overrides: Record<string, unknown> = {}
+  ): Record<string, unknown> {
+    return {
+      runtimeLifetime: 'dsh-runtime-1',
+      generation: 2,
+      state: 'active',
+      active: { contextWindow: 131072, maxOutputTokens: 8192 },
+      desired: { contextWindow: 131072, maxOutputTokens: 4096 },
+      differences: { maxOutputTokens: { active: 8192, desired: 4096 } },
+      compaction: 'disabled',
+      preflightApplied: true,
+      ...overrides
+    };
+  }
+
+  function emit(socket: FakeWebSocket, payload: unknown): void {
+    socket.onmessage?.({
+      data: typeof payload === 'string' ? payload : JSON.stringify(payload)
+    });
+  }
+
+  it('receives a validated report without touching turn, busy, or context', () => {
+    const { session, socket } = sessionWithSocket();
+    socket.open();
+    session.sendUser('run it', 'run-1');
+    const blocksRef = session.blocks;
+    const turnRef = session.turn;
+    const contextRef = session.contextState;
+    const sessionIdRef = session.sessionId;
+
+    emit(socket, { type: 'configuration', report: validReport() });
+
+    expect(session.configurationReport).toEqual(validReport());
+    expect(session.configurationError).toBeNull();
+    expect(session.blocks).toBe(blocksRef);
+    expect(session.turn).toBe(turnRef);
+    expect(session.running).toBe(true);
+    expect(session.contextState).toBe(contextRef);
+    expect(session.sessionId).toBe(sessionIdRef);
+  });
+
+  it('ignores a malformed report instead of clearing the last one', () => {
+    const { session, socket } = sessionWithSocket();
+    socket.open();
+    emit(socket, { type: 'configuration', report: validReport() });
+    const accepted = session.configurationReport;
+
+    emit(socket, {
+      type: 'configuration',
+      report: { ...validReport(), state: 'observed' }
+    });
+
+    expect(session.configurationReport).toBe(accepted);
+  });
+
+  it('surfaces only fixed copy for a configuration-error and keeps state', () => {
+    const { session, socket } = sessionWithSocket();
+    socket.open();
+    session.sendUser('run it', 'run-1');
+    const blocksRef = session.blocks;
+    const turnRef = session.turn;
+    const contextRef = session.contextState;
+
+    emit(socket, {
+      type: 'configuration-error',
+      message: 'failed for token sk-live-123 with baseUrl https://user:pass@host'
+    });
+
+    expect(session.configurationError).toContain(
+      'configuration could not be refreshed'
+    );
+    expect(session.configurationError).not.toContain('sk-live-123');
+    expect(session.configurationError).not.toContain('user:pass');
+    expect(session.blocks).toBe(blocksRef);
+    expect(session.turn).toBe(turnRef);
+    expect(session.running).toBe(true);
+    expect(session.error).toBeNull();
+    expect(session.contextState).toBe(contextRef);
+  });
+
+  it('clears the side error once a valid report arrives', () => {
+    const { session, socket } = sessionWithSocket();
+    socket.open();
+
+    emit(socket, { type: 'configuration-error' });
+    expect(session.configurationError).not.toBeNull();
+
+    emit(socket, { type: 'configuration', report: validReport() });
+    expect(session.configurationError).toBeNull();
+    expect(session.configurationReport).toEqual(validReport());
+  });
+
+  it('requests configuration with only the request frame when open', () => {
+    const { session, socket } = sessionWithSocket();
+    socket.open();
+
+    expect(session.requestConfiguration()).toBe(true);
+
+    expect(socket.sent).toEqual([
+      JSON.stringify({ type: 'configuration' })
+    ]);
+  });
+
+  it('returns false and never queues or opens a socket when unavailable', () => {
+    const created: FakeWebSocket[] = [];
+    const session = new AgentSession({
+      wsUrl: 'ws://example',
+      WebSocket: class extends FakeWebSocket {
+        constructor(url: string) {
+          super(url);
+          created.push(this);
+        }
+      },
+      appendToken: false,
+      token: ''
+    } as never);
+
+    // No socket exists yet: the request must not create one.
+    expect(session.requestConfiguration()).toBe(false);
+    expect(created).toHaveLength(0);
+
+    // Still connecting: the frame is dropped, not queued for `onopen`.
+    session.connect();
+    expect(session.requestConfiguration()).toBe(false);
+    expect(created).toHaveLength(1);
+    created[0].open();
+    expect(created[0].sent).toEqual([]);
+  });
+});

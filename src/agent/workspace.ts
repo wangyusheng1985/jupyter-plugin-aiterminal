@@ -34,11 +34,20 @@ import { WorkspaceSaveCoordinator } from './save-coordinator';
 import { SelectionCopyButton } from './selectioncopy';
 import { formatToolInput } from './tool';
 import type { AgentToolbarHost } from './toolbar';
-import type { ChatBlock, DshProductEvent } from './protocol';
+import type {
+  BudgetFieldName,
+  BudgetProvenanceEntry,
+  BudgetSnapshot,
+  ChatBlock,
+  ConfigurationDifferenceValue,
+  ConfigurationReport,
+  DshProductEvent
+} from './protocol';
 import { renderTurn, type TurnRenderHandlers } from './turn-renderer';
 import {
   createTurn,
   deriveTurn,
+  preserveTurnPresentation,
   revealFailedActivity,
   setTurnStatus,
   toggleActivity,
@@ -242,6 +251,7 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
       onRevealFailure: cellId => this.navigateToCell(cellId),
       onRevealInterrupted: cellId => this.navigateToCell(cellId),
       onOpenHistory: () => this.navigatorView.openHistory(),
+      onRefreshConfiguration: () => this.requestConfigurationRefresh(),
       onRetrySave: () => {
         void this.saveCoordinator.retry().catch(() => undefined);
       }
@@ -374,6 +384,7 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
         this.inputHistory.restore(this.historyStorage.load(context.path));
         this.applyModel();
         if (!this.documentLoadErrorState) {
+          this.session.configureWorkspacePath(context.path);
           this.session.configureContext(this.notebook.agentSessionId);
           this.configureDshSessionFromDocument();
           if (!context.model.toString().trim()) {
@@ -600,6 +611,15 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     const anchorTop = anchor?.getBoundingClientRect().top ?? null;
     const scrollTop = scrollNode.scrollTop;
     cell.turn = update(turn);
+    // Mirror the user's presentation choice into the session turn so later
+    // events derive from it instead of re-expanding via the 'auto' default.
+    if (
+      this.session.turn &&
+      (this.session.turn.id === turnId ||
+        this.notebook.activeRun?.cellId === cellId)
+    ) {
+      this.session.turn = update(this.session.turn);
+    }
     this.refresh();
     if (focusKey !== null && anchorTop !== null) {
       const next = this.notebookView.toggleElement(focusKey);
@@ -763,12 +783,6 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     if (
       resolveRunExecution(source, this.notebook.current.kind)?.kind === 'ai'
     ) {
-      if (this.pendingContextSubmission) {
-        this.status.setMessage(
-          'Resolve the pending context choice before submitting again.'
-        );
-        return;
-      }
       const membership = this.contextMembership();
       const visibleAiCount =
         membership.nativeCount +
@@ -778,13 +792,25 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
       const choiceCount = unavailable
         ? visibleAiCount
         : membership.outsideCount;
+      if (this.pendingContextSubmission) {
+        // A repeated submit while a choice is pending must never look like a
+        // dead editor: reopen the choice panel and put focus back on it.
+        this.promptContextChoice(
+          choiceCount,
+          unavailable ? 'unavailable' : 'uncovered',
+          unavailable
+            ? 'The saved Agent context is unavailable. Resolve the pending context choice before submitting again.'
+            : 'Resolve the pending context choice before submitting again.'
+        );
+        return;
+      }
       if (choiceCount > 0 && (unavailable || !membership.policyChosen)) {
         this.pendingContextSubmission = {
           cellId: this.notebook.current.id,
           source,
           advance
         };
-        this.status.openHistoryChoice(
+        this.promptContextChoice(
           choiceCount,
           unavailable ? 'unavailable' : 'uncovered'
         );
@@ -798,6 +824,19 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
       }
     }
     this.acceptRun(this.notebook.active, advance);
+  }
+
+  private promptContextChoice(
+    choiceCount: number,
+    reason: HistoryChoiceReason,
+    message?: string
+  ): void {
+    if (message) {
+      this.status.setMessage(message);
+    }
+    if (choiceCount > 0) {
+      this.status.openHistoryChoice(choiceCount, reason);
+    }
   }
 
   private acceptRun(
@@ -926,7 +965,16 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     }
     this.followState = syncFollowRequest(this.followState, request.id);
     this.refresh();
+    if (!this.session.connected) {
+      // A drained run must not look frozen when no socket exists: reconnect
+      // explicitly and state the transport wait in the status bar.
+      this.session.connect();
+      this.status.setMessage(
+        'Connecting to the Agent server before sending the queued run…'
+      );
+    }
     if (request.kind === 'ai') {
+      this.session.activeCellId = request.cellId;
       if (request.historyBridge) {
         this.session.sendUser(
           request.source,
@@ -1005,10 +1053,13 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
       if (index >= 0) {
         const cell = this.notebook.cells[index];
         if (request.kind === 'ai') {
+          const previousTurn = cell.turn;
           cell.blocks = this.session.blocks;
-          cell.turn =
+          cell.turn = preserveTurnPresentation(
             this.session.turn ??
-            deriveTurn(createTurn(request.id), this.session.blocks);
+              deriveTurn(createTurn(request.id), this.session.blocks),
+            previousTurn
+          );
           if (!this.session.running) {
             if (this.pendingContextAcceptance?.id === request.id) {
               this.finishContextAcceptance(request);
@@ -1019,10 +1070,13 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
               !this.session.connected
                 ? 'interrupted'
                 : 'done';
-            cell.turn = setTurnStatus(
-              cell.turn,
-              cell.status === 'interrupted' ? 'interrupted' : 'done',
-              cell.blocks
+            cell.turn = preserveTurnPresentation(
+              setTurnStatus(
+                cell.turn,
+                cell.status === 'interrupted' ? 'interrupted' : 'done',
+                cell.blocks
+              ),
+              previousTurn
             );
             this.finishRun(
               request.id,
@@ -1266,7 +1320,12 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
 
   private syncWorkspaceChrome(): void {
     const state = this.uiState;
-    this.status.sync(state, workspaceOverview(this.notebook.cells));
+    this.status.sync(
+      state,
+      workspaceOverview(this.notebook.cells),
+      this.session.configurationReport,
+      this.session.configurationError
+    );
     if (this.documentLoadErrorState) {
       // A load protection notice must stay visible across refreshes, unlike a
       // transient status message that the next sync would replace.
@@ -1310,6 +1369,19 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     if (key === this.lastUiStateKey) return;
     this.lastUiStateKey = key;
     this.uiListeners.forEach(listener => listener(state));
+  }
+
+  /**
+   * Configuration refresh is best effort and never opens a connection. A
+   * dropped request is reported explicitly so the button cannot look like a
+   * success when nothing was sent.
+   */
+  private requestConfigurationRefresh(): void {
+    if (this.session.requestConfiguration() === false) {
+      this.status.setMessage(
+        'The Agent server is not connected, so configuration cannot be refreshed. Refreshing never opens a connection.'
+      );
+    }
   }
 
   private startNewContext(): void {
@@ -1638,7 +1710,6 @@ export class CellView {
     this.node = document.createElement('div');
     this.node.className = 'jp-AgentWorkspace-cell';
     this.node.dataset.cellId = this.id;
-    this.node.tabIndex = -1;
     this.node.addEventListener('mousedown', event => {
       if (event.button !== 0) return;
       const target = event.target;
@@ -1681,8 +1752,9 @@ export class CellView {
       }
     });
     this.editor.addEventListener('focus', () => {
-      if (this.editor.readOnly) return;
-      if (this.node.classList.contains('is-active')) return;
+      if (this.node.classList.contains('is-active') && !this.editor.readOnly) {
+        return;
+      }
       this.handlers.onSelect(this.index);
     });
     inputRow.append(this.inputCollapser, this.inputPrompt, this.editor);
@@ -1707,11 +1779,9 @@ export class CellView {
   ): void {
     this.index = index;
     const active = index === notebook.active;
-    const editable = notebook.isEditable(index);
-    const editing = !readOnly && active && editable && notebook.mode === 'edit';
+    const editing = !readOnly && active && notebook.mode === 'edit';
     this.node.classList.toggle('is-active', active);
     this.node.classList.toggle('is-edit', editing);
-    this.node.classList.toggle('is-readonly', !editable || readOnly);
     this.node.classList.toggle('is-collapsed', cell.outputCollapsed);
     setPrompt(this.inputPrompt, cell);
     if (
@@ -1730,17 +1800,7 @@ export class CellView {
   }
 
   focus(options: { preventScroll?: boolean } = {}): void {
-    if (this.editor.readOnly) {
-      const target =
-        this.outputBody && !this.outputBody.hidden
-          ? this.outputBody
-          : this.node;
-      target.focus({ preventScroll: true });
-      if (!options.preventScroll) {
-        target.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-      }
-      return;
-    }
+    if (this.editor.readOnly) return;
     this.editor.focus({ preventScroll: true });
     if (!options.preventScroll) {
       this.editor.scrollIntoView({ block: 'nearest', inline: 'nearest' });
@@ -1940,6 +2000,7 @@ export interface StatusBarHandlers {
   onRevealFailure: (cellId: string) => void;
   onRevealInterrupted: (cellId: string) => void;
   onOpenHistory: () => void;
+  onRefreshConfiguration: () => void;
   onRetrySave: () => void;
 }
 
@@ -1957,6 +2018,10 @@ export class StatusBar extends Widget {
   private readonly contextPopover: HTMLDivElement;
   private readonly contextDescription: HTMLDivElement;
   private readonly resetContextButton: HTMLButtonElement;
+  private readonly configurationDetails: HTMLDetailsElement;
+  private readonly configurationContent: HTMLDivElement;
+  private readonly configurationError: HTMLDivElement;
+  private lastConfigurationKey = '';
   private readonly historyChoice: HTMLDivElement;
   private readonly historyChoiceDescription: HTMLDivElement;
   private readonly continueHistoryButton: HTMLButtonElement;
@@ -1974,6 +2039,7 @@ export class StatusBar extends Widget {
       onRevealFailure: () => undefined,
       onRevealInterrupted: () => undefined,
       onOpenHistory: () => undefined,
+      onRefreshConfiguration: () => undefined,
       onRetrySave: () => undefined
     }
   ) {
@@ -2055,6 +2121,32 @@ export class StatusBar extends Widget {
       this.setContextOpen(false);
       this.handlers.onStartNewContext();
     });
+    this.configurationDetails = document.createElement('details');
+    this.configurationDetails.className = 'jp-AgentWorkspace-configuration';
+    const configurationSummary = document.createElement('summary');
+    configurationSummary.textContent = 'Effective configuration';
+    const refreshConfigurationButton = document.createElement('button');
+    refreshConfigurationButton.type = 'button';
+    refreshConfigurationButton.className =
+      'jp-AgentWorkspace-refreshConfiguration';
+    refreshConfigurationButton.textContent = 'Refresh configuration';
+    refreshConfigurationButton.addEventListener('click', () => {
+      this.handlers.onRefreshConfiguration();
+    });
+    this.configurationContent = document.createElement('div');
+    this.configurationContent.className =
+      'jp-AgentWorkspace-configurationContent';
+    this.configurationError = document.createElement('div');
+    this.configurationError.className = 'jp-AgentWorkspace-configurationError';
+    this.configurationError.setAttribute('role', 'status');
+    this.configurationError.setAttribute('aria-live', 'polite');
+    this.configurationError.setAttribute('aria-atomic', 'true');
+    this.configurationError.hidden = true;
+    this.configurationDetails.append(
+      configurationSummary,
+      refreshConfigurationButton,
+      this.configurationContent
+    );
     this.historyChoice = document.createElement('div');
     this.historyChoice.className = 'jp-AgentWorkspace-historyChoice';
     this.historyChoice.setAttribute('role', 'group');
@@ -2092,6 +2184,7 @@ export class StatusBar extends Widget {
     this.contextPopover.append(
       this.contextDescription,
       this.resetContextButton,
+      this.configurationDetails,
       this.historyChoice
     );
     this.node.addEventListener('keydown', event => {
@@ -2118,7 +2211,13 @@ export class StatusBar extends Widget {
     );
   }
 
-  sync(state: WorkspaceUiState, overview = workspaceOverview([])): void {
+  sync(
+    state: WorkspaceUiState,
+    overview = workspaceOverview([]),
+    configuration: ConfigurationReport | null = null,
+    configurationError: string | null = null
+  ): void {
+    this.syncConfiguration(configuration, configurationError);
     const key = `${workspaceUiStateKey(state)}|${JSON.stringify(overview)}`;
     if (key === this.lastSyncKey) return;
     this.lastSyncKey = key;
@@ -2154,6 +2253,26 @@ export class StatusBar extends Widget {
   setMessage(message: string): void {
     this.lastSyncKey = '';
     this.execution.textContent = message;
+  }
+
+  private syncConfiguration(
+    configuration: ConfigurationReport | null,
+    error: string | null
+  ): void {
+    const key = `${
+      configuration ? JSON.stringify(configuration) : 'unavailable'
+    }|${error ?? ''}`;
+    if (key === this.lastConfigurationKey) return;
+    this.lastConfigurationKey = key;
+    // The failure notice is its own persistent row: the last validated report
+    // (if any) stays rendered instead of being replaced by the error, and only
+    // the frontend message reaches the DOM, never raw server text.
+    this.configurationError.textContent = error ?? '';
+    this.configurationError.hidden = error === null;
+    this.configurationContent.replaceChildren(
+      this.configurationError,
+      ...renderConfigurationReport(configuration)
+    );
   }
 
   containsFocus(): boolean {
@@ -2255,6 +2374,250 @@ function contextDescription(state: WorkspaceUiState): string {
   const outsideCount = state.contextOutsideCount ?? 0;
   if (!nativeCount && !bridgedCount && !outsideCount) return description;
   return `${description} Coverage: ${nativeCount} native, ${bridgedCount} bridged, ${outsideCount} outside.`;
+}
+
+function configurationLine(label: string, value: string): HTMLElement {
+  const row = document.createElement('div');
+  row.className = 'jp-AgentWorkspace-configurationLine';
+  const labelNode = document.createElement('span');
+  labelNode.className = 'jp-AgentWorkspace-configurationLabel';
+  labelNode.textContent = label;
+  const valueNode = document.createElement('span');
+  valueNode.className = 'jp-AgentWorkspace-configurationValue';
+  valueNode.textContent = value;
+  row.append(labelNode, valueNode);
+  return row;
+}
+
+function configurationHeading(text: string): HTMLElement {
+  const heading = document.createElement('div');
+  heading.className = 'jp-AgentWorkspace-configurationHeading';
+  heading.textContent = text;
+  return heading;
+}
+
+function configurationStateLabel(state: ConfigurationReport['state']): string {
+  switch (state) {
+    case 'active':
+      return 'Active: these values are applied to the currently running runtime.';
+    case 'pending-next-runtime':
+      return 'Pending next runtime: saved changes are not active now. They apply only when the runtime next starts normally, for example after an administrator explicitly restarts Jupyter. A new session does not activate them, and this panel never restarts or interrupts the runtime.';
+    case 'not-started':
+      return 'Not started: the runtime has not started, so no active configuration is applied yet.';
+    case 'snapshot-unavailable':
+      return 'Snapshot unavailable: the runtime did not report effective values, so active and desired values cannot be shown.';
+  }
+}
+
+function configurationCompactionLabel(
+  compaction: ConfigurationReport['compaction']
+): string {
+  return compaction === 'disabled'
+    ? 'Compaction: disabled was reported for this runtime.'
+    : 'Compaction: not observable. The runtime did not prove whether compaction is active.';
+}
+
+function formatDifferenceValue(value: ConfigurationDifferenceValue): string {
+  if (value === null) return 'none';
+  if (Array.isArray(value)) return value.length ? value.join(', ') : 'none';
+  if (typeof value === 'object') {
+    return Object.entries(value)
+      .map(([key, leaf]) => `${key}: ${formatDifferenceValue(leaf)}`)
+      .join(', ');
+  }
+  return String(value);
+}
+
+function appendBudgetSnapshot(
+  parent: HTMLElement,
+  title: string,
+  snapshot: BudgetSnapshot | null
+): void {
+  parent.append(configurationHeading(title));
+  if (!snapshot) {
+    parent.append(configurationLine('Values', 'Not reported by the runtime.'));
+    return;
+  }
+  if (snapshot.contextWindow !== undefined) {
+    parent.append(
+      configurationLine(
+        'Context window',
+        `${snapshot.contextWindow} tokens (declared metadata, not measured capacity)`
+      )
+    );
+  }
+  if (snapshot.maxOutputTokens !== undefined) {
+    parent.append(
+      configurationLine('Max output tokens', String(snapshot.maxOutputTokens))
+    );
+  }
+  const compaction = snapshot.compaction;
+  if (compaction) {
+    if (compaction.enabled !== undefined) {
+      parent.append(
+        configurationLine(
+          'Compaction enabled',
+          compaction.enabled ? 'yes' : 'no'
+        )
+      );
+    }
+    if (compaction.thresholdRatio !== undefined) {
+      parent.append(
+        configurationLine(
+          'Compaction threshold ratio',
+          String(compaction.thresholdRatio)
+        )
+      );
+    }
+    if (compaction.headroom !== undefined) {
+      parent.append(
+        configurationLine('Compaction headroom', String(compaction.headroom))
+      );
+    }
+    if (compaction.retainRatio !== undefined) {
+      parent.append(
+        configurationLine(
+          'Compaction retain ratio',
+          String(compaction.retainRatio)
+        )
+      );
+    }
+    if (compaction.summaryMaxTokens !== undefined) {
+      parent.append(
+        configurationLine(
+          'Compaction summary max tokens',
+          String(compaction.summaryMaxTokens)
+        )
+      );
+    }
+  }
+  const computed = snapshot.computed;
+  if (computed) {
+    if (computed.messageBudget !== undefined) {
+      parent.append(
+        configurationLine(
+          'Computed message budget',
+          String(computed.messageBudget)
+        )
+      );
+    }
+    if (computed.pressure !== undefined) {
+      parent.append(
+        configurationLine('Computed pressure', String(computed.pressure))
+      );
+    }
+    if (computed.threshold !== undefined) {
+      parent.append(
+        configurationLine('Computed threshold', String(computed.threshold))
+      );
+    }
+    if (computed.retain !== undefined) {
+      parent.append(
+        configurationLine('Computed retain', String(computed.retain))
+      );
+    }
+  }
+  const provenance = snapshot.provenance;
+  if (provenance) {
+    const entries = Object.entries(provenance) as [
+      BudgetFieldName,
+      BudgetProvenanceEntry
+    ][];
+    entries
+      .sort(([left], [right]) => left.localeCompare(right))
+      .forEach(([field, entry]) => {
+        const derived = entry.derivedFrom?.length
+          ? ` (derived from ${entry.derivedFrom.join(', ')})`
+          : '';
+        parent.append(
+          configurationLine(`Provenance ${field}`, `${entry.source}${derived}`)
+        );
+      });
+  }
+}
+
+/**
+ * Render only validated, presentation-safe report fields with textContent.
+ * No raw settings, tokens, or unknown keys can reach the DOM: the report was
+ * already projected onto the protocol whitelist before it arrived here.
+ */
+function renderConfigurationReport(
+  report: ConfigurationReport | null
+): HTMLElement[] {
+  if (!report) {
+    const unavailable = document.createElement('div');
+    unavailable.className = 'jp-AgentWorkspace-configurationUnavailable';
+    unavailable.textContent =
+      'Effective configuration is unavailable until the runtime reports it. No values are inferred.';
+    return [unavailable];
+  }
+  const nodes: HTMLElement[] = [];
+  const stateNode = document.createElement('div');
+  stateNode.className = 'jp-AgentWorkspace-configurationState';
+  stateNode.textContent = configurationStateLabel(report.state);
+  nodes.push(
+    configurationLine('Runtime lifetime', report.runtimeLifetime),
+    configurationLine('Configuration generation', String(report.generation)),
+    stateNode,
+    configurationLine(
+      'Preflight applied',
+      report.preflightApplied ? 'yes' : 'no'
+    )
+  );
+
+  const activeSection = document.createElement('div');
+  activeSection.className = 'jp-AgentWorkspace-configurationSnapshot';
+  appendBudgetSnapshot(
+    activeSection,
+    'Active (current runtime)',
+    report.active
+  );
+  nodes.push(activeSection);
+
+  const desiredSection = document.createElement('div');
+  desiredSection.className = 'jp-AgentWorkspace-configurationSnapshot';
+  appendBudgetSnapshot(
+    desiredSection,
+    'Desired (saved settings)',
+    report.desired
+  );
+  nodes.push(desiredSection);
+
+  nodes.push(
+    configurationLine(
+      'Compaction observation',
+      configurationCompactionLabel(report.compaction)
+    )
+  );
+
+  const differencePaths = Object.keys(report.differences)
+    // An empty path is a valid report key but renders as a blank label, so it
+    // is skipped instead of producing an unlabeled difference row.
+    .filter(path => path.trim() !== '')
+    .sort();
+  nodes.push(configurationHeading('Differences'));
+  if (!differencePaths.length) {
+    nodes.push(configurationLine('Reported', 'No differences.'));
+  } else {
+    differencePaths.forEach(path => {
+      const difference = report.differences[path];
+      nodes.push(
+        configurationLine(
+          path,
+          `${formatDifferenceValue(
+            difference.active
+          )} → ${formatDifferenceValue(difference.desired)}`
+        )
+      );
+    });
+  }
+
+  const capacityNote = document.createElement('div');
+  capacityNote.className = 'jp-AgentWorkspace-configurationNote';
+  capacityNote.textContent =
+    'Context window is declared metadata, not measured capacity. A larger budget does not repair gateway or provider truncation.';
+  nodes.push(capacityNote);
+  return nodes;
 }
 
 export function runningIndicatorNode(): HTMLElement {

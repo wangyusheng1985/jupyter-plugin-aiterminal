@@ -9,44 +9,6 @@ describe('WorkspaceNotebook', () => {
     expect(notebook.mode).toBe('edit');
   });
 
-  it('makes running and finished cells read-only', () => {
-    const notebook = new WorkspaceNotebook();
-    notebook.setSource('pwd');
-    const request = notebook.enqueueRun();
-    expect(notebook.isEditable()).toBe(true);
-    notebook.promoteNextRun();
-    expect(notebook.isEditable()).toBe(false);
-    notebook.enterEdit();
-    expect(notebook.mode).toBe('command');
-    notebook.setSource('rm -rf /');
-    expect(notebook.current.source).toBe('pwd');
-    expect(notebook.setDraftKind('command')).toBeNull();
-    notebook.finishRun(request?.id ?? '', 'done');
-    expect(notebook.isEditable()).toBe(false);
-    notebook.setSource('ls');
-    expect(notebook.current.source).toBe('pwd');
-  });
-
-  it('does not enter edit mode when advancing into a historical cell', () => {
-    const notebook = new WorkspaceNotebook();
-    notebook.setSource('first');
-    const first = notebook.enqueueRun();
-    notebook.promoteNextRun();
-    notebook.finishRun(first?.id ?? '', 'one');
-    notebook.insertBelow();
-    notebook.setSource('second');
-    const second = notebook.enqueueRun();
-    notebook.promoteNextRun();
-    notebook.finishRun(second?.id ?? '', 'two');
-    notebook.select(0);
-
-    notebook.advanceAfterRun();
-
-    expect(notebook.active).toBe(1);
-    expect(notebook.isEditable()).toBe(false);
-    expect(notebook.mode).toBe('command');
-  });
-
   it('inserts above and below the active cell', () => {
     const notebook = new WorkspaceNotebook();
     notebook.setSource('pwd');
@@ -247,7 +209,6 @@ describe('WorkspaceNotebook', () => {
     expect(notebook.commitRunContext(request?.id ?? '')).toBe(false);
 
     notebook.clearRuns();
-    notebook.insertBelow();
     notebook.setSource('!pwd');
     expect(notebook.enqueueRun()).toMatchObject({ kind: 'command' });
     expect(notebook.current.agentContextGeneration).toBeNull();

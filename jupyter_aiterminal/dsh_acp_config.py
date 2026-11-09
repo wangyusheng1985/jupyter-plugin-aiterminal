@@ -48,17 +48,13 @@ from .dsh_config import (
     DSH_API_KEY_ENV,
     DSH_PLUGIN_ID,
     DSH_PROVIDER_ID,
+    DerivedBudget,
     DshProviderConfig,
     _validate_config_snapshot,
 )
 from .settings import AgentConfigError
 
 ACP_PROFILE = "acp"
-
-# Conservative cap for the ACP overlay. The value is metadata for the provider
-# snapshot, not a measured model window, and is intentionally not raised above
-# the provider default.
-ACP_MAX_OUTPUT_TOKENS_CAP = 4096
 
 # Rows that exist in the shipped ACP profile. Only these ids are patched; the
 # module never inserts a row, so a typo cannot create a new plugin.
@@ -67,6 +63,11 @@ ACP_ROW_ACP = "acp"
 ACP_ROW_APPROVAL = "approval"
 ACP_ROW_SANDBOX_POLICY = "sandbox-policy"
 ACP_ROW_TOOL_FS = "tool-fs"
+# ``compaction-basic`` is already enabled in the shipped profile; the overlay
+# patches its config in place. ``token-meter`` is likewise already enabled and
+# is deliberately left without a config: the pinned runtime rejects a config
+# patch against its empty schema.
+ACP_ROW_COMPACTION = "compaction-basic"
 
 # Tool/service rows kept out of the ACP agent surface. The ACP profile is meant
 # for basic file plus shell work; web, jobs, subagents, workflows, skills,
@@ -183,8 +184,9 @@ def build_acp_session_params(
     return {"cwd": os.fspath(Path(os.path.abspath(root))), "mcpServers": []}
 
 
-def _provider_row(config: DshProviderConfig) -> dict[str, Any]:
-    max_output = min(config.max_output_tokens, ACP_MAX_OUTPUT_TOKENS_CAP)
+def _provider_row(config: DshProviderConfig, budget: DerivedBudget) -> dict[str, Any]:
+    # C (context window) and O (maximum output tokens) come only from the one
+    # derived budget; this overlay never recomputes or clamps them.
     return {
         "id": DSH_PLUGIN_ID,
         "config": {
@@ -197,17 +199,32 @@ def _provider_row(config: DshProviderConfig) -> dict[str, Any]:
                         {
                             "id": config.model,
                             "name": config.model,
-                            "contextWindow": config.context_window,
-                            "maxTokens": max_output,
+                            "contextWindow": budget.context_window,
+                            "maxTokens": budget.max_output_tokens,
                         }
                     ],
-                    "defaultMaxTokens": max_output,
+                    "defaultMaxTokens": budget.max_output_tokens,
                     "retryPolicy": {
                         "mode": "normal",
                         "maxRetries": 0,
                     },
                 }
             }
+        },
+    }
+
+
+def _compaction_row(budget: DerivedBudget) -> dict[str, Any]:
+    # Field names match the pinned runtime's ``compaction-basic`` schema. This
+    # is a patch of an existing id, never an insert.
+    return {
+        "id": ACP_ROW_COMPACTION,
+        "config": {
+            "auto": budget.compaction_enabled,
+            "thresholdRatio": budget.threshold_ratio,
+            "headroomTokens": budget.headroom,
+            "retainRatio": budget.retain_ratio,
+            "maxTokens": budget.summary_max_tokens,
         },
     }
 
@@ -225,11 +242,11 @@ def build_acp_profile_patches(
     real ACP write boundary is the client-supplied ``session/new.cwd``, which
     the host pins through :func:`build_acp_session_params`.
     """
-    _validate_config_snapshot(config)
+    budget = _validate_config_snapshot(config)
     root = _absolute_root("workspace_root", workspace_root)
 
     rows: list[dict[str, Any]] = [
-        _provider_row(config),
+        _provider_row(config, budget),
         {
             "id": ACP_ROW_AGENT_DEFAULT_MODEL,
             "config": {"provider": DSH_PROVIDER_ID, "model": config.model},
@@ -256,6 +273,7 @@ def build_acp_profile_patches(
                 "applyPatch": False,
             },
         },
+        _compaction_row(budget),
     ]
     rows.extend({"id": row_id, "disabled": True} for row_id in ACP_DISABLED_ROW_IDS)
     return rows

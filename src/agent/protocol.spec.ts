@@ -1,6 +1,7 @@
 import {
   applyServerEvent,
   isDshProductEvent,
+  parseConfigurationReport,
   parseDshProductEvent,
   type ChatBlock
 } from './protocol';
@@ -153,6 +154,183 @@ describe('applyServerEvent', () => {
       kind: 'error',
       message: 'command failed'
     });
+  });
+});
+
+describe('applyServerEvent configuration side channels', () => {
+  const blocks: ChatBlock[] = [{ kind: 'user', id: 'u1', text: 'hello' }];
+
+  it('returns the same blocks for a configuration event', () => {
+    expect(
+      applyServerEvent(blocks, {
+        type: 'configuration',
+        report: {
+          runtimeLifetime: 'runtime-1',
+          generation: 0,
+          state: 'not-started',
+          active: null,
+          desired: null,
+          differences: {},
+          compaction: 'not-observable',
+          preflightApplied: false
+        }
+      })
+    ).toBe(blocks);
+  });
+
+  it('returns the same blocks for a configuration-error event', () => {
+    expect(applyServerEvent(blocks, { type: 'configuration-error' })).toBe(
+      blocks
+    );
+  });
+
+  it('returns the same blocks for an unknown runtime event', () => {
+    expect(
+      applyServerEvent(blocks, { type: 'future-unprocessed' } as never)
+    ).toBe(blocks);
+  });
+});
+
+describe('parseConfigurationReport', () => {
+  // Mirrors the real payload produced by the Python runtime host's
+  // `configuration_report()`, using the fixed `DerivedBudget.safe_report()`
+  // shape the backend projects snapshots onto.
+  const activeReport = {
+    runtimeLifetime: 'dsh-runtime-7f3a',
+    generation: 4,
+    state: 'pending-next-runtime',
+    active: {
+      contextWindow: 131072,
+      maxOutputTokens: 8192,
+      compaction: {
+        enabled: true,
+        thresholdRatio: 0.8,
+        headroom: 16384,
+        retainRatio: 0.5,
+        summaryMaxTokens: 4096
+      },
+      computed: {
+        messageBudget: 122880,
+        pressure: 106496,
+        threshold: 85196,
+        retain: 61440
+      },
+      provenance: {
+        context_window: { source: 'user' },
+        retain: { source: 'derived', derivedFrom: ['message_budget', 'retain_ratio'] }
+      }
+    },
+    desired: {
+      contextWindow: 131072,
+      maxOutputTokens: 4096
+    },
+    differences: {
+      maxOutputTokens: { active: 8192, desired: 4096 },
+      'compaction.enabled': { active: true, desired: false }
+    },
+    compaction: 'disabled',
+    preflightApplied: true
+  };
+
+  const activeNullReport = {
+    runtimeLifetime: 'dsh-runtime-0000',
+    generation: 0,
+    state: 'not-started',
+    active: null,
+    desired: null,
+    differences: {},
+    compaction: 'not-observable',
+    preflightApplied: false
+  };
+
+  it('accepts a real backend host report with an active snapshot', () => {
+    expect(
+      parseConfigurationReport(JSON.parse(JSON.stringify(activeReport)))
+    ).toEqual(activeReport);
+  });
+
+  it('accepts a report whose active and desired snapshots are null', () => {
+    expect(
+      parseConfigurationReport(JSON.parse(JSON.stringify(activeNullReport)))
+    ).toEqual(activeNullReport);
+  });
+
+  it('rejects a difference keyed by an unknown token field', () => {
+    expect(
+      parseConfigurationReport({
+        ...activeNullReport,
+        differences: { token: { active: 'secret', desired: null } }
+      })
+    ).toBeNull();
+  });
+
+  it('rejects differences that carry a baseUrl or unknown snapshot key', () => {
+    expect(
+      parseConfigurationReport({
+        ...activeNullReport,
+        differences: {
+          baseUrl: { active: 'http://user:pass@host', desired: null }
+        }
+      })
+    ).toBeNull();
+    expect(
+      parseConfigurationReport({
+        ...activeNullReport,
+        active: { baseUrl: 'http://user:pass@host' }
+      })
+    ).toBeNull();
+  });
+
+  it('rejects an illegal runtime lifetime', () => {
+    expect(
+      parseConfigurationReport({
+        ...activeNullReport,
+        runtimeLifetime: 'has spaces and /slashes/'
+      })
+    ).toBeNull();
+    expect(
+      parseConfigurationReport({
+        ...activeNullReport,
+        runtimeLifetime: 'x'.repeat(129)
+      })
+    ).toBeNull();
+  });
+
+  it('rejects unknown state and compaction enums', () => {
+    expect(
+      parseConfigurationReport({ ...activeNullReport, state: 'observed' })
+    ).toBeNull();
+    expect(
+      parseConfigurationReport({
+        ...activeNullReport,
+        compaction: 'observed'
+      })
+    ).toBeNull();
+  });
+
+  it('rejects unknown provenance source and field names', () => {
+    expect(
+      parseConfigurationReport({
+        ...activeNullReport,
+        active: {
+          provenance: { context_window: { source: 'remote' } }
+        }
+      })
+    ).toBeNull();
+    expect(
+      parseConfigurationReport({
+        ...activeNullReport,
+        active: {
+          provenance: { secret_token: { source: 'user' } }
+        }
+      })
+    ).toBeNull();
+  });
+
+  it('returns null for a non-object payload instead of throwing', () => {
+    expect(parseConfigurationReport(null)).toBeNull();
+    expect(parseConfigurationReport('report')).toBeNull();
+    expect(parseConfigurationReport(42)).toBeNull();
   });
 });
 

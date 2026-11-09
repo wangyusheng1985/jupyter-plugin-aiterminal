@@ -153,7 +153,7 @@ export function restoreNotebook(
     return;
   }
   notebook.active = clamp(snapshot.active, 0, notebook.cells.length - 1);
-  notebook.enterEdit();
+  notebook.mode = 'edit';
   notebook.restoreCounters(notebook.cells);
 }
 

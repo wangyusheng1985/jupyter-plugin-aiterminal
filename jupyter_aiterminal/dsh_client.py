@@ -318,16 +318,12 @@ def _prepare_home_dir(home: Path) -> Path:
         home.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(home, 0o700)
     marker = home / _HOME_MARKER_NAME
-    try:
-        marker_stat = marker.lstat()
-    except FileNotFoundError:
-        marker_stat = None
-    if marker_stat is not None:
-        if not stat.S_ISREG(marker_stat.st_mode):
-            raise DshClientError(
-                f"controlled home marker is not a regular file: {marker}"
-            )
+    if marker.is_file():
         _read_home_marker(marker)
+    elif marker.exists() or marker.is_symlink():
+        raise DshClientError(
+            f"controlled home marker is not a regular file: {marker}"
+        )
     elif any(
         entry != _HOME_MARKER_NAME and not _is_transient_marker_entry(entry)
         for entry in os.listdir(home)

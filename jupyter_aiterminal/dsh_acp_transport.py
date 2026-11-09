@@ -150,6 +150,7 @@ class DshAcpTransport:
         self._profile = profile
         self._on_notification = on_notification
         self._on_server_request = on_server_request
+        self._listeners: dict[str, tuple[NotificationHandler | None, ServerRequestHandler | None]] = {}
         self._default_request_timeout = self._positive(
             "default_request_timeout", default_request_timeout
         )
@@ -434,6 +435,20 @@ class DshAcpTransport:
             self._pending.pop(request_id, None)
             raise
 
+    def add_listener(
+        self,
+        session_id: str,
+        *,
+        on_notification: NotificationHandler | None = None,
+        on_server_request: ServerRequestHandler | None = None,
+    ) -> None:
+        """Register one ACP session on this shared runtime connection."""
+        self._listeners[session_id] = (on_notification, on_server_request)
+
+    def remove_listener(self, session_id: str | None) -> None:
+        if isinstance(session_id, str):
+            self._listeners.pop(session_id, None)
+
     async def notify(self, method: str, params: Any = None) -> None:
         """Send one JSON-RPC notification (no id, no response expected)."""
         self._require_running()
@@ -629,21 +644,49 @@ class DshAcpTransport:
                 message = await self._notify_queue.get()
                 if message is _QUEUE_STOP:
                     return
-                handler = self._on_notification
-                if handler is None:
+                session_id = None
+                params = message.get("params") if isinstance(message, dict) else None
+                if isinstance(params, dict):
+                    candidate = params.get("sessionId")
+                    if isinstance(candidate, str):
+                        session_id = candidate
+                handlers = []
+                if session_id is not None:
+                    listener = self._listeners.get(session_id)
+                    if listener is not None and listener[0] is not None:
+                        handlers.append(listener[0])
+                if not handlers and self._on_notification is not None:
+                    handlers.append(self._on_notification)
+                if not handlers:
+                    handlers = [
+                        listener[0]
+                        for listener in self._listeners.values()
+                        if listener[0] is not None
+                    ]
+                if not handlers:
                     continue
-                try:
-                    outcome = handler(message)
-                    if inspect.isawaitable(outcome):
-                        await outcome
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # callback errors never kill the reader
-                    self._record_protocol_error(
-                        f"notification handler failed: {type(exc).__name__}: {exc}"
-                    )
+                for handler in handlers:
+                    try:
+                        outcome = handler(message)
+                        if inspect.isawaitable(outcome):
+                            await outcome
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # callback errors never kill the reader
+                        self._record_protocol_error(
+                            f"notification handler failed: {type(exc).__name__}: {exc}"
+                        )
         except asyncio.CancelledError:
             raise
+
+    def _server_request_handler(self, message: dict[str, Any]) -> ServerRequestHandler | None:
+        params = message.get("params") if isinstance(message, dict) else None
+        session_id = params.get("sessionId") if isinstance(params, dict) else None
+        if isinstance(session_id, str):
+            listener = self._listeners.get(session_id)
+            if listener is not None and listener[1] is not None:
+                return listener[1]
+        return self._on_server_request
 
     async def _handle_server_request(self, message: dict[str, Any]) -> None:
         request_id = message.get("id")
@@ -651,7 +694,7 @@ class DshAcpTransport:
             request_id, bool
         )
         try:
-            handler = self._on_server_request
+            handler = self._server_request_handler(message)
             if handler is None:
                 await self._respond_safely(
                     request_id,

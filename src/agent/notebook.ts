@@ -72,18 +72,6 @@ export function createWorkspaceCell(
   };
 }
 
-/**
- * A cell may only be edited before it has run. Queued drafts are still part of
- * the current input, while running or finished cells are workspace history and
- * must stay immutable.
- */
-export function isCellEditable(cell: WorkspaceCell): boolean {
-  return (
-    cell.executionCount === null &&
-    (cell.status === 'idle' || cell.status === 'queued')
-  );
-}
-
 export function isShellEscapeSource(source: string): boolean {
   return /^\s*!/.test(source);
 }
@@ -194,11 +182,6 @@ export class WorkspaceNotebook {
     return this.cells.length === 0;
   }
 
-  isEditable(index = this.active): boolean {
-    const cell = this.cells[index];
-    return Boolean(cell) && isCellEditable(cell);
-  }
-
   select(index: number): void {
     if (this.cells.length === 0) {
       this.active = 0;
@@ -268,7 +251,7 @@ export class WorkspaceNotebook {
   }
 
   enterEdit(): void {
-    this.mode = this.isEditable() ? 'edit' : 'command';
+    this.mode = 'edit';
   }
 
   exitEdit(): void {
@@ -276,7 +259,7 @@ export class WorkspaceNotebook {
   }
 
   setSource(source: string): void {
-    if (this.empty || !this.isEditable()) return;
+    if (this.empty) return;
     const cell = this.current;
     cell.source = source;
     if (cell.executionCount === null && !this.explicitDraftKinds.has(cell.id)) {
@@ -486,7 +469,7 @@ export class WorkspaceNotebook {
     if (this.active < this.cells.length - 1) {
       this.active += 1;
     }
-    this.enterEdit();
+    this.mode = 'edit';
     return this.current;
   }
 }

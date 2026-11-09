@@ -56,21 +56,6 @@ describe('Agent Workspace document', () => {
     expect(restored.agentContextBridges).toEqual([]);
   });
 
-  it('restores an active historical cell as read-only', () => {
-    const notebook = new WorkspaceNotebook();
-    notebook.setSource('pwd');
-    const request = notebook.enqueueRun();
-    notebook.promoteNextRun();
-    notebook.finishRun(request?.id ?? '', '/root\n');
-
-    const restored = new WorkspaceNotebook();
-    restoreNotebook(restored, serializeNotebook(notebook));
-
-    expect(restored.active).toBe(0);
-    expect(restored.isEditable()).toBe(false);
-    expect(restored.mode).toBe('command');
-  });
-
   it('migrates version 1, 2, and unlinked 3 workspaces without inventing context', () => {
     for (const version of [1, 2, 3]) {
       const restored = new WorkspaceNotebook();

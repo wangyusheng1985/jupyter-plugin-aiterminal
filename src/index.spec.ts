@@ -3,16 +3,24 @@ import { CommandRegistry } from '@lumino/commands';
 jest.mock('@jupyterlab/apputils', () => ({
   MainAreaWidget: class {},
   WidgetTracker: class {
+    private _widgets: unknown[] = [];
     has(): boolean {
       return false;
     }
-    add(): Promise<void> {
+    add(widget: unknown): Promise<void> {
+      this._widgets.push(widget);
       return Promise.resolve();
     }
     save(): Promise<void> {
       return Promise.resolve();
     }
+    forEach(fn: (widget: never) => void): void {
+      this._widgets.forEach(widget => fn(widget as never));
+    }
   }
+}));
+jest.mock('@jupyterlab/settingregistry', () => ({
+  ISettingRegistry: Symbol('ISettingRegistry')
 }));
 jest.mock('@jupyterlab/application', () => ({
   ILayoutRestorer: Symbol('ILayoutRestorer')
@@ -82,7 +90,7 @@ jest.mock('@jupyterlab/services', () => ({
   }
 }));
 
-import {
+import plugin, {
   AGENT_COMMAND_ID,
   AGENT_FILE_BROWSER_COMMAND_ID,
   AGENT_RESTORE_COMMAND_ID,
@@ -92,6 +100,24 @@ import {
   activate,
   resolveFileBrowserCreationPath
 } from './index';
+import { ISettingRegistry } from '@jupyterlab/settingregistry';
+
+function flushPromises(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
+
+function workspaceWidget(
+  path: string,
+  session: unknown,
+  isDisposed = false
+): unknown {
+  return {
+    isDisposed,
+    context: { path, pathChanged: { connect: jest.fn() } },
+    disposed: { connect: jest.fn() },
+    content: { session }
+  };
+}
 
 describe('jupyter-aiterminal launcher', () => {
   beforeEach(() => {
@@ -605,6 +631,197 @@ describe('jupyter-aiterminal launcher', () => {
       'work/Untitled.agentnb',
       'Agent Workspace'
     );
+  });
+
+  it('refreshes every live workspace configuration when settings are saved', async () => {
+    const commands = new CommandRegistry();
+    const translator = { load: () => ({ __: (value: string) => value }) };
+    const registry = {
+      addFileType: jest.fn(),
+      addModelFactory: jest.fn(),
+      addWidgetFactory: jest.fn()
+    };
+    const docManager = {
+      registry,
+      open: jest.fn(),
+      openOrReveal: jest.fn(),
+      newUntitled: jest.fn()
+    };
+    let onSettingsChanged: (() => void) | undefined;
+    const settings = {
+      changed: {
+        connect: jest.fn((callback: () => void) => {
+          onSettingsChanged = callback;
+          return 'settings-changed';
+        })
+      },
+      dispose: jest.fn()
+    };
+    const settingRegistry = {
+      load: jest.fn(async () => settings)
+    };
+
+    activate(
+      { commands, shell: {} } as never,
+      { add: jest.fn() } as never,
+      translator as never,
+      {} as never,
+      docManager as never,
+      null,
+      null,
+      settingRegistry as never
+    );
+    await flushPromises();
+
+    const factory = registry.addWidgetFactory.mock.calls[0][0] as {
+      widgetCreated: { connect: jest.Mock };
+    };
+    const onWidgetCreated = factory.widgetCreated.connect.mock.calls[0][0] as (
+      sender: unknown,
+      widget: unknown
+    ) => void;
+    const firstSession = {
+      requestConfiguration: jest.fn(() => true),
+      connect: jest.fn(),
+      resetContext: jest.fn()
+    };
+    const secondSession = {
+      requestConfiguration: jest.fn(() => true),
+      connect: jest.fn(),
+      resetContext: jest.fn()
+    };
+    onWidgetCreated(
+      undefined,
+      workspaceWidget('work/one.agentnb', firstSession)
+    );
+    onWidgetCreated(
+      undefined,
+      workspaceWidget('work/two.agentnb', secondSession)
+    );
+    await flushPromises();
+
+    expect(settingRegistry.load).toHaveBeenCalledWith(PLUGIN_ID);
+    expect(settings.changed.connect).toHaveBeenCalledTimes(1);
+
+    onSettingsChanged?.();
+
+    expect(firstSession.requestConfiguration).toHaveBeenCalledTimes(1);
+    expect(secondSession.requestConfiguration).toHaveBeenCalledTimes(1);
+    expect(firstSession.connect).not.toHaveBeenCalled();
+    expect(secondSession.connect).not.toHaveBeenCalled();
+    expect(firstSession.resetContext).not.toHaveBeenCalled();
+    expect(secondSession.resetContext).not.toHaveBeenCalled();
+    expect(settings.dispose).not.toHaveBeenCalled();
+  });
+
+  it('skips disposed workspaces when settings are saved', async () => {
+    const commands = new CommandRegistry();
+    const translator = { load: () => ({ __: (value: string) => value }) };
+    const registry = {
+      addFileType: jest.fn(),
+      addModelFactory: jest.fn(),
+      addWidgetFactory: jest.fn()
+    };
+    const docManager = {
+      registry,
+      open: jest.fn(),
+      openOrReveal: jest.fn(),
+      newUntitled: jest.fn()
+    };
+    let onSettingsChanged: (() => void) | undefined;
+    const settings = {
+      changed: {
+        connect: jest.fn((callback: () => void) => {
+          onSettingsChanged = callback;
+          return 'settings-changed';
+        })
+      },
+      dispose: jest.fn()
+    };
+
+    activate(
+      { commands, shell: {} } as never,
+      { add: jest.fn() } as never,
+      translator as never,
+      {} as never,
+      docManager as never,
+      null,
+      null,
+      { load: jest.fn(async () => settings) } as never
+    );
+    await flushPromises();
+
+    const factory = registry.addWidgetFactory.mock.calls[0][0] as {
+      widgetCreated: { connect: jest.Mock };
+    };
+    const onWidgetCreated = factory.widgetCreated.connect.mock.calls[0][0] as (
+      sender: unknown,
+      widget: unknown
+    ) => void;
+    const session = { requestConfiguration: jest.fn(() => true) };
+    onWidgetCreated(
+      undefined,
+      workspaceWidget('work/closed.agentnb', session, true)
+    );
+    await flushPromises();
+
+    onSettingsChanged?.();
+    expect(session.requestConfiguration).not.toHaveBeenCalled();
+  });
+
+  it('keeps working when the setting registry cannot load the schema', async () => {
+    const commands = new CommandRegistry();
+    const translator = { load: () => ({ __: (value: string) => value }) };
+    const registry = {
+      addFileType: jest.fn(),
+      addModelFactory: jest.fn(),
+      addWidgetFactory: jest.fn()
+    };
+    const docManager = {
+      registry,
+      open: jest.fn(),
+      openOrReveal: jest.fn(),
+      newUntitled: jest.fn()
+    };
+    const load = jest.fn(() => Promise.reject(new Error('missing schema')));
+
+    expect(() => {
+      activate(
+        { commands, shell: {} } as never,
+        { add: jest.fn() } as never,
+        translator as never,
+        {} as never,
+        docManager as never,
+        null,
+        null,
+        { load } as never
+      );
+    }).not.toThrow();
+    await flushPromises();
+
+    expect(load).toHaveBeenCalledWith(PLUGIN_ID);
+    expect(commands.hasCommand(AGENT_COMMAND_ID)).toBe(true);
+  });
+
+  it('activates without the optional setting registry', () => {
+    const commands = new CommandRegistry();
+    const translator = { load: () => ({ __: (value: string) => value }) };
+    const registry = {
+      addFileType: jest.fn(),
+      addModelFactory: jest.fn(),
+      addWidgetFactory: jest.fn()
+    };
+
+    activate(
+      { commands, shell: {} } as never,
+      { add: jest.fn() } as never,
+      translator as never,
+      {} as never,
+      { registry } as never
+    );
+
+    expect(plugin.optional).toContain(ISettingRegistry);
+    expect(commands.hasCommand(AGENT_COMMAND_ID)).toBe(true);
   });
 
   it('shuts a session down only once', async () => {

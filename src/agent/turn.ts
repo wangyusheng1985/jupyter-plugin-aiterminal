@@ -1,4 +1,4 @@
-import type { AgentServerEvent, ChatBlock } from './protocol';
+import type { AgentServerEvent, ChatBlock, TerminalReason } from './protocol';
 import { presentTool, type ToolPresentation } from './tool-presenter';
 
 export type TurnStatus = 'running' | 'done' | 'interrupted' | 'error';
@@ -87,6 +87,8 @@ export interface ChatTurn {
   presentation: TurnPresentationState;
   resultText: string;
   resultIsError: boolean;
+  /** Stable runtime outcome; absent for legacy turns and partial results. */
+  terminalReason?: TerminalReason;
   revision: number;
 }
 
@@ -95,6 +97,7 @@ export interface PersistedTurn {
   status: Exclude<TurnStatus, 'running'>;
   resultText: string;
   resultIsError: boolean;
+  terminalReason?: TerminalReason;
   metrics: TurnMetrics;
   presentation: TurnPresentationState;
 }
@@ -138,6 +141,7 @@ export function applyTurnEvent(
         ...next.metrics,
         ...eventMetrics(event)
       };
+      next.terminalReason = normalizeTerminalReason(event.reason);
       break;
     case 'error':
       next.status = 'error';
@@ -190,12 +194,32 @@ export function setTurnStatus(
   return deriveTurn({ ...turn, status }, blocks);
 }
 
+export function preserveTurnPresentation(
+  incoming: ChatTurn,
+  previous: ChatTurn | null | undefined
+): ChatTurn {
+  if (!previous) return incoming;
+  const presentation = previous.presentation;
+  const userAdjusted =
+    presentation.trace !== 'auto' ||
+    presentation.expandedActivityIds.length > 0 ||
+    presentation.fullEvidenceActivityIds.length > 0;
+  if (!userAdjusted) return incoming;
+  if (previous.id !== incoming.id && !previous.id.startsWith('legacy-')) {
+    return incoming;
+  }
+  return { ...incoming, presentation };
+}
+
 export function toPersistedTurn(turn: ChatTurn): PersistedTurn {
   return {
     id: turn.id,
     status: turn.status === 'running' ? 'interrupted' : turn.status,
     resultText: turn.resultText,
     resultIsError: turn.resultIsError,
+    ...(turn.terminalReason === undefined
+      ? {}
+      : { terminalReason: turn.terminalReason }),
     metrics: turn.metrics,
     presentation: turn.presentation
   };
@@ -206,11 +230,15 @@ export function restoreTurn(
 ): ChatTurn | null {
   if (!value || typeof value.id !== 'string') return null;
   const turn = createTurn(value.id);
+  const terminalReason = normalizeTerminalReason(
+    (value as { terminalReason?: unknown }).terminalReason
+  );
   return {
     ...turn,
     status: value.status,
     resultText: typeof value.resultText === 'string' ? value.resultText : '',
     resultIsError: Boolean(value.resultIsError),
+    ...(terminalReason === undefined ? {} : { terminalReason }),
     metrics: {
       ...(value.metrics && typeof value.metrics === 'object'
         ? value.metrics
@@ -218,6 +246,57 @@ export function restoreTurn(
     },
     presentation: normalizePresentation(value.presentation)
   };
+}
+
+/**
+ * True only for the stable reasons the backend emits. Unknown or legacy values
+ * (including non-strings) are dropped so a stale document cannot smuggle a
+ * new state into the renderer.
+ */
+function normalizeTerminalReason(value: unknown): TerminalReason | undefined {
+  return value === 'completed' ||
+    value === 'cancelled' ||
+    value === 'budget-exhausted' ||
+    value === 'failed'
+    ? value
+    : undefined;
+}
+
+/**
+ * User-facing explanation of how a turn ended. Rendered as its own notice, never
+ * appended to the assistant text. `completed` only needs a message when the run
+ * produced no output; every other terminal reason is worth stating even when a
+ * partial answer was already streamed.
+ */
+export function terminalReasonMessage(
+  turn: Pick<ChatTurn, 'terminalReason' | 'resultText' | 'outcomeKind'>
+): string | null {
+  const reason = turn.terminalReason;
+  if (!reason) return null;
+  // ACP streams assistant text into `text` blocks while `result.text` stays
+  // empty, so the runtime result string alone cannot prove an answer exists.
+  // The derived outcome kind is the source of truth for visible assistant text;
+  // `tool`/`none` outcomes are activity or silence, never an answer.
+  const hasResult =
+    turn.resultText.trim().length > 0 ||
+    turn.outcomeKind === 'assistant' ||
+    turn.outcomeKind === 'result';
+  switch (reason) {
+    case 'completed':
+      return hasResult ? null : 'Run completed without producing a response.';
+    case 'cancelled':
+      return hasResult
+        ? 'Run cancelled before finishing.'
+        : 'Run cancelled before producing a response.';
+    case 'budget-exhausted':
+      return hasResult
+        ? 'Run stopped early: token budget exhausted.'
+        : 'Run stopped before producing a response: token budget exhausted.';
+    case 'failed':
+      return hasResult
+        ? 'Run failed before finishing.'
+        : 'Run failed before producing a response.';
+  }
 }
 
 export function isTraceExpanded(turn: ChatTurn): boolean {

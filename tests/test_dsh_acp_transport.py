@@ -22,6 +22,7 @@ from jupyter_aiterminal.dsh_acp_transport import (
     DshAcpError,
     DshAcpTransport,
     resolve_runtime_path,
+    _QUEUE_STOP,
 )
 
 TEST_TIMEOUT_SECONDS = 10.0
@@ -595,3 +596,44 @@ def test_start_errors_are_clear(tmp_path: Path) -> None:
         await not_started.close()
 
     asyncio.run(_bounded(scenario()))
+
+
+def test_transport_listeners_route_and_fallback(tmp_path: Path) -> None:
+    """Verify add_listener, remove_listener, session targeting and fallback."""
+    patch = tmp_path / "patch.yml"
+    patch.write_text("# patch\n", encoding="utf-8")
+    default_notifications: list[dict[str, Any]] = []
+    sess1_notifications: list[dict[str, Any]] = []
+    sess2_notifications: list[dict[str, Any]] = []
+
+    transport = DshAcpTransport(
+        runtime_path=_make_runtime(tmp_path),
+        patch_path=patch,
+        cwd=tmp_path,
+        env=_env(tmp_path),
+        on_notification=lambda msg: default_notifications.append(msg),
+    )
+
+    transport.add_listener("session-1", on_notification=lambda msg: sess1_notifications.append(msg))
+    transport.add_listener("session-2", on_notification=lambda msg: sess2_notifications.append(msg))
+
+    async def scenario() -> None:
+        transport._notify_queue.put_nowait({"method": "update", "params": {"sessionId": "session-1", "val": 1}})
+        transport._notify_queue.put_nowait({"method": "update", "params": {"sessionId": "session-2", "val": 2}})
+        transport._notify_queue.put_nowait({"method": "update", "params": {"sessionId": "session-unknown", "val": 3}})
+        transport._notify_queue.put_nowait({"method": "update", "params": {"val": 4}})
+        transport._notify_queue.put_nowait(_QUEUE_STOP)
+        await transport._drain_notifications()
+
+    asyncio.run(_bounded(scenario()))
+
+    assert len(sess1_notifications) == 1 and sess1_notifications[0]["params"]["val"] == 1
+    assert len(sess2_notifications) == 1 and sess2_notifications[0]["params"]["val"] == 2
+    # Unknown sessionId falls back to on_notification
+    assert any(m.get("params", {}).get("val") == 3 for m in default_notifications)
+    # Untagged falls back to on_notification
+    assert any(m.get("params", {}).get("val") == 4 for m in default_notifications)
+
+    # Test remove_listener
+    transport.remove_listener("session-1")
+    assert "session-1" not in transport._listeners

@@ -3,6 +3,7 @@ import {
   applyTurnEvent,
   createTurn,
   isTraceExpanded,
+  preserveTurnPresentation,
   revealFailedActivity,
   restoreTurn,
   setTurnStatus,
@@ -146,5 +147,32 @@ describe('ChatTurn', () => {
         text: 'wrong'
       })
     ).toBe(turn);
+  });
+
+  it('preserves a user collapsed presentation only for the same turn', () => {
+    const previous = toggleTrace(createTurn('run-1'));
+    expect(previous.presentation.trace).toBe('collapsed');
+
+    const incoming = createTurn('run-1');
+    expect(preserveTurnPresentation(incoming, previous).presentation).toEqual(
+      previous.presentation
+    );
+
+    const nextRun = createTurn('run-2');
+    expect(preserveTurnPresentation(nextRun, previous)).toBe(nextRun);
+  });
+
+  it('inherits a user presentation from a legacy turn into the incoming turn', () => {
+    const previous = toggleTrace(createTurn('legacy-cell-1'));
+    const incoming = createTurn('run-9');
+    expect(
+      preserveTurnPresentation(incoming, previous).presentation.trace
+    ).toBe('collapsed');
+  });
+
+  it('leaves an untouched auto presentation alone', () => {
+    const incoming = createTurn('run-1');
+    const previous = createTurn('run-1');
+    expect(preserveTurnPresentation(incoming, previous)).toBe(incoming);
   });
 });

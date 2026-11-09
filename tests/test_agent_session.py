@@ -1,17 +1,21 @@
 import asyncio
+import json
 import stat
+from contextlib import asynccontextmanager
 
 from jupyter_aiterminal.agent import (
     AgentSession,
     _is_not_connected_error,
+    _terminal_reason,
     dsh_storage_root,
     format_sdk_error,
     normalize_session_id,
     sdk_client_kwargs,
     sdk_environment,
 )
+from jupyter_aiterminal.detached_document import load_workspace
 from jupyter_aiterminal.dsh_acp_session import DshAcpSessionError
-from jupyter_aiterminal.dsh_config import DshProviderConfig
+from jupyter_aiterminal.dsh_config import DshProviderConfig, derive_dsh_budget
 from jupyter_aiterminal.pi_client import PiProcessError
 from jupyter_aiterminal.settings import AgentConfigError
 
@@ -24,6 +28,25 @@ def _provider_config(token="secret-token"):
         context_window=8192,
         max_output_tokens=4096,
         token=token,
+    )
+
+
+def _budget_config(
+    context_window=8192, max_output_tokens=4096, token="secret-token"
+):
+    return DshProviderConfig(
+        api_protocol="anthropic-messages",
+        base_url="https://api.example/v1",
+        model="dsh-model",
+        context_window=context_window,
+        max_output_tokens=max_output_tokens,
+        token=token,
+        budget=derive_dsh_budget(
+            {
+                "contextWindow": context_window,
+                "maxOutputTokens": max_output_tokens,
+            }
+        ),
     )
 
 
@@ -42,9 +65,16 @@ class _FakeAcpSession:
         self.emit = kwargs["emit"]
         self.on_notification = kwargs["on_notification"]
         self.resume_session_id = kwargs.get("resume_session_id")
+        self._transport = kwargs.get("transport")
+        owns_transport = kwargs.get("owns_transport")
+        self._owns_transport = (
+            self._transport is None if owns_transport is None else owns_transport
+        )
+        self.config_preflight_proven = False
         self.session_id = None
         self.runtime_id = None
         self.started = False
+        self.start_calls = 0
         self.prompts: list[tuple[str, str]] = []
         self.cancels = 0
         self.closes = 0
@@ -61,11 +91,15 @@ class _FakeAcpSession:
         self.start_gate: asyncio.Event | None = None
 
     async def start(self):
+        self.start_calls += 1
         if self.start_gate is not None:
             await self.start_gate.wait()
         if self.start_error is not None:
             raise self.start_error
         self.started = True
+        if self._transport is None:
+            # A real session creates its own transport inside start().
+            self._transport = object()
         self.session_id = self.resume_session_id or self.new_session_id
         self.runtime_id = self.new_runtime_id
         self.emit(
@@ -113,6 +147,75 @@ def _emit_to(events):
         events.append(event)
 
     return emit
+
+
+class _FakeStartup:
+    def __init__(self, transport):
+        self.transport = transport
+
+    @property
+    def owns_bootstrap(self):
+        return self.transport is None
+
+
+class _FakeSharedRuntime:
+    """In-process stand-in for ``SharedDshRuntime`` configuration wiring."""
+
+    def __init__(self, transport=None):
+        self._transport = transport
+        self.active_snapshot = None
+        self.adopted: list[tuple] = []
+        self.bound: list[tuple] = []
+        self.start_calls = 0
+        self.report_calls: list = []
+        self._bootstrap_lock = asyncio.Lock()
+        # Set to a different object to simulate a host that refuses adoption.
+        self.adopt_override = None
+
+    @asynccontextmanager
+    async def transport_startup(self):
+        async with self._bootstrap_lock:
+            yield _FakeStartup(self._transport)
+
+    def adopt_initialized_transport(
+        self, transport, snapshot=None, preflight_proven=False
+    ):
+        self.adopted.append((transport, snapshot, preflight_proven))
+        if self.adopt_override is not None:
+            return self.adopt_override
+        if self._transport is None:
+            self._transport = transport
+            self.active_snapshot = snapshot
+        return self._transport
+
+    def bind_transport(self, transport, snapshot=None, preflight_proven=False):
+        self.bound.append((transport, snapshot, preflight_proven))
+        if self._transport is None:
+            self._transport = transport
+        return self._transport
+
+    async def start(self):
+        self.start_calls += 1
+
+    def configuration_report(self, desired=None):
+        self.report_calls.append(desired)
+        active = self.active_snapshot
+        if active is None:
+            state = "not-started"
+        elif desired is not None and desired != active:
+            state = "pending-next-runtime"
+        else:
+            state = "active"
+        return {
+            "active": active,
+            "desired": desired,
+            "state": state,
+            "generation": 1 if active is not None else 0,
+        }
+
+
+def _config_events(events):
+    return [event for event in events if event["type"] == "configuration"]
 
 
 def test_start_reports_config_error_without_launching_acp(tmp_path, monkeypatch):
@@ -408,6 +511,7 @@ def test_query_projects_acp_notifications_to_legacy_turn_events(
         "type": "result",
         "text": "",
         "isError": False,
+        "reason": "completed",
         "sessionId": session.session_id,
         "turnId": "turn-1",
     }
@@ -436,7 +540,90 @@ def test_query_reports_cancelled_prompt_as_error_result(tmp_path, monkeypatch):
     assert created[0].cancels == 1
     result = next(event for event in events if event["type"] == "result")
     assert result["isError"] is True
+    assert result["reason"] == "cancelled"
     assert result["turnId"] == "turn-2"
+
+
+def test_terminal_reason_falls_back_to_status_without_reason():
+    # Older run.finished payloads carried only status; map it to the same
+    # stable reason vocabulary instead of forcing clients to guess.
+    assert _terminal_reason({"status": "completed"}) == "completed"
+    assert _terminal_reason({"status": "cancelled"}) == "cancelled"
+    assert _terminal_reason({"status": "failed"}) == "failed"
+    assert _terminal_reason({}) == "failed"
+
+
+def test_query_reports_budget_exhausted_terminal(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+    created = []
+
+    def factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+        session.prompt_result = {"stopReason": "max_tokens"}
+        session.script = [
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "acp-session-0123456789",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": "msg-3",
+                        "content": {"type": "text", "text": "partial"},
+                    },
+                },
+            }
+        ]
+        created.append(session)
+        return session
+
+    _configure_fake_acp(monkeypatch, factory)
+
+    async def run():
+        events = []
+        session = AgentSession(str(tmp_path), _emit_to(events))
+        await session.query("hello", "turn-3")
+        return session, events
+
+    _, events = asyncio.run(run())
+    # The streamed assistant text is preserved, but the result event never
+    # fabricates or re-sends an assistant body for a budget-limited stop.
+    assert [event["text"] for event in events if event["type"] == "text"] == [
+        "partial"
+    ]
+    results = [event for event in events if event["type"] == "result"]
+    assert len(results) == 1
+    assert results[0]["isError"] is True
+    assert results[0]["reason"] == "budget-exhausted"
+    assert results[0]["text"] == ""
+    # Exactly one prompt: no automatic retry, continue, or replay.
+    assert created[0].prompts == [("hello", "turn-3")]
+
+
+def test_query_distinguishes_failed_from_cancelled_terminal(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+    created = []
+
+    def factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+        session.prompt_result = {"stopReason": "refusal"}
+        created.append(session)
+        return session
+
+    _configure_fake_acp(monkeypatch, factory)
+
+    async def run():
+        events = []
+        session = AgentSession(str(tmp_path), _emit_to(events))
+        await session.query("hello", "turn-4")
+        return session, events
+
+    _, events = asyncio.run(run())
+    results = [event for event in events if event["type"] == "result"]
+    assert len(results) == 1
+    assert results[0]["isError"] is True
+    assert results[0]["reason"] == "failed"
+    assert results[0]["text"] == ""
+    assert created[0].prompts == [("hello", "turn-4")]
 
 
 def test_close_closes_acp_session(tmp_path, monkeypatch):
@@ -872,3 +1059,547 @@ def test_not_connected_predicate_is_specific():
 def test_dsh_storage_root_uses_server_data_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path))
     assert dsh_storage_root() == tmp_path / "aiterminal" / "dsh"
+
+
+def test_start_adopts_initialized_transport_with_budget_snapshot(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+    config = _budget_config()
+    runtime = _FakeSharedRuntime()
+    created = []
+
+    def factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+        session.config_preflight_proven = True
+        created.append(session)
+        return session
+
+    _configure_fake_acp(monkeypatch, factory, config)
+
+    async def run():
+        events = []
+        session = AgentSession(str(tmp_path), _emit_to(events), runtime=runtime)
+        await session.start()
+        await asyncio.sleep(0)
+        return session, events
+
+    session, events = asyncio.run(run())
+
+    # The first session initialized its own transport; the shared runtime
+    # adopts it instead of starting or initializing a second one.
+    assert created[0].start_calls == 1
+    assert runtime.start_calls == 0
+    assert runtime.bound == []
+    assert len(runtime.adopted) == 1
+    transport, snapshot, proven = runtime.adopted[0]
+    assert transport is created[0]._transport
+    assert snapshot is config.budget
+    assert proven is True
+    assert created[0].kwargs["owns_transport"] is True
+    assert created[0]._owns_transport is False
+    assert session.session_id == created[0].new_session_id
+
+    configuration = _config_events(events)
+    assert len(configuration) == 1
+    report = configuration[0]["report"]
+    assert report["active"] is config.budget
+    assert report["desired"] is config.budget
+    assert report["state"] == "active"
+
+
+def test_new_session_reuses_active_snapshot_and_does_not_initialize(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+    active_config = _budget_config()
+    pending_config = _budget_config(context_window=16384, max_output_tokens=8192)
+    shared_transport = object()
+    runtime = _FakeSharedRuntime(transport=shared_transport)
+    runtime.active_snapshot = active_config.budget
+    created = []
+
+    def factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+        created.append(session)
+        return session
+
+    _configure_fake_acp(monkeypatch, factory, pending_config)
+
+    async def run():
+        events = []
+        session = AgentSession(str(tmp_path), _emit_to(events), runtime=runtime)
+        await session.start()
+        await asyncio.sleep(0)
+        return session, events
+
+    _session, events = asyncio.run(run())
+
+    # An already-active shared runtime is reused as-is: the new session gets
+    # the same initialized transport and no second initialize/start happens.
+    assert runtime.adopted == []
+    assert runtime.bound == []
+    assert runtime.start_calls == 0
+    assert created[0].start_calls == 1
+    assert created[0].kwargs["transport"] is shared_transport
+    assert created[0].kwargs["owns_transport"] is False
+
+    # The active snapshot is not replaced by the new session's desired settings.
+    assert runtime.active_snapshot is active_config.budget
+    report = _config_events(events)[0]["report"]
+    assert report["active"] is active_config.budget
+    assert report["desired"] is pending_config.budget
+    assert report["state"] == "pending-next-runtime"
+
+
+def test_reemit_handshake_refreshes_configuration_report(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+    config = _budget_config()
+    runtime = _FakeSharedRuntime()
+
+    def factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+        session.config_preflight_proven = True
+        return session
+
+    _configure_fake_acp(monkeypatch, factory, config)
+
+    async def run():
+        session = AgentSession(str(tmp_path), _emit_to([]), runtime=runtime)
+        await session.start()
+        attached: list[dict] = []
+        await session.reemit_handshake(_emit_to(attached))
+        return attached
+
+    attached = asyncio.run(run())
+
+    configuration = _config_events(attached)
+    assert len(configuration) == 1
+    assert configuration[0]["report"]["active"] is config.budget
+    assert configuration[0]["report"]["desired"] is config.budget
+    # The handshake events are preserved.
+    assert any(event["type"] == "ready" for event in attached)
+
+
+def test_query_on_existing_session_refreshes_configuration(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+    config = _budget_config()
+    runtime = _FakeSharedRuntime()
+
+    def factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+        session.config_preflight_proven = True
+        return session
+
+    _configure_fake_acp(monkeypatch, factory, config)
+
+    async def run():
+        events: list[dict] = []
+        session = AgentSession(str(tmp_path), _emit_to(events), runtime=runtime)
+        await session.start()
+        await session.query("hello", "turn-1")
+        await asyncio.sleep(0)
+        return events, session
+
+    events, session = asyncio.run(run())
+
+    # One configuration event on start and one refresh for the existing
+    # session; the runtime is neither restarted nor re-initialized.
+    assert len(_config_events(events)) == 2
+    assert runtime.start_calls == 0
+    assert any(event["type"] == "result" for event in events)
+    handshake_config = _config_events(events)[-1]["report"]
+    assert handshake_config["desired"] is config.budget
+    assert session.session_id == "acp-session-0123456789"
+
+
+def test_configuration_refresh_read_failure_reports_configuration_error_and_nonfatal(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+    config = _budget_config()
+    runtime = _FakeSharedRuntime()
+    state = {"fail": False}
+    created = []
+
+    def load():
+        if state["fail"]:
+            raise AgentConfigError(
+                "AI Terminal settings are incomplete (secret-token)."
+            )
+        return config
+
+    def factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+        session.config_preflight_proven = True
+        created.append(session)
+        return session
+
+    monkeypatch.setattr("jupyter_aiterminal.agent.load_dsh_settings", load)
+    monkeypatch.setattr("jupyter_aiterminal.agent.DshAcpSession", factory)
+
+    async def run():
+        events: list[dict] = []
+        session = AgentSession(str(tmp_path), _emit_to(events), runtime=runtime)
+        await session.start()
+        state["fail"] = True
+        events.clear()
+        await session.query("hello", "turn-1")
+        await asyncio.sleep(0)
+        return session, events
+
+    session, events = asyncio.run(run())
+
+    # A desired-read failure must not use the fatal ``config`` error channel;
+    # it is reported on a dedicated non-fatal ``configuration-error`` channel
+    # with a fixed message, no turn id, and no leaked exception or token.
+    assert not [
+        event
+        for event in events
+        if event["type"] == "error" and event.get("code") == "config"
+    ]
+    config_errors = [
+        event for event in events if event["type"] == "configuration-error"
+    ]
+    assert len(config_errors) == 1
+    failure = config_errors[0]
+    assert "turnId" not in failure
+    assert "code" not in failure
+    assert "secret-token" not in failure["message"]
+    assert "AI Terminal provider settings could not be refreshed" in failure["message"]
+
+    # The refresh does not fabricate a desired or active snapshot: the report
+    # only carries the runtime's real active budget and a null desired.
+    report = _config_events(events)[-1]["report"]
+    assert report["active"] is config.budget
+    assert report["desired"] is None
+
+    # The turn still runs to completion after the non-fatal refresh failure.
+    assert any(event["type"] == "result" for event in events)
+    assert created[0].prompts == [("hello", "turn-1")]
+    assert session.session_id == created[0].new_session_id
+
+
+def test_start_config_error_and_refresh_error_use_distinct_channels(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+    config = _budget_config()
+
+    # Path 1: a real startup config failure stays a fatal ``config`` error.
+    def failing_factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+        session.start_error = AgentConfigError(
+            "DSH runtime dump-config is missing a config row (secret-token)"
+        )
+        return session
+
+    _configure_fake_acp(monkeypatch, failing_factory, config)
+    start_events: list[dict] = []
+    asyncio.run(AgentSession(str(tmp_path), _emit_to(start_events)).start())
+    assert start_events[0]["type"] == "error"
+    assert start_events[0]["code"] == "config"
+    assert not [
+        event for event in start_events if event["type"] == "configuration-error"
+    ]
+
+    # Path 2: a refresh failure on an existing runtime never becomes that fatal
+    # ``config`` error; it uses the dedicated non-fatal channel instead.
+    runtime = _FakeSharedRuntime()
+
+    def ok_factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+        session.config_preflight_proven = True
+        return session
+
+    monkeypatch.setattr(
+        "jupyter_aiterminal.agent.DshAcpSession", ok_factory
+    )
+    state = {"fail": False}
+
+    def load():
+        if state["fail"]:
+            raise AgentConfigError("incomplete (secret-token)")
+        return config
+
+    monkeypatch.setattr("jupyter_aiterminal.agent.load_dsh_settings", load)
+
+    async def run():
+        events: list[dict] = []
+        session = AgentSession(str(tmp_path), _emit_to(events), runtime=runtime)
+        await session.start()
+        state["fail"] = True
+        events.clear()
+        await session.query("hello", "turn-2")
+        await asyncio.sleep(0)
+        return events
+
+    refresh_events = asyncio.run(run())
+    assert not [
+        event
+        for event in refresh_events
+        if event["type"] == "error" and event.get("code") == "config"
+    ]
+    assert [
+        event for event in refresh_events if event["type"] == "configuration-error"
+    ]
+    assert any(event["type"] == "result" for event in refresh_events)
+
+
+def test_start_preflight_agent_config_error_reports_config_code(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+    created = []
+
+    def factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+        session.start_error = AgentConfigError(
+            "DSH runtime dump-config is missing the 'compaction-basic' config "
+            "row; refusing to start (secret-token)"
+        )
+        created.append(session)
+        return session
+
+    _configure_fake_acp(monkeypatch, factory, _provider_config())
+
+    events: list[dict] = []
+    asyncio.run(AgentSession(str(tmp_path), _emit_to(events)).start())
+
+    assert len(events) == 1
+    assert events[0]["type"] == "error"
+    # A preflight row failure is a configuration failure, not a generic
+    # runtime failure, and it never echoes the token.
+    assert events[0]["code"] == "config"
+    assert "compaction-basic" in events[0]["message"]
+    assert "secret-token" not in events[0]["message"]
+    assert "[redacted]" in events[0]["message"]
+    assert created[0].closes == 1
+
+
+def test_concurrent_first_starts_share_one_host_transport(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+    runtime = _FakeSharedRuntime()
+    created = []
+
+    async def run():
+        gate = asyncio.Event()
+
+        def factory(**kwargs):
+            session = _FakeAcpSession(**kwargs)
+            if not created:
+                session.start_gate = gate
+            created.append(session)
+            return session
+
+        _configure_fake_acp(monkeypatch, factory)
+        first = AgentSession(str(tmp_path / "a"), _emit_to([]), runtime=runtime)
+        second = AgentSession(str(tmp_path / "b"), _emit_to([]), runtime=runtime)
+
+        first_start = asyncio.create_task(first.start())
+        await asyncio.sleep(0)
+        second_start = asyncio.create_task(second.start())
+        await asyncio.sleep(0)
+
+        # The host bootstrap lock is held across the first session's start, so
+        # the second caller has not created an ACP session or a transport yet.
+        assert len(created) == 1
+        assert created[0].start_calls == 1
+
+        gate.set()
+        await asyncio.gather(first_start, second_start)
+        return first, second
+
+    first, second = asyncio.run(run())
+
+    assert len(created) == 2
+    assert len(runtime.adopted) == 1
+    assert runtime.adopted[0][0] is created[0]._transport
+    # Exactly one child process was spawned and adopted; the second session
+    # reused the host transport instead of starting another one.
+    assert created[1].kwargs["transport"] is created[0]._transport
+    assert created[1].kwargs["owns_transport"] is False
+    assert created[0]._owns_transport is False
+    assert created[1]._owns_transport is False
+    assert runtime._transport is created[0]._transport
+    assert first.session_id == created[0].new_session_id
+    assert second.session_id == created[1].new_session_id
+
+
+def test_start_releases_owned_transport_when_host_does_not_adopt(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+    runtime = _FakeSharedRuntime()
+    runtime.adopt_override = object()
+    created = []
+
+    def factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+        created.append(session)
+        return session
+
+    _configure_fake_acp(monkeypatch, factory)
+
+    events: list[dict] = []
+    async def run():
+        session = AgentSession(str(tmp_path), _emit_to(events), runtime=runtime)
+        await session.start()
+        return session
+
+    session = asyncio.run(run())
+
+    # Adoption failed, so the session keeps ownership long enough to close its
+    # own child; it never becomes live and no orphan process is left behind.
+    assert session._acp is None
+    assert created[0].closes == 1
+    assert runtime._transport is None
+    assert len(runtime.adopted) == 1
+    errors = [event for event in events if event["type"] == "error"]
+    assert len(errors) == 1
+    assert errors[0]["code"] == "runtime"
+    assert "did not adopt" in errors[0]["message"]
+
+
+def _write_running_workspace(path):
+    path.write_text(
+        json.dumps(
+            {
+                "version": 5,
+                "cells": [
+                    {
+                        "id": "cell-1",
+                        "kind": "ai",
+                        "source": "hello",
+                        "output": "",
+                        "blocks": [],
+                        "turn": None,
+                        "status": "running",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _persisted_turn(path):
+    return load_workspace(path)["cells"][0]["turn"]
+
+
+def test_detached_turn_persists_completed_terminal_reason(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+    workspace = _write_running_workspace(tmp_path / "done.agentnb")
+
+    def factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+        session.prompt_result = {"stopReason": "end_turn"}
+        return session
+
+    _configure_fake_acp(monkeypatch, factory)
+
+    async def run():
+        session = AgentSession(
+            str(tmp_path),
+            _emit_to([]),
+            workspace_file=str(workspace),
+            is_detached=lambda: True,
+        )
+        await session.query("hello", turn_id="turn-1", cell_id="cell-1")
+
+    asyncio.run(run())
+
+    turn = _persisted_turn(workspace)
+    assert turn["status"] == "done"
+    assert turn["terminalReason"] == "completed"
+    assert turn["resultText"] == ""
+
+
+def test_detached_turn_persists_cancelled_terminal_reason(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+    workspace = _write_running_workspace(tmp_path / "cancelled.agentnb")
+
+    def factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+        session.prompt_result = {"stopReason": "cancelled"}
+        return session
+
+    _configure_fake_acp(monkeypatch, factory)
+
+    async def run():
+        session = AgentSession(
+            str(tmp_path),
+            _emit_to([]),
+            workspace_file=str(workspace),
+            is_detached=lambda: True,
+        )
+        await session.query("hello", turn_id="turn-2", cell_id="cell-1")
+
+    asyncio.run(run())
+
+    turn = _persisted_turn(workspace)
+    assert turn["status"] == "error"
+    assert turn["terminalReason"] == "cancelled"
+
+
+def test_detached_turn_persists_failed_terminal_reason(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+    workspace = _write_running_workspace(tmp_path / "failed.agentnb")
+
+    def factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+        session.prompt_error = DshAcpSessionError("runtime died mid-turn")
+        return session
+
+    _configure_fake_acp(monkeypatch, factory)
+
+    async def run():
+        session = AgentSession(
+            str(tmp_path),
+            _emit_to([]),
+            workspace_file=str(workspace),
+            is_detached=lambda: True,
+        )
+        await session.query("hello", turn_id="turn-3", cell_id="cell-1")
+
+    asyncio.run(run())
+
+    turn = _persisted_turn(workspace)
+    assert turn["status"] == "error"
+    assert turn["terminalReason"] == "failed"
+
+
+def test_host_bootstrap_lock_released_after_first_start_failure(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+    runtime = _FakeSharedRuntime()
+    created = []
+
+    def factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+        if str(kwargs["cwd"]).endswith("bad"):
+            session.start_error = DshAcpSessionError("first child failed")
+        created.append(session)
+        return session
+
+    _configure_fake_acp(monkeypatch, factory)
+
+    async def run():
+        bad = AgentSession(str(tmp_path / "bad"), _emit_to([]), runtime=runtime)
+        await bad.start()
+        good = AgentSession(str(tmp_path / "good"), _emit_to([]), runtime=runtime)
+        await good.start()
+        return bad, good
+
+    bad, good = asyncio.run(run())
+
+    # The failed first start released the host bootstrap lock and left no
+    # transport installed, so the next session can bootstrap normally.
+    assert bad._acp is None
+    assert created[0].closes == 1
+    assert good._acp is not None
+    assert len(runtime.adopted) == 1
+    assert runtime._transport is created[1]._transport
+    assert created[1]._owns_transport is False

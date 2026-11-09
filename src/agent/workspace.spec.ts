@@ -26,7 +26,9 @@ import {
 import { WorkspaceNotebook, type WorkspaceCell } from './notebook';
 import { AgentSession } from './session';
 import { createTurn, setTurnStatus, toggleActivity, toggleTrace } from './turn';
+import type { ConfigurationReport } from './protocol';
 import {
+  workspaceOverview,
   workspaceUiState,
   type WorkspaceUiState
 } from './workspace-interaction';
@@ -861,6 +863,22 @@ describe('AgentWorkspaceContent queue scheduling', () => {
     jest.restoreAllMocks();
   });
 
+  it('connects a drained run and reports the transport wait', () => {
+    const connect = jest.mocked(AgentSession.prototype.connect);
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as WorkspaceInternals;
+
+    content.notebook.setSource('first');
+    internals.runCell(false);
+
+    expect(connect).toHaveBeenCalled();
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-statusExecution')
+        ?.textContent
+    ).toContain('Connecting to the Agent server before sending the queued run');
+    content.dispose();
+  });
+
   it('queues the next request and sends it only after the active AI turn ends', () => {
     const exec = jest
       .spyOn(AgentSession.prototype, 'exec')
@@ -898,6 +916,38 @@ describe('AgentWorkspaceContent queue scheduling', () => {
       source: '!second',
       executionSource: 'second'
     });
+
+    content.dispose();
+  });
+
+  it('keeps a user-collapsed execution record collapsed across session updates', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as WorkspaceInternals;
+    content.notebook.setSource('first');
+    internals.runCell(false);
+
+    const cell = content.notebook.cells[0];
+    const turnId = content.notebook.activeRun!.id;
+    cell.turn = toggleTrace(setTurnStatus(createTurn(turnId), 'running', []));
+    expect(cell.turn.presentation.trace).toBe('collapsed');
+
+    content.session.blocks = [
+      { kind: 'text', id: 'text-1', messageId: 'm1', text: 'working' }
+    ];
+    content.session.turn = setTurnStatus(
+      createTurn(turnId),
+      'running',
+      content.session.blocks
+    );
+    internals.onSessionChange();
+    expect(cell.turn?.presentation.trace).toBe('collapsed');
+
+    content.session.running = false;
+    content.session.connected = true;
+    content.session.error = null;
+    internals.onSessionChange();
+    expect(cell.status).toBe('done');
+    expect(cell.turn?.presentation.trace).toBe('collapsed');
 
     content.dispose();
   });
@@ -1859,6 +1909,7 @@ describe('AgentWorkspaceContent page interaction', () => {
     const onRevealFailure = jest.fn();
     const onRevealInterrupted = jest.fn();
     const onOpenHistory = jest.fn();
+    const onRefreshConfiguration = jest.fn();
     const onRetrySave = jest.fn();
     const status = new StatusBar({
       onStartNewContext,
@@ -1868,6 +1919,7 @@ describe('AgentWorkspaceContent page interaction', () => {
       onRevealFailure,
       onRevealInterrupted,
       onOpenHistory,
+      onRefreshConfiguration,
       onRetrySave
     });
     const overview = {
@@ -2540,10 +2592,9 @@ describe('AgentWorkspaceContent page interaction', () => {
     acceptActiveAgentRun(content, internals);
     await Promise.resolve();
 
-    const submitted = content.node.querySelector(
-      `.jp-AgentWorkspace-cell[data-cell-id="${content.notebook.cells[1].id}"]`
+    expect(document.activeElement).toBe(
+      content.node.querySelectorAll('.jp-AgentWorkspace-cellInput')[1]
     );
-    expect(submitted?.contains(document.activeElement)).toBe(true);
     expect(document.activeElement).not.toBe(continueButton);
     content.dispose();
     content.node.remove();
@@ -2566,10 +2617,9 @@ describe('AgentWorkspaceContent page interaction', () => {
     failed.session.running = false;
     failedInternals.onSessionChange();
     await Promise.resolve();
-    const submitted = failed.node.querySelector(
-      `.jp-AgentWorkspace-cell[data-cell-id="${failed.notebook.cells[1].id}"]`
+    expect(document.activeElement).toBe(
+      failed.node.querySelectorAll('.jp-AgentWorkspace-cellInput')[1]
     );
-    expect(submitted?.contains(document.activeElement)).toBe(true);
     failed.dispose();
     failed.node.remove();
 
@@ -2913,10 +2963,12 @@ describe('AgentWorkspaceContent page interaction', () => {
       const internals = content as unknown as PageInternals;
       const first = content.notebook.current;
       first.source = 'first';
-      first.status = 'queued';
+      first.status = 'done';
+      first.executionCount = 1;
       const second = content.notebook.appendCell();
       second.source = 'second';
-      second.status = 'queued';
+      second.status = 'done';
+      second.executionCount = 2;
       content.notebook.select(0);
       content.notebook.enterEdit();
       internals.refresh();
@@ -3436,6 +3488,47 @@ describe('cell context submission', () => {
     content.dispose();
   });
 
+  it('reopens and focuses the context choice when a second submit is refused', async () => {
+    const content = new AgentWorkspaceContent(null);
+    document.body.append(content.node);
+    seedDoneAiCell(content);
+    appendInputCell(content);
+    content.session.contextState = 'unavailable';
+
+    submitCell(content, 'continue the analysis');
+    // Simulate the user not noticing the panel: hide it without cancelling the
+    // pending choice, then submit again.
+    (
+      content as unknown as { status: { closeHistoryChoice(): void } }
+    ).status.closeHistoryChoice();
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-historyChoice')
+    ).toBeNull();
+
+    cellInput(content).dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Enter',
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true
+      })
+    );
+    await Promise.resolve();
+
+    expect(contextButtons(content).bridge).not.toBeNull();
+    expect(
+      content.node.querySelector<HTMLElement>(
+        '.jp-AgentWorkspace-contextPopover'
+      )?.hidden
+    ).toBe(false);
+    expect(document.activeElement).toBe(contextButtons(content).bridge);
+    expect(content.node.textContent).toContain(
+      'The saved Agent context is unavailable. Resolve the pending context choice before submitting again.'
+    );
+
+    content.dispose();
+  });
+
   it('runs the pending cell once after the context choice is confirmed', () => {
     const sendUser = jest.mocked(AgentSession.prototype.sendUser);
     const content = new AgentWorkspaceContent(null);
@@ -3618,6 +3711,81 @@ describe('cell context submission', () => {
     expect(content.notebook.cells[0].status).toBe('running');
 
     content.dispose();
+  });
+
+  it('keeps unavailable-context prompts while compaction stays not observable', () => {
+    jest
+      .spyOn(AgentSession.prototype, 'configurationReport', 'get')
+      .mockReturnValue({
+        runtimeLifetime: 'runtime-1',
+        generation: 1,
+        state: 'active',
+        active: null,
+        desired: null,
+        differences: {},
+        compaction: 'not-observable',
+        preflightApplied: false
+      });
+    const content = new AgentWorkspaceContent(null);
+    document.body.append(content.node);
+    seedDoneAiCell(content);
+    appendInputCell(content);
+    content.session.contextState = 'unavailable';
+    (content as unknown as CellSubmitInternals).refresh();
+
+    submitCell(content, 'continue the analysis');
+
+    const choice = content.node.querySelector(
+      '.jp-AgentWorkspace-historyChoiceDescription'
+    );
+    expect(choice?.textContent).toContain(
+      'The saved Agent context could not be resumed.'
+    );
+    expect(choice?.textContent).not.toContain('Compaction');
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-configurationContent')
+        ?.textContent
+    ).toContain('Compaction: not observable');
+    // The pending choice is still an unavailable context, not a reset one.
+    expect(content.session.contextState).toBe('unavailable');
+    const context = content.node.querySelector(
+      '.jp-AgentWorkspace-contextDescription'
+    );
+    expect(context?.textContent).toContain(
+      'its Agent context is unavailable on this server'
+    );
+    expect(context?.textContent).not.toContain(
+      'The previous context link was cleared'
+    );
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-statusContext')
+        ?.textContent
+    ).toContain('Context: Unavailable');
+
+    // Without visible AI history the same state keeps its explicit
+    // start-a-new-context hint instead of compaction or reset copy.
+    const fresh = new AgentWorkspaceContent(null);
+    document.body.append(fresh.node);
+    fresh.session.contextState = 'unavailable';
+    (fresh as unknown as CellSubmitInternals).refresh();
+    submitCell(fresh, 'needs a context');
+
+    expect(
+      fresh.node.querySelector('.jp-AgentWorkspace-statusExecution')
+        ?.textContent
+    ).toContain('Start a new context before continuing with an AI request.');
+    expect(fresh.session.contextState).toBe('unavailable');
+    expect(
+      fresh.node.querySelector('.jp-AgentWorkspace-configurationContent')
+        ?.textContent
+    ).toContain('Compaction: not observable');
+    expect(
+      fresh.node.querySelector('.jp-AgentWorkspace-contextDescription')
+        ?.textContent
+    ).not.toContain('The previous context link was cleared');
+
+    content.dispose();
+    fresh.dispose();
   });
 });
 
@@ -4555,5 +4723,482 @@ describe('AgentWorkspaceContent execution record toggle', () => {
     rectSpy.mockRestore();
     content.node.remove();
     content.dispose();
+  });
+
+  it('mirrors a user toggle into the session turn for the active run', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as ToggleInternals;
+    const blocks = [
+      {
+        kind: 'tool' as const,
+        id: 'tool-1',
+        name: 'Bash',
+        input: { command: 'ls' },
+        output: 'a.ts\n',
+        status: 'done' as const
+      }
+    ];
+    const cell = content.notebook.current;
+    cell.kind = 'ai';
+    cell.status = 'done';
+    cell.source = 'list files';
+    cell.blocks = blocks;
+    cell.turn = setTurnStatus(createTurn('run-1'), 'done', blocks);
+    content.session.turn = setTurnStatus(createTurn('run-1'), 'done', blocks);
+    document.body.append(content.node);
+    internals.refresh();
+
+    const before = content.node.querySelector<HTMLButtonElement>(
+      '[data-turn-focus-key="trace:run-1"]'
+    );
+    before?.click();
+
+    expect(cell.turn?.presentation.trace).toBe('expanded');
+    expect(content.session.turn?.presentation.trace).toBe('expanded');
+
+    content.node.remove();
+    content.dispose();
+  });
+});
+
+describe('effective configuration report', () => {
+  function readyState(): WorkspaceUiState {
+    return workspaceUiState({
+      connected: true,
+      error: null,
+      cwd: '/tmp',
+      selectedCellId: null,
+      activeRun: null,
+      queueCount: 0,
+      contextState: 'live'
+    });
+  }
+
+  function handlers(
+    onRefreshConfiguration = jest.fn()
+  ): ConstructorParameters<typeof StatusBar>[0] {
+    return {
+      onStartNewContext: jest.fn(),
+      onContinueFromHistory: jest.fn(),
+      onStartEmptyContext: jest.fn(),
+      onDismissContextChoice: jest.fn(),
+      onRevealFailure: jest.fn(),
+      onRevealInterrupted: jest.fn(),
+      onOpenHistory: jest.fn(),
+      onRefreshConfiguration,
+      onRetrySave: jest.fn()
+    };
+  }
+
+  function report(
+    overrides: Partial<ConfigurationReport> = {}
+  ): ConfigurationReport {
+    return {
+      runtimeLifetime: 'runtime-1',
+      generation: 3,
+      state: 'active',
+      active: null,
+      desired: null,
+      differences: {},
+      compaction: 'not-observable',
+      preflightApplied: false,
+      ...overrides
+    };
+  }
+
+  function configurationText(status: StatusBar): string {
+    return (
+      status.node.querySelector('.jp-AgentWorkspace-configurationContent')
+        ?.textContent ?? ''
+    );
+  }
+
+  function configurationErrorText(status: StatusBar): string {
+    return (
+      status.node.querySelector('.jp-AgentWorkspace-configurationError')
+        ?.textContent ?? ''
+    );
+  }
+
+  function executionText(status: StatusBar): string {
+    return (
+      status.node.querySelector('.jp-AgentWorkspace-statusExecution')
+        ?.textContent ?? ''
+    );
+  }
+
+  const configurationErrorCopy =
+    'AI Terminal configuration could not be refreshed; the current turn keeps running.';
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('renders active/desired values with user, default, and derived provenance', () => {
+    const status = new StatusBar(handlers());
+    status.sync(
+      readyState(),
+      workspaceOverview([]),
+      report({
+        active: {
+          contextWindow: 200000,
+          maxOutputTokens: 8192,
+          compaction: { enabled: true, thresholdRatio: 0.8 },
+          computed: { messageBudget: 100, pressure: 0.4 },
+          provenance: {
+            context_window: { source: 'user' },
+            max_output_tokens: { source: 'default' },
+            message_budget: {
+              source: 'derived',
+              derivedFrom: ['context_window', 'max_output_tokens']
+            }
+          }
+        },
+        desired: { contextWindow: 100000, maxOutputTokens: 4096 },
+        compaction: 'disabled'
+      })
+    );
+
+    const text = configurationText(status);
+    expect(status.node.textContent).toContain('Effective configuration');
+    expect(text).toContain('runtime-1');
+    expect(text).toContain('3');
+    expect(text).toContain(
+      '200000 tokens (declared metadata, not measured capacity)'
+    );
+    expect(text).toContain('Provenance context_window');
+    expect(text).toContain('user');
+    expect(text).toContain('default');
+    expect(text).toContain('derived from context_window, max_output_tokens');
+    expect(text).toContain('Computed message budget');
+    expect(text).toContain('Compaction threshold ratio');
+    expect(text).toContain('Compaction: disabled');
+    expect(text).toContain('declared metadata, not measured capacity');
+    expect(text).toContain('does not repair gateway or provider truncation');
+  });
+
+  it('reports pending next-runtime changes without claiming they are applied', () => {
+    const status = new StatusBar(handlers());
+    status.sync(
+      readyState(),
+      workspaceOverview([]),
+      report({
+        state: 'pending-next-runtime',
+        active: { contextWindow: 100000 },
+        desired: { contextWindow: 200000 },
+        differences: {
+          context_window: { active: 100000, desired: 200000 },
+          compaction_enabled: { active: true, desired: false }
+        }
+      })
+    );
+
+    const text = configurationText(status);
+    expect(text).toContain('Pending next runtime');
+    expect(text).toContain('not active now');
+    expect(text).toContain('administrator explicitly restarts Jupyter');
+    expect(text).toContain('A new session does not activate them');
+    expect(text).toContain('never restarts or interrupts the runtime');
+    expect(text).toContain('100000 → 200000');
+    expect(text).toContain('true → false');
+    expect(text).not.toContain(
+      'Active: these values are applied to the currently running runtime.'
+    );
+  });
+
+  it('shows no active values when the runtime has not started', () => {
+    const status = new StatusBar(handlers());
+    status.sync(
+      readyState(),
+      workspaceOverview([]),
+      report({
+        state: 'not-started',
+        active: null,
+        desired: { contextWindow: 100000 }
+      })
+    );
+
+    const text = configurationText(status);
+    expect(text).toContain('Not started');
+    expect(text).toContain('no active configuration is applied yet');
+    expect(text).toContain('Not reported by the runtime.');
+    expect(text).toContain('ValuesNot reported by the runtime.');
+    expect(text).not.toContain('200000 tokens');
+  });
+
+  it('states that effective configuration is unavailable without a report', () => {
+    const status = new StatusBar(handlers());
+    status.sync(readyState(), workspaceOverview([]), null);
+
+    const text = configurationText(status);
+    expect(text).toContain(
+      'Effective configuration is unavailable until the runtime reports it'
+    );
+    expect(text).toContain('No values are inferred.');
+  });
+
+  it('shows a configuration failure as a persistent panel notice that keeps the active report', () => {
+    const status = new StatusBar(handlers());
+    const activeReport = report({
+      runtimeLifetime: 'runtime-7',
+      generation: 7,
+      active: { contextWindow: 200000 }
+    });
+    status.sync(
+      readyState(),
+      workspaceOverview([]),
+      activeReport,
+      configurationErrorCopy
+    );
+
+    expect(configurationErrorText(status)).toBe(configurationErrorCopy);
+    const text = configurationText(status);
+    expect(text).toContain('runtime-7');
+    expect(text).toContain('200000 tokens');
+    expect(text).toContain(
+      'Active: these values are applied to the currently running runtime.'
+    );
+    // The failure is a panel row, not a transient execution message.
+    expect(executionText(status)).not.toContain(configurationErrorCopy);
+
+    status.sync(
+      readyState(),
+      workspaceOverview([]),
+      activeReport,
+      '<img src=x onerror=alert(1)>'
+    );
+    expect(configurationErrorText(status)).toBe('<img src=x onerror=alert(1)>');
+    expect(
+      status.node.querySelector('.jp-AgentWorkspace-configurationError img')
+    ).toBeNull();
+    expect(
+      status.node.querySelector('.jp-AgentWorkspace-configurationContent')!
+        .textContent
+    ).toContain('runtime-7');
+  });
+
+  it('clears the configuration failure notice after a successful report', () => {
+    const status = new StatusBar(handlers());
+    const activeReport = report({ generation: 5 });
+    status.sync(
+      readyState(),
+      workspaceOverview([]),
+      activeReport,
+      configurationErrorCopy
+    );
+    expect(configurationErrorText(status)).toBe(configurationErrorCopy);
+
+    // Same report object: only the cleared error makes the dedupe key differ.
+    status.sync(readyState(), workspaceOverview([]), activeReport, null);
+
+    expect(configurationErrorText(status)).toBe('');
+    expect(
+      status.node.querySelector<HTMLElement>(
+        '.jp-AgentWorkspace-configurationError'
+      )?.hidden
+    ).toBe(true);
+    expect(configurationText(status)).toContain('runtime-1');
+    expect(executionText(status)).not.toContain(configurationErrorCopy);
+  });
+
+  it('skips an empty difference path instead of rendering a blank label', () => {
+    const status = new StatusBar(handlers());
+    status.sync(
+      readyState(),
+      workspaceOverview([]),
+      report({
+        differences: {
+          '': { active: null, desired: { contextWindow: 100000 } },
+          context_window: { active: 100000, desired: 200000 }
+        }
+      })
+    );
+
+    const labels = Array.from(
+      status.node.querySelectorAll<HTMLElement>(
+        '.jp-AgentWorkspace-configurationLabel'
+      )
+    ).map(node => node.textContent);
+    expect(labels).not.toContain('');
+    expect(configurationText(status)).toContain('100000 → 200000');
+  });
+
+  it('refreshes configuration through the handler without other side effects', () => {
+    const onRefreshConfiguration = jest.fn();
+    const status = new StatusBar(handlers(onRefreshConfiguration));
+
+    status.node
+      .querySelector<HTMLButtonElement>(
+        '.jp-AgentWorkspace-refreshConfiguration'
+      )
+      ?.click();
+
+    expect(onRefreshConfiguration).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders the session report and updates after a session change', () => {
+    const getter = jest.spyOn(
+      AgentSession.prototype,
+      'configurationReport',
+      'get'
+    );
+    getter.mockReturnValue(report({ generation: 3 }));
+    const content = new AgentWorkspaceContent(null);
+    expect(content.node.textContent).toContain('runtime-1');
+
+    getter.mockReturnValue(
+      report({ generation: 4, runtimeLifetime: 'runtime-2' })
+    );
+    (content as unknown as { onSessionChange(): void }).onSessionChange();
+    expect(content.node.textContent).toContain('runtime-2');
+    content.dispose();
+  });
+
+  it('asks the session for a fresh report without connecting or changing context', () => {
+    const requestConfiguration = jest
+      .spyOn(AgentSession.prototype, 'requestConfiguration')
+      .mockImplementation(() => {});
+    const connect = jest
+      .spyOn(AgentSession.prototype, 'connect')
+      .mockImplementation(() => {});
+    const resetContext = jest.spyOn(AgentSession.prototype, 'resetContext');
+    const content = new AgentWorkspaceContent(null);
+    const contextState = content.session.contextState;
+    const serialized = serializeNotebook(content.notebook);
+
+    content.node
+      .querySelector<HTMLButtonElement>(
+        '.jp-AgentWorkspace-refreshConfiguration'
+      )
+      ?.click();
+
+    expect(requestConfiguration).toHaveBeenCalledTimes(1);
+    expect(connect).not.toHaveBeenCalled();
+    expect(resetContext).not.toHaveBeenCalled();
+    expect(content.session.contextState).toBe(contextState);
+    expect(content.notebook.activeRun).toBeNull();
+    expect(serializeNotebook(content.notebook)).toBe(serialized);
+    content.dispose();
+  });
+
+  it('reports that configuration cannot be refreshed while disconnected without connecting', () => {
+    const requestConfiguration = jest
+      .spyOn(AgentSession.prototype, 'requestConfiguration')
+      .mockReturnValue(false);
+    const connect = jest
+      .spyOn(AgentSession.prototype, 'connect')
+      .mockImplementation(() => {});
+    const resetContext = jest.spyOn(AgentSession.prototype, 'resetContext');
+    const content = new AgentWorkspaceContent(null);
+    const contextState = content.session.contextState;
+    const serialized = serializeNotebook(content.notebook);
+
+    content.node
+      .querySelector<HTMLButtonElement>(
+        '.jp-AgentWorkspace-refreshConfiguration'
+      )
+      ?.click();
+
+    expect(requestConfiguration).toHaveBeenCalledTimes(1);
+    expect(connect).not.toHaveBeenCalled();
+    expect(resetContext).not.toHaveBeenCalled();
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-statusExecution')
+        ?.textContent
+    ).toContain('not connected');
+    expect(content.session.contextState).toBe(contextState);
+    expect(content.notebook.activeRun).toBeNull();
+    expect(serializeNotebook(content.notebook)).toBe(serialized);
+    content.dispose();
+  });
+
+  it('keeps a bodyless running turn and live context while showing the configuration failure', () => {
+    jest
+      .spyOn(AgentSession.prototype, 'configurationReport', 'get')
+      .mockReturnValue(report({ runtimeLifetime: 'runtime-9', generation: 9 }));
+    const configurationError = jest.spyOn(
+      AgentSession.prototype,
+      'configurationError',
+      'get'
+    );
+    configurationError.mockReturnValue(null);
+    jest.spyOn(AgentSession.prototype, 'connect').mockImplementation(() => {});
+    jest.spyOn(AgentSession.prototype, 'sendUser').mockImplementation(function (
+      this: AgentSession
+    ): void {
+      this.running = true;
+      this.error = null;
+    });
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as {
+      runCell(advance: boolean): void;
+      onSessionChange(): void;
+    };
+
+    content.notebook.setSource('do the work');
+    internals.runCell(false);
+    const requestId = content.notebook.activeRun!.id;
+    content.session.acceptedTurnId = requestId;
+    content.session.contextState = 'live';
+    content.session.blocks = [];
+    content.session.turn = setTurnStatus(createTurn(requestId), 'running', []);
+    internals.onSessionChange();
+    expect(content.notebook.cells[0].status).toBe('running');
+    expect(content.node.textContent).not.toContain(configurationErrorCopy);
+
+    configurationError.mockReturnValue(configurationErrorCopy);
+    internals.onSessionChange();
+
+    expect(content.node.textContent).toContain(configurationErrorCopy);
+    expect(content.node.textContent).toContain('runtime-9');
+    expect(content.notebook.cells[0].status).toBe('running');
+    expect(content.session.turn?.status).toBe('running');
+    expect(content.session.running).toBe(true);
+    expect(content.session.contextState).toBe('live');
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-statusExecution')
+        ?.textContent
+    ).not.toContain(configurationErrorCopy);
+    content.dispose();
+  });
+
+  it('states not-observable compaction without downgrading a live context', () => {
+    const status = new StatusBar(handlers());
+    status.sync(readyState(), workspaceOverview([]), report());
+
+    const configuration = configurationText(status);
+    expect(configuration).toContain('Compaction: not observable');
+    expect(configuration).toContain(
+      'The runtime did not prove whether compaction is active.'
+    );
+    expect(configuration).not.toContain('Compaction: disabled');
+
+    // Scoped to the context nodes: the popover also contains the always-present
+    // "Start new context" button, which must not be read as a warning.
+    const context =
+      status.node.querySelector('.jp-AgentWorkspace-contextDescription')
+        ?.textContent ?? '';
+    expect(context).toBe(
+      'The current Agent context is live and linked to this workspace.'
+    );
+    expect(context).not.toMatch(
+      /unavailable|reset|could not be resumed|cleared/i
+    );
+    expect(executionText(status)).not.toMatch(
+      /unavailable|reset|could not be resumed|cleared/i
+    );
+    expect(
+      status.node
+        .querySelector('.jp-AgentWorkspace-statusContext')
+        ?.classList.contains('is-unavailable')
+    ).toBe(false);
+    expect(
+      status.node.querySelector<HTMLElement>('.jp-AgentWorkspace-historyChoice')
+        ?.hidden
+    ).toBe(true);
+    expect(
+      status.node.querySelector('.jp-AgentWorkspace-historyChoiceDescription')
+        ?.textContent
+    ).toBe('');
   });
 });
