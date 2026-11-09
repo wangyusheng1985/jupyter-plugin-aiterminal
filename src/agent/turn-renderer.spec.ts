@@ -949,6 +949,17 @@ describe('outcome Markdown copy', () => {
     expect(button!.type).toBe('button');
     expect(button!.getAttribute('aria-label')).toBe('Copy');
     expect(button!.textContent).toBe('Copy');
+    const card = node.querySelector('.jp-AgentWorkspace-outcome');
+    expect(
+      card?.firstElementChild?.classList.contains(
+        'jp-AgentWorkspace-outcomeActions'
+      )
+    ).toBe(true);
+    expect(
+      card?.lastElementChild?.classList.contains(
+        'jp-AgentWorkspace-outcomeBody'
+      )
+    ).toBe(true);
 
     button!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     await flush();

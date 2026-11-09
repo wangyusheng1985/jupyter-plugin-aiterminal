@@ -294,6 +294,11 @@
 .jp-AgentWorkspace-outcome {
   min-width: 0;
   max-width: 100%;
+  padding: 12px;
+  border: 1px solid var(--jp-border-color2, #e0e0e0);
+  border-radius: 6px;
+  background: var(--jp-layout-color0, #ffffff);
+  box-sizing: border-box;
 }
 
 .jp-AgentWorkspace-outcomeBody {
@@ -526,21 +531,25 @@
 .jp-AgentWorkspace-outcomeActions {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 8px;
-  margin-top: 4px;
+  margin-bottom: 8px;
   font-family: var(--jp-ui-font-family, sans-serif);
   font-size: var(--jp-ui-font-size1, 13px);
 }
 
 .jp-AgentWorkspace-outcomeCopyButton {
-  min-height: 26px;
-  padding: 2px 10px;
-  border: var(--jp-border-width, 1px) solid var(--jp-border-color2, #e0e0e0);
-  border-radius: var(--jp-border-radius, 2px);
-  background: transparent;
+  min-height: 32px;
+  min-width: 64px;
+  padding: 4px 12px;
+  border: 1px solid var(--jp-brand-color1, #1976d2);
+  border-radius: 4px;
+  background: var(--jp-layout-color1, #f5f5f5);
   color: var(--jp-content-link-color, #1976d2);
   cursor: pointer;
   font: inherit;
+  font-weight: 600;
 }
 
 .jp-AgentWorkspace-outcomeCopyButton:hover {

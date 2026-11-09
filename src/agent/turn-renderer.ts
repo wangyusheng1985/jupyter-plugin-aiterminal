@@ -113,12 +113,11 @@ function renderOutcome(
   body.className = 'jp-AgentWorkspace-outcomeBody';
   body.dataset.turnScrollKey = `outcome:${turn.id}`;
   renderMarkdownSource(body, turn.outcome, options.rendermime ?? null);
-  section.append(body);
-
   const copyText = copyableOutcomeText(turn);
   if (copyText !== null) {
     section.append(renderOutcomeCopyControl(turn, copyText));
   }
+  section.append(body);
   return section;
 }
 
