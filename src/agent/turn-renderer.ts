@@ -1,8 +1,10 @@
 import type { IRenderMimeRegistry } from '@jupyterlab/rendermime';
 
 import { renderMarkdownSource } from './markdown';
+import { writeClipboardText } from './selectioncopy';
 import { formatToolInput } from './tool';
 import {
+  copyableOutcomeText,
   isTraceExpanded,
   terminalReasonMessage,
   type ChatTurn,
@@ -112,7 +114,79 @@ function renderOutcome(
   body.dataset.turnScrollKey = `outcome:${turn.id}`;
   renderMarkdownSource(body, turn.outcome, options.rendermime ?? null);
   section.append(body);
+
+  const copyText = copyableOutcomeText(turn);
+  if (copyText !== null) {
+    section.append(renderOutcomeCopyControl(turn, copyText));
+  }
   return section;
+}
+
+const COPY_FEEDBACK_MS = 2000;
+
+/**
+ * Copies the pre-render Markdown source held on the turn, never the rendered
+ * DOM or the current selection, so collapsing the cell cannot change what is
+ * copied. Feedback stays in an `aria-live` status and is cleared after a short
+ * delay; a second click copies again.
+ */
+function renderOutcomeCopyControl(turn: ChatTurn, text: string): HTMLElement {
+  const row = document.createElement('div');
+  row.className = 'jp-AgentWorkspace-outcomeActions';
+  row.dataset.copyState = 'idle';
+  row.dataset.turnId = turn.id;
+
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className =
+    'jp-AgentWorkspace-turnControl jp-AgentWorkspace-outcomeCopyButton';
+  button.dataset.turnControl = '';
+  button.dataset.copyAction = 'outcome';
+  // No translator is available here; mirror the fixed Lab copy wording.
+  button.setAttribute('aria-label', 'Copy Markdown'); // eslint-disable-line jupyter/no-untranslated-string
+  button.textContent = 'Copy Markdown';
+
+  const status = document.createElement('span');
+  status.className = 'jp-AgentWorkspace-outcomeCopyStatus';
+  status.setAttribute('role', 'status');
+  status.setAttribute('aria-live', 'polite');
+  status.setAttribute('aria-atomic', 'true');
+
+  let feedbackTimer: number | undefined;
+  let request = 0;
+
+  const showState = (state: 'copied' | 'failed', message: string): void => {
+    row.dataset.copyState = state;
+    status.dataset.copyState = state;
+    status.textContent = message;
+    if (feedbackTimer !== undefined) window.clearTimeout(feedbackTimer);
+    feedbackTimer = window.setTimeout(() => {
+      row.dataset.copyState = 'idle';
+      status.dataset.copyState = 'idle';
+      status.textContent = '';
+    }, COPY_FEEDBACK_MS);
+  };
+
+  button.addEventListener('mousedown', event => {
+    event.preventDefault();
+    event.stopPropagation();
+  });
+  button.addEventListener('click', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    const current = (request += 1);
+    row.dataset.copyState = 'pending';
+    void writeClipboardText(text).then(copied => {
+      if (current !== request) return;
+      showState(
+        copied ? 'copied' : 'failed',
+        copied ? 'Copied' : 'Copy failed'
+      );
+    });
+  });
+
+  row.append(button, status);
+  return row;
 }
 
 function renderAuditSummary(

@@ -83,15 +83,67 @@ export function copyTextToClipboard(text: string): void {
     void clipboard.writeText(text);
     return;
   }
+  legacyCopy(text);
+}
+
+/**
+ * Copy text and report whether it actually reached the clipboard. Unlike
+ * `copyTextToClipboard`, the caller must show the result: a rejected promise
+ * (insecure context, missing permission) or a falsy `execCommand` is a real
+ * failure and must never be reported as success. The legacy path restores the
+ * prior DOM selection and focus and removes its temporary textarea.
+ */
+export async function writeClipboardText(text: string): Promise<boolean> {
+  const clipboard = navigator.clipboard;
+  if (clipboard?.writeText) {
+    try {
+      await clipboard.writeText(text);
+      return true;
+    } catch {
+      // Fall through: http origins and denied permissions reject here.
+    }
+  }
+  return legacyCopy(text);
+}
+
+function legacyCopy(text: string): boolean {
+  const selection =
+    typeof document.getSelection === 'function'
+      ? document.getSelection()
+      : null;
+  const ranges: Range[] = [];
+  if (selection) {
+    for (let index = 0; index < selection.rangeCount; index += 1) {
+      ranges.push(selection.getRangeAt(index));
+    }
+  }
+  const active =
+    document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
   const field = document.createElement('textarea');
   field.value = text;
   field.setAttribute('readonly', '');
+  field.setAttribute('aria-hidden', 'true');
   field.style.position = 'fixed';
+  field.style.top = '-9999px';
   field.style.left = '-9999px';
   document.body.append(field);
-  field.select();
-  document.execCommand('copy');
-  field.remove();
+  let copied = false;
+  try {
+    field.select();
+    copied = document.execCommand('copy');
+  } catch {
+    copied = false;
+  } finally {
+    field.remove();
+    if (active) active.focus({ preventScroll: true });
+    if (selection) {
+      selection.removeAllRanges();
+      ranges.forEach(range => selection.addRange(range));
+    }
+  }
+  return copied;
 }
 
 export class SelectionCopyButton {

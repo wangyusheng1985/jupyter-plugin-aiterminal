@@ -899,3 +899,178 @@ const done = false;</code></pre>
     expect(renderMarkdown).not.toHaveBeenCalled();
   });
 });
+
+describe('outcome Markdown copy', () => {
+  const markdown = [
+    '# 标题',
+    '',
+    '- item one',
+    '- item two',
+    '',
+    '```ts',
+    'const ready = true;',
+    '```',
+    '',
+    '[link](https://example.com)',
+    '',
+    '| a | b |',
+    '| - | - |',
+    '| 1 | 2 |'
+  ].join('\n');
+
+  function resultTurn(text: string): ChatTurn {
+    return applyTurnEvent(createTurn('run-copy'), [], {
+      type: 'result',
+      turnId: 'run-copy',
+      text,
+      reason: 'completed'
+    });
+  }
+
+  function flush(): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, 0));
+  }
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    Object.assign(navigator, { clipboard: undefined });
+  });
+
+  it('copies the exact pre-render Markdown source instead of the DOM', async () => {
+    const writeText = jest.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const node = renderTurn(resultTurn(markdown), { handlers: handlers() });
+    document.body.append(node);
+
+    const button = node.querySelector<HTMLButtonElement>(
+      '.jp-AgentWorkspace-outcomeCopyButton'
+    );
+    expect(button).not.toBeNull();
+    expect(button!.type).toBe('button');
+    expect(button!.getAttribute('aria-label')).toBe('Copy Markdown');
+    expect(button!.textContent).toBe('Copy Markdown');
+
+    button!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await flush();
+
+    // renderMarkdown is mocked, so an empty DOM still copied the full source.
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(writeText).toHaveBeenCalledWith(markdown);
+    const status = node.querySelector<HTMLElement>(
+      '.jp-AgentWorkspace-outcomeCopyStatus'
+    );
+    expect(status?.textContent).toBe('Copied');
+    expect(status?.getAttribute('role')).toBe('status');
+    expect(
+      node
+        .querySelector('.jp-AgentWorkspace-outcomeActions')
+        ?.getAttribute('data-copy-state')
+    ).toBe('copied');
+    node.remove();
+  });
+
+  it('does not copy the DOM when the cell is collapsed', async () => {
+    const writeText = jest.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const turn = resultTurn(markdown);
+    expect(turn.presentation.trace).toBe('collapsed');
+    const node = renderTurn(turn, { handlers: handlers() });
+    document.body.append(node);
+    // Collapsed cells still render the full outcome body.
+    node
+      .querySelector<HTMLButtonElement>('.jp-AgentWorkspace-outcomeCopyButton')!
+      .dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await flush();
+    expect(writeText).toHaveBeenCalledWith(markdown);
+    node.remove();
+  });
+
+  it('offers no copy control when the outcome is tool output or empty', () => {
+    const toolOutcome = applyTurnEvent(
+      createTurn('run-tool'),
+      [toolBlock('tool-1')],
+      {
+        type: 'result',
+        turnId: 'run-tool',
+        text: '',
+        reason: 'completed'
+      }
+    );
+    expect(toolOutcome.outcomeKind).toBe('tool');
+    expect(
+      renderTurn(toolOutcome, { handlers: handlers() }).querySelector(
+        '.jp-AgentWorkspace-outcomeCopyButton'
+      )
+    ).toBeNull();
+
+    expect(
+      renderTurn(resultTurn('   '), { handlers: handlers() }).querySelector(
+        '.jp-AgentWorkspace-outcomeCopyButton'
+      )
+    ).toBeNull();
+  });
+
+  it('falls back to execCommand and still reports success', async () => {
+    Object.assign(navigator, { clipboard: undefined });
+    const exec = jest.fn().mockReturnValue(true);
+    Object.defineProperty(document, 'execCommand', {
+      configurable: true,
+      value: exec
+    });
+    const node = renderTurn(resultTurn(markdown), { handlers: handlers() });
+    document.body.append(node);
+
+    node
+      .querySelector<HTMLButtonElement>('.jp-AgentWorkspace-outcomeCopyButton')!
+      .dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await flush();
+
+    expect(exec).toHaveBeenCalledWith('copy');
+    expect(
+      node.querySelector<HTMLElement>('.jp-AgentWorkspace-outcomeCopyStatus')
+        ?.textContent
+    ).toBe('Copied');
+    // The temporary textarea must be removed from the document.
+    expect(document.querySelector('textarea')).toBeNull();
+    node.remove();
+  });
+
+  it('reports a failed fallback instead of pretending success', async () => {
+    Object.assign(navigator, { clipboard: undefined });
+    Object.defineProperty(document, 'execCommand', {
+      configurable: true,
+      value: jest.fn().mockReturnValue(false)
+    });
+    const node = renderTurn(resultTurn(markdown), { handlers: handlers() });
+    document.body.append(node);
+
+    node
+      .querySelector<HTMLButtonElement>('.jp-AgentWorkspace-outcomeCopyButton')!
+      .dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await flush();
+
+    const status = node.querySelector<HTMLElement>(
+      '.jp-AgentWorkspace-outcomeCopyStatus'
+    );
+    expect(status?.textContent).toBe('Copy failed');
+    expect(status?.dataset.copyState).toBe('failed');
+    node.remove();
+  });
+
+  it('copies again on a second click', async () => {
+    const writeText = jest.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const node = renderTurn(resultTurn(markdown), { handlers: handlers() });
+    document.body.append(node);
+    const button = node.querySelector<HTMLButtonElement>(
+      '.jp-AgentWorkspace-outcomeCopyButton'
+    )!;
+    button.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await flush();
+    button.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await flush();
+    expect(writeText).toHaveBeenCalledTimes(2);
+    expect(writeText).toHaveBeenNthCalledWith(2, markdown);
+    node.remove();
+  });
+});

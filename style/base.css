@@ -521,6 +521,50 @@
   margin-top: 2px;
 }
 
+/* Outcome copy control: the label stays stable, the adjacent live status names
+   the result so both sighted and screen-reader users get explicit feedback. */
+.jp-AgentWorkspace-outcomeActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+  font-family: var(--jp-ui-font-family, sans-serif);
+  font-size: var(--jp-ui-font-size1, 13px);
+}
+
+.jp-AgentWorkspace-outcomeCopyButton {
+  min-height: 26px;
+  padding: 2px 10px;
+  border: var(--jp-border-width, 1px) solid var(--jp-border-color2, #e0e0e0);
+  border-radius: var(--jp-border-radius, 2px);
+  background: transparent;
+  color: var(--jp-content-link-color, #1976d2);
+  cursor: pointer;
+  font: inherit;
+}
+
+.jp-AgentWorkspace-outcomeCopyButton:hover {
+  background: var(--jp-layout-color2, #eeeeee);
+}
+
+.jp-AgentWorkspace-outcomeCopyButton:focus-visible {
+  outline: 2px solid var(--jp-brand-color1, #1976d2);
+  outline-offset: 2px;
+}
+
+.jp-AgentWorkspace-outcomeCopyStatus {
+  min-width: 0;
+  color: var(--jp-ui-font-color2, #5b6570);
+}
+
+.jp-AgentWorkspace-outcomeCopyStatus[data-copy-state='copied'] {
+  color: var(--jp-success-color1, #2e7d32);
+}
+
+.jp-AgentWorkspace-outcomeCopyStatus[data-copy-state='failed'] {
+  color: var(--jp-error-color1, #d32f2f);
+}
+
 .jp-AgentWorkspace-retryTurn {
   min-height: 28px;
   padding: 2px 0;

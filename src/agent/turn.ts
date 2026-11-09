@@ -297,6 +297,22 @@ export function terminalReasonMessage(
   }
 }
 
+/**
+ * Raw Markdown an outcome copy control may place on the clipboard. Only a real
+ * final answer qualifies: `result` from the runtime and `assistant` from the
+ * last streamed text block. A `tool` fallback is execution evidence, never an
+ * answer, and `none` has no text; both must stay uncopyable so a copy can never
+ * leak tool output. Returns the exact source string, never DOM text.
+ */
+export function copyableOutcomeText(
+  turn: Pick<ChatTurn, 'outcome' | 'outcomeKind'>
+): string | null {
+  if (turn.outcomeKind !== 'result' && turn.outcomeKind !== 'assistant') {
+    return null;
+  }
+  return turn.outcome.trim().length > 0 ? turn.outcome : null;
+}
+
 export function isTraceExpanded(turn: ChatTurn): boolean {
   // The execution record stays hidden until the user explicitly opens it.
   // Running and failed turns never expand it on their own; terminal errors
