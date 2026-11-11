@@ -16,6 +16,7 @@ from jupyter_core.paths import jupyter_config_dir, jupyter_data_dir
 
 from .dsh_acp_events import DshAcpEventProjector
 from .dsh_acp_session import DshAcpSession, DshAcpSessionError
+from .dsh_storage import runtime_storage_home
 from .pi_client import PiProcessError
 from .settings import AgentConfigError, load_dsh_settings
 
@@ -269,6 +270,10 @@ class AgentSession:
 
             acp: DshAcpSession | None = None
             try:
+                runtime_home = runtime_storage_home(root, self._resume_session_id)
+                select_runtime = getattr(self._runtime, "for_storage", None)
+                if callable(select_runtime):
+                    self._runtime = select_runtime(str(runtime_home))
                 # The host bootstrap lock covers the whole transaction: seeing
                 # whether a shared transport exists, starting the first session
                 # (which spawns the only child), and adopting that transport.
@@ -285,6 +290,7 @@ class AgentSession:
                         resume_session_id=self._resume_session_id,
                         transport=shared_transport,
                         owns_transport=owns_transport,
+                        runtime_home=runtime_home,
                     )
                     await acp.start()
                     if (

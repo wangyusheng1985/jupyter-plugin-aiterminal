@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "basePath": "aiterminal/btw",
+  "routes": {
+    "thread": "thread",
+    "message": "message",
+    "cancel": "cancel",
+    "queue": "queue",
+    "queueClaim": "queue/claim",
+    "queueAck": "queue/ack",
+    "queueCancel": "queue/cancel"
+  },
+  "messageRoles": ["user", "assistant"],
+  "messageStatuses": ["done", "cancelled", "failed"],
+  "queueStatuses": [
+    "queued",
+    "delivering",
+    "delivered",
+    "cancelled",
+    "failed",
+    "unknown"
+  ],
+  "snapshotFields": [
+    "capturedAt",
+    "answerNumber",
+    "omittedPairs",
+    "truncated",
+    "sourceChars"
+  ]
+}

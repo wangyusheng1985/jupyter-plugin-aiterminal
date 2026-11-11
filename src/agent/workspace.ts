@@ -1,9 +1,11 @@
 import type { DocumentRegistry } from '@jupyterlab/docregistry';
 import type { IRenderMimeRegistry } from '@jupyterlab/rendermime';
 import type { Message } from '@lumino/messaging';
-import { Panel, Widget } from '@lumino/widgets';
+import { BoxPanel, Panel, Widget } from '@lumino/widgets';
 
 import { AGENT_PANEL_CLASS, ShutdownCoordinator } from '../theme';
+import { BtwPanel, type BtwSendBackOutcome } from './btw';
+import { answerNumberForCell, isAnswerCard } from './btw-protocol';
 import {
   getResumableDshSessionReference,
   normalizeAgentSessionId,
@@ -24,6 +26,7 @@ import { mapHistoryKey, mapWorkspaceKey, strokeFromEvent } from './keys';
 import { renderMarkdownSource } from './markdown';
 import { CellNavigatorView } from './navigator';
 import {
+  isShellEscapeSource,
   resolveRunExecution,
   WorkspaceNotebook,
   type RunRequest,
@@ -52,7 +55,6 @@ import {
   setTurnStatus,
   toggleActivity,
   toggleEvidence,
-  toggleOutcome,
   toggleTrace,
   type ChatTurn
 } from './turn';
@@ -107,13 +109,13 @@ export interface CellHandlers {
     turnId: string,
     activityId: string
   ) => void;
-  onToggleTurnOutcome?: (cellId: string, turnId: string) => void;
   onRevealTurnFailure?: (
     cellId: string,
     turnId: string,
     activityId: string
   ) => void;
   onRetryTurn?: (cellId: string, turnId: string) => void;
+  onBtwTurn?: (cellId: string, turnId: string) => void;
   rendermime: IRenderMimeRegistry | null;
 }
 
@@ -134,6 +136,8 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   private readonly shutdown = new ShutdownCoordinator();
   private readonly notebookView: NotebookView;
   private readonly body: Panel;
+  private readonly split: BoxPanel;
+  private readonly btwPanel: BtwPanel;
   private readonly navigatorView: CellNavigatorView;
   private readonly status: StatusBar;
   private readonly returnLatestButton: HTMLButtonElement;
@@ -162,6 +166,16 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   private readonly saveCoordinator: WorkspaceSaveCoordinator;
   private unsubscribeDsh: (() => void) | null = null;
   private dshOwnedSession: string | null = null;
+  private readonly sendBackWaiters = new Map<
+    string,
+    (accepted: boolean) => void
+  >();
+  /**
+   * Send-back cells that were inserted but not submitted, keyed by their text.
+   * A repeated delivery of the same text reuses that cell instead of inserting
+   * a second copy.
+   */
+  private readonly pendingSendBackCells = new Map<string, string>();
 
   constructor(
     private readonly rendermime: IRenderMimeRegistry | null = null,
@@ -216,11 +230,10 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
         this.updateTurn(cellId, turnId, turn =>
           toggleEvidence(turn, activityId)
         ),
-      onToggleTurnOutcome: (cellId, turnId) =>
-        this.updateTurn(cellId, turnId, toggleOutcome),
       onRevealTurnFailure: (cellId, turnId, activityId) =>
         this.revealTurnFailure(cellId, turnId, activityId),
       onRetryTurn: (cellId, turnId) => this.prepareRetry(cellId, turnId),
+      onBtwTurn: (cellId, turnId) => this.openBtwTurn(cellId, turnId),
       rendermime: this.rendermime
     });
     this.navigatorView = new CellNavigatorView({
@@ -256,7 +269,32 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
         void this.saveCoordinator.retry().catch(() => undefined);
       }
     });
-    this.addWidget(this.body);
+    this.btwPanel = new BtwPanel({
+      notebook: () => this.notebookPath(),
+      isMainBusy: () => this.session.running || this.notebook.busy(),
+      canSend: () => this.canSendBack(),
+      sendBack: text => this.insertSendBackCell(text),
+      awaitAccepted: runId => this.awaitSendBackAccepted(runId),
+      flush: () => this.flushSave(),
+      answerNumber: cellId =>
+        answerNumberForCell(
+          this.notebook.cells.map(cell => ({
+            id: cell.id,
+            kind: cell.kind,
+            turn: cell.turn,
+            blocks: cell.blocks
+          })),
+          cellId
+        )
+    });
+    this.btwPanel.hide();
+    this.split = new BoxPanel({ direction: 'left-to-right' });
+    this.split.addClass('jp-AgentWorkspace-split');
+    this.split.addWidget(this.body);
+    this.split.addWidget(this.btwPanel);
+    BoxPanel.setStretch(this.body, 1);
+    BoxPanel.setStretch(this.btwPanel, 0);
+    this.addWidget(this.split);
     this.addWidget(this.status);
     this.node.tabIndex = -1;
     this.copyButton = new SelectionCopyButton(this.node);
@@ -612,7 +650,7 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     const scrollTop = scrollNode.scrollTop;
     cell.turn = update(turn);
     // Mirror the user's presentation choice into the session turn so later
-    // events derive from it instead of re-expanding via the 'auto' default.
+    // events derive from it instead of falling back to the collapsed default.
     if (
       this.session.turn &&
       (this.session.turn.id === turnId ||
@@ -644,6 +682,167 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     this.refresh();
     this.persistSoon();
     this.notebookView.revealTurnActivity(cellId, activityId);
+  }
+
+  private notebookPath(): string | null {
+    const path = this.context?.path;
+    if (!path) return null;
+    return path.endsWith('.agentnb') ? path : null;
+  }
+
+  private openBtwTurn(cellId: string, turnId: string): void {
+    if (this.documentLoadErrorState) {
+      this.reportDocumentLoadError();
+      return;
+    }
+    const cell = this.notebook.cells.find(item => item.id === cellId);
+    // Only a persisted answer card may open BTW. This uses the same rule as
+    // the server snapshot builder, so a legacy cell (no persisted turn) never
+    // opens a panel that cannot snapshot anything.
+    const turn = cell?.turn ?? null;
+    if (!cell || !turn || turn.id !== turnId) return;
+    if (
+      !isAnswerCard({
+        id: cell.id,
+        kind: cell.kind,
+        turn,
+        blocks: cell.blocks
+      })
+    ) {
+      return;
+    }
+    // Opening the panel never starts a model call; the BTW thread and its
+    // fixed snapshot are created on the first sent message.
+    void this.btwPanel.open(cellId).catch(() => undefined);
+  }
+
+  /** Whether a new send-back run can be submitted right now. */
+  private canSendBack(): boolean {
+    return (
+      !this.closing &&
+      !this.documentLoadErrorState &&
+      this.context !== null &&
+      this.pendingContextSubmission === null &&
+      !this.session.running &&
+      !this.notebook.busy()
+    );
+  }
+
+  /** The still-unsubmitted send-back cell holding exactly this text, if any. */
+  private findPendingSendBackCell(text: string): WorkspaceCell | null {
+    const cellId = this.pendingSendBackCells.get(text);
+    if (!cellId) return null;
+    const cell = this.notebook.cells.find(item => item.id === cellId);
+    if (!cell) {
+      this.pendingSendBackCells.delete(text);
+      return null;
+    }
+    if (
+      cell.turn !== null ||
+      cell.status !== 'idle' ||
+      cell.executionCount !== null
+    ) {
+      // The user already ran or edited it into a real turn: stop reusing it.
+      this.pendingSendBackCells.delete(text);
+      return null;
+    }
+    return cell;
+  }
+
+  /**
+   * Insert send-back text into a new main input cell and submit it when the
+   * session is idle. Existing cells and their history are never modified.
+   *
+   * ``sent`` means the notebook accepted the run (and will send it), so only
+   * that outcome may be acknowledged as delivered. ``inserted`` means nothing
+   * was inserted because the main session cannot take a run right now; the
+   * queued entry stays queued and is retried when the session is idle.
+   * ``blocked`` means the text can never be delivered automatically and says
+   * why.
+   *
+   * The busy check runs *before* any cell is created, so a busy session never
+   * leaves an unsubmitted cell behind. If an earlier attempt did leave one, a
+   * repeat delivery of the same text reuses that cell instead of inserting a
+   * second copy.
+   */
+  private insertSendBackCell(text: string): BtwSendBackOutcome {
+    if (this.closing) {
+      return {
+        status: 'blocked',
+        message:
+          'This workspace is closing, so the BTW answer was not sent back.'
+      };
+    }
+    if (this.documentLoadErrorState || !this.context) {
+      return {
+        status: 'blocked',
+        message:
+          'Save this workspace as a notebook before sending a BTW answer back.'
+      };
+    }
+    // A leading ``!`` would be resolved as a shell command by the notebook's
+    // own execution resolver. Auto-running a side-chat answer as a command is
+    // not what "send to main session" means, so refuse instead of guessing.
+    if (isShellEscapeSource(text)) {
+      return {
+        status: 'blocked',
+        message:
+          'This answer starts with "!", which the notebook would run as a ' +
+          'shell command. Sending it back was blocked; copy it instead if you ' +
+          'want a command.'
+      };
+    }
+    if (!this.canSendBack()) {
+      // Nothing is inserted while the main session is busy, so a later retry
+      // cannot duplicate a cell.
+      return { status: 'inserted' };
+    }
+    const pending = this.findPendingSendBackCell(text);
+    let index: number;
+    if (pending) {
+      // Reuse the cell an earlier attempt inserted; never a second copy.
+      index = this.notebook.cells.findIndex(item => item.id === pending.id);
+      this.notebook.select(index);
+    } else {
+      const cell = this.notebook.createCell('ai', text);
+      this.notebook.cells.push(cell);
+      index = this.notebook.cells.length - 1;
+      this.notebook.select(index);
+      this.persistSoon();
+    }
+    this.inputHistory.resetNavigation();
+    this.refresh();
+    const request = this.acceptRun(index, true);
+    if (!request) {
+      this.pendingSendBackCells.set(text, this.notebook.cells[index].id);
+      return { status: 'inserted' };
+    }
+    this.pendingSendBackCells.delete(text);
+    return { status: 'sent', runId: request.id };
+  }
+
+  /**
+   * Resolve once the main session accepts ``runId``. Bounded so a dead socket
+   * leaves the delivery unproven (``unknown``) instead of hanging the panel.
+   */
+  private awaitSendBackAccepted(runId: string): Promise<boolean> {
+    if (this.session.acceptedTurnId === runId) return Promise.resolve(true);
+    return new Promise<boolean>(resolve => {
+      const timer = window.setTimeout(() => {
+        this.sendBackWaiters.delete(runId);
+        resolve(false);
+      }, SEND_BACK_ACCEPT_TIMEOUT_MS);
+      this.sendBackWaiters.set(runId, accepted => {
+        window.clearTimeout(timer);
+        this.sendBackWaiters.delete(runId);
+        resolve(accepted);
+      });
+    });
+  }
+
+  /** Flush the document so a delivered send-back cell is on disk. */
+  async flushSave(): Promise<void> {
+    await this.saveCoordinator.flush();
   }
 
   private prepareRetry(cellId: string, turnId: string): void {
@@ -1014,6 +1213,15 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   }
 
   private onSessionChange(): void {
+    // Deliver a queued send-back as soon as the main session is idle again;
+    // the panel only claims when its stored queue actually holds an entry.
+    if (!this.session.running) {
+      void this.btwPanel.deliverPending().catch(() => undefined);
+    }
+    const acceptedId = this.session.acceptedTurnId;
+    if (acceptedId) {
+      this.sendBackWaiters.get(acceptedId)?.(true);
+    }
     const request = this.notebook.activeRun;
     const requestAccepted = Boolean(
       request && this.session.acceptedTurnId === request.id
@@ -1669,6 +1877,11 @@ class NotebookView extends Widget {
 
 const CELL_INPUT_MAX_HEIGHT = 320;
 
+// A send-back run is acknowledged as delivered only after the main session
+// accepts it. If no acceptance arrives in this window the delivery stays
+// unproven and the panel asks the user to confirm instead of retrying.
+const SEND_BACK_ACCEPT_TIMEOUT_MS = 15000;
+
 function editorLineHeight(editor: HTMLTextAreaElement): number {
   const style = getComputedStyle(editor);
   const lineHeight = Number.parseFloat(style.lineHeight);
@@ -1951,11 +2164,20 @@ export class CellView {
       this.outputBody,
       cell,
       this.handlers.rendermime,
-      this.turnRenderHandlers()
+      this.turnRenderHandlers(cell)
     );
   }
 
-  private turnRenderHandlers(): TurnRenderHandlers {
+  private turnRenderHandlers(cell: WorkspaceCell): TurnRenderHandlers {
+    // The BTW entry point mirrors the server's answer-card eligibility: a
+    // persisted turn with persisted answer text. Legacy cells (blocks only)
+    // keep Copy but must not offer a BTW panel that cannot be created.
+    const btwEligible = isAnswerCard({
+      id: cell.id,
+      kind: cell.kind,
+      turn: cell.turn,
+      blocks: cell.blocks
+    });
     return {
       onToggleTrace: turnId =>
         this.handlers.onToggleTurnTrace?.(this.id, turnId),
@@ -1963,11 +2185,12 @@ export class CellView {
         this.handlers.onToggleTurnActivity?.(this.id, turnId, activityId),
       onToggleEvidence: (turnId, activityId) =>
         this.handlers.onToggleTurnEvidence?.(this.id, turnId, activityId),
-      onToggleOutcome: turnId =>
-        this.handlers.onToggleTurnOutcome?.(this.id, turnId),
       onRevealFailure: (turnId, activityId) =>
         this.handlers.onRevealTurnFailure?.(this.id, turnId, activityId),
-      onRetry: turnId => this.handlers.onRetryTurn?.(this.id, turnId)
+      onRetry: turnId => this.handlers.onRetryTurn?.(this.id, turnId),
+      onBtw: btwEligible
+        ? turnId => this.handlers.onBtwTurn?.(this.id, turnId)
+        : undefined
     };
   }
 
@@ -2758,7 +2981,6 @@ function noopTurnHandlers(): TurnRenderHandlers {
     onToggleTrace: () => undefined,
     onToggleActivity: () => undefined,
     onToggleEvidence: () => undefined,
-    onToggleOutcome: () => undefined,
     onRevealFailure: () => undefined,
     onRetry: () => undefined
   };

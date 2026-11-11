@@ -1,5 +1,5 @@
 import { WorkspaceNotebook } from './notebook';
-import { createTurn, toggleOutcome, toggleTrace } from './turn';
+import { createTurn, toggleTrace } from './turn';
 
 describe('WorkspaceNotebook', () => {
   it('starts with one editable unified input', () => {
@@ -466,7 +466,6 @@ describe('WorkspaceNotebook', () => {
     notebook.setSource('run again');
     let turn = createTurn('run-old');
     turn = toggleTrace(turn);
-    turn = toggleOutcome(turn);
     notebook.current.turn = turn;
 
     notebook.enqueueRun();

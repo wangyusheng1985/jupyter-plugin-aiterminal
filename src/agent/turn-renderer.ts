@@ -1,8 +1,10 @@
 import type { IRenderMimeRegistry } from '@jupyterlab/rendermime';
 
 import { renderMarkdownSource } from './markdown';
+import { writeClipboardText } from './selectioncopy';
 import { formatToolInput } from './tool';
 import {
+  copyableOutcomeText,
   isTraceExpanded,
   terminalReasonMessage,
   type ChatTurn,
@@ -12,9 +14,14 @@ import {
 
 export interface TurnRenderHandlers {
   onToggleTrace: (turnId: string) => void;
+  /**
+   * Open the BTW side chat for this answer. Optional so existing renderer
+   * callers keep working; only terminal answers with copyable text pass it a
+   * button.
+   */
+  onBtw?: (turnId: string) => void;
   onToggleActivity: (turnId: string, activityId: string) => void;
   onToggleEvidence: (turnId: string, activityId: string) => void;
-  onToggleOutcome: (turnId: string) => void;
   onRevealFailure: (turnId: string, activityId: string) => void;
   onRetry: (turnId: string) => void;
 }
@@ -24,8 +31,6 @@ export interface TurnRenderOptions {
   handlers: TurnRenderHandlers;
 }
 
-const OUTCOME_PREVIEW_LENGTH = 1800;
-const OUTCOME_PREVIEW_LINES = 24;
 const RUNNING_ACTIVITY_WINDOW = 3;
 
 export function renderTurn(
@@ -110,34 +115,112 @@ function renderOutcome(
   const section = document.createElement('section');
   section.className = 'jp-AgentWorkspace-outcome';
 
-  const long = isLongOutcome(turn.outcome);
-  const expanded = turn.presentation.outcomeExpanded;
   const body = document.createElement('div');
   body.className = 'jp-AgentWorkspace-outcomeBody';
   body.dataset.turnScrollKey = `outcome:${turn.id}`;
-  if (long && !expanded) {
-    body.classList.add('is-preview');
-    renderMarkdownSource(
-      body,
-      boundedOutcomePreview(turn.outcome),
-      options.rendermime ?? null
-    );
-  } else {
-    renderMarkdownSource(body, turn.outcome, options.rendermime ?? null);
+  renderMarkdownSource(body, turn.outcome, options.rendermime ?? null);
+  const copyText = copyableOutcomeText(turn);
+  if (copyText !== null) {
+    section.append(renderOutcomeCopyControl(turn, copyText, options));
   }
   section.append(body);
-
-  if (long) {
-    section.append(
-      disclosureButton(
-        expanded ? 'Show less' : 'Show full result',
-        expanded,
-        `outcome:${turn.id}`,
-        () => options.handlers.onToggleOutcome(turn.id)
-      )
-    );
-  }
   return section;
+}
+
+const COPY_FEEDBACK_MS = 2000;
+
+/**
+ * Copies the pre-render Markdown source held on the turn, never the rendered
+ * DOM or the current selection, so collapsing the cell cannot change what is
+ * copied. Feedback stays in an `aria-live` status and is cleared after a short
+ * delay; a second click copies again.
+ */
+function renderOutcomeCopyControl(
+  turn: ChatTurn,
+  text: string,
+  options: TurnRenderOptions
+): HTMLElement {
+  const row = document.createElement('div');
+  row.className = 'jp-AgentWorkspace-outcomeActions';
+  row.dataset.copyState = 'idle';
+  row.dataset.turnId = turn.id;
+
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className =
+    'jp-AgentWorkspace-turnControl jp-AgentWorkspace-outcomeCopyButton';
+  button.dataset.turnControl = '';
+  button.dataset.copyAction = 'outcome';
+  // No translator is available here; mirror the fixed Lab copy wording.
+  button.setAttribute('aria-label', 'Copy'); // eslint-disable-line jupyter/no-untranslated-string
+  button.textContent = 'Copy';
+
+  const status = document.createElement('span');
+  status.className = 'jp-AgentWorkspace-outcomeCopyStatus';
+  status.setAttribute('role', 'status');
+  status.setAttribute('aria-live', 'polite');
+  status.setAttribute('aria-atomic', 'true');
+
+  let feedbackTimer: number | undefined;
+  let request = 0;
+
+  const showState = (state: 'copied' | 'failed', message: string): void => {
+    row.dataset.copyState = state;
+    status.dataset.copyState = state;
+    status.textContent = message;
+    if (feedbackTimer !== undefined) window.clearTimeout(feedbackTimer);
+    feedbackTimer = window.setTimeout(() => {
+      row.dataset.copyState = 'idle';
+      status.dataset.copyState = 'idle';
+      status.textContent = '';
+    }, COPY_FEEDBACK_MS);
+  };
+
+  button.addEventListener('mousedown', event => {
+    event.preventDefault();
+    event.stopPropagation();
+  });
+  button.addEventListener('click', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    const current = (request += 1);
+    row.dataset.copyState = 'pending';
+    void writeClipboardText(text).then(copied => {
+      if (current !== request) return;
+      showState(
+        copied ? 'copied' : 'failed',
+        copied ? 'Copied' : 'Copy failed'
+      );
+    });
+  });
+
+  row.append(button, status);
+  const openBtw = options.handlers.onBtw;
+  if (
+    openBtw &&
+    turn.status !== 'running' &&
+    (turn.outcomeKind === 'result' || turn.outcomeKind === 'assistant')
+  ) {
+    const btw = document.createElement('button');
+    btw.type = 'button';
+    btw.className =
+      'jp-AgentWorkspace-turnControl jp-AgentWorkspace-outcomeBtwButton';
+    btw.dataset.turnControl = '';
+    btw.dataset.copyAction = 'btw';
+    btw.setAttribute('aria-label', 'BTW side chat for this answer'); // eslint-disable-line jupyter/no-untranslated-string
+    btw.textContent = 'BTW';
+    btw.addEventListener('mousedown', event => {
+      event.preventDefault();
+      event.stopPropagation();
+    });
+    btw.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      openBtw(turn.id);
+    });
+    row.append(btw);
+  }
+  return row;
 }
 
 function renderAuditSummary(
@@ -625,24 +708,6 @@ function failureActivityIds(turn: ChatTurn): string[] {
 function firstLine(value: string): string {
   const line = value.trim().split('\n', 1)[0] ?? '';
   return line.length > 120 ? `${line.slice(0, 117)}...` : line;
-}
-
-function isLongOutcome(value: string): boolean {
-  return (
-    value.length > OUTCOME_PREVIEW_LENGTH ||
-    value.split('\n').length > OUTCOME_PREVIEW_LINES
-  );
-}
-
-function boundedOutcomePreview(value: string): string {
-  const lines = value.split('\n');
-  const lineBounded =
-    lines.length > OUTCOME_PREVIEW_LINES
-      ? lines.slice(0, OUTCOME_PREVIEW_LINES).join('\n')
-      : value;
-  return lineBounded.length > OUTCOME_PREVIEW_LENGTH
-    ? lineBounded.slice(0, OUTCOME_PREVIEW_LENGTH)
-    : lineBounded;
 }
 
 function formatDuration(value: number | undefined): string {

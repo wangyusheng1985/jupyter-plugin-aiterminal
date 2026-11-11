@@ -26,7 +26,6 @@ function handlers() {
     onToggleTrace: jest.fn(),
     onToggleActivity: jest.fn(),
     onToggleEvidence: jest.fn(),
-    onToggleOutcome: jest.fn(),
     onRevealFailure: jest.fn(),
     onRetry: jest.fn()
   };
@@ -80,6 +79,48 @@ describe('renderTurn', () => {
         ?.getAttribute('aria-expanded')
     ).toBe('false');
     expect(node.querySelector('.jp-AgentWorkspace-executionRecord')).toBeNull();
+  });
+
+  it('renders the complete outcome without preview or disclosure controls', () => {
+    const longText = Array.from(
+      { length: 60 },
+      (_, index) => `line ${index + 1}`
+    ).join('\n');
+    const turn = completedTurn([
+      { kind: 'text', id: 'text-long', text: longText }
+    ]);
+    const node = renderTurn(turn, { handlers: handlers() });
+    const body = node.querySelector('.jp-AgentWorkspace-outcomeBody');
+
+    expect(body?.textContent).toContain('line 1');
+    expect(body?.textContent).toContain('line 60');
+    expect(body?.classList.contains('is-preview')).toBe(false);
+    expect(node.querySelector('[data-turn-focus-key^="outcome:"]')).toBeNull();
+    expect(node.textContent).not.toContain('Show full result');
+    expect(node.textContent).not.toContain('Show less');
+  });
+
+  it('keeps terminal errors visible while the record stays collapsed', () => {
+    const blocks: ChatBlock[] = [
+      toolBlock('tool-1', { status: 'error', output: 'boom\n' })
+    ];
+    const turn = applyTurnEvent(createTurn('run-failed'), blocks, {
+      type: 'result',
+      turnId: 'run-failed',
+      text: '',
+      isError: true,
+      reason: 'failed',
+      durationMs: 900
+    });
+    const node = renderTurn(turn, { handlers: handlers() });
+
+    expect(node.querySelector('.jp-AgentWorkspace-executionRecord')).toBeNull();
+    expect(
+      node.querySelector('.jp-AgentWorkspace-terminalNotice')?.textContent
+    ).toBe('Run failed before producing a response.');
+    expect(node.querySelector('[data-failure-navigation]')?.textContent).toBe(
+      '1 step failed'
+    );
   });
 
   it('keeps representative Markdown semantics inside the scoped outcome', () => {
@@ -304,7 +345,7 @@ describe('renderTurn', () => {
         output: `file ${index + 1}\n`
       })
     );
-    const turn = deriveTurn(createTurn('run-1'), blocks);
+    const turn = toggleTrace(deriveTurn(createTurn('run-1'), blocks));
     const node = renderTurn(turn, { handlers: handlers() });
     const rows = node.querySelectorAll('.jp-AgentWorkspace-activity');
 
@@ -325,7 +366,7 @@ describe('renderTurn', () => {
         input: { file_path: `/tmp/file-${index + 1}.ts` }
       })
     );
-    let turn = deriveTurn(createTurn('run-1'), blocks);
+    let turn = toggleTrace(deriveTurn(createTurn('run-1'), blocks));
     turn = toggleActivity(turn, 'activity-tool-1');
     const node = renderTurn(turn, { handlers: handlers() });
     const first = node.querySelector('[data-activity-id="activity-tool-1"]');
@@ -336,19 +377,28 @@ describe('renderTurn', () => {
     ).not.toBeNull();
   });
 
-  it('collapses an automatic record on completion but preserves explicit expansion', () => {
+  it('defaults new and completed records collapsed but preserves explicit expansion', () => {
     const blocks: ChatBlock[] = [toolBlock('tool-1')];
     const running = deriveTurn(createTurn('run-1'), blocks);
     const completed = setTurnStatus(running, 'done', blocks);
-    const automatic = renderTurn(completed, { handlers: handlers() });
 
+    const runningNode = renderTurn(running, { handlers: handlers() });
+    expect(
+      runningNode.querySelector('.jp-AgentWorkspace-executionRecord')
+    ).toBeNull();
+    expect(
+      runningNode
+        .querySelector('[data-turn-focus-key="trace:run-1"]')
+        ?.getAttribute('aria-expanded')
+    ).toBe('false');
+
+    const automatic = renderTurn(completed, { handlers: handlers() });
     expect(
       automatic.querySelector('.jp-AgentWorkspace-executionRecord')
     ).toBeNull();
 
-    const explicitlyExpanded = toggleTrace(toggleTrace(running));
-    const stillExpanded = setTurnStatus(explicitlyExpanded, 'done', blocks);
-    const explicit = renderTurn(stillExpanded, { handlers: handlers() });
+    const explicitlyExpanded = toggleTrace(completed);
+    const explicit = renderTurn(explicitlyExpanded, { handlers: handlers() });
     expect(
       explicit.querySelector('.jp-AgentWorkspace-executionRecord')
     ).not.toBeNull();
@@ -567,7 +617,9 @@ describe('terminal reason notice', () => {
           '.jp-AgentWorkspace-terminalNotice'
         );
         expect(notice?.dataset.terminalReason).toBe(reason);
-        expect(notice?.textContent).not.toContain('without producing a response');
+        expect(notice?.textContent).not.toContain(
+          'without producing a response'
+        );
         expect(notice?.textContent).not.toContain(
           'before producing a response'
         );
@@ -667,9 +719,11 @@ describe('streaming text rendering', () => {
   });
 
   it('renders the running tail synchronously without Markdown parsing', () => {
-    const turn = deriveTurn(createTurn('run-1'), [
-      { kind: 'text', id: 'text-1', text: 'Hello stream' }
-    ]);
+    const turn = toggleTrace(
+      deriveTurn(createTurn('run-1'), [
+        { kind: 'text', id: 'text-1', text: 'Hello stream' }
+      ])
+    );
     const node = renderTurn(turn, {
       rendermime: {} as IRenderMimeRegistry,
       handlers: handlers()
@@ -683,9 +737,11 @@ describe('streaming text rendering', () => {
   });
 
   it('grows across deltas without duplicating the full text', () => {
-    const first = deriveTurn(createTurn('run-1'), [
-      { kind: 'text', id: 'text-1', text: 'Hello' }
-    ]);
+    const first = toggleTrace(
+      deriveTurn(createTurn('run-1'), [
+        { kind: 'text', id: 'text-1', text: 'Hello' }
+      ])
+    );
     const second = deriveTurn(first, [
       { kind: 'text', id: 'text-1', text: 'Hello world' }
     ]);
@@ -716,10 +772,12 @@ describe('streaming text rendering', () => {
   });
 
   it('turns a trailing text into stable Markdown once a tool starts', () => {
-    let turn = deriveTurn(createTurn('run-1'), [
-      { kind: 'text', id: 'text-1', text: 'Streaming so far' },
-      toolBlock('tool-1', { status: 'running' })
-    ]);
+    let turn = toggleTrace(
+      deriveTurn(createTurn('run-1'), [
+        { kind: 'text', id: 'text-1', text: 'Streaming so far' },
+        toolBlock('tool-1', { status: 'running' })
+      ])
+    );
     turn = toggleActivity(turn, 'activity-text-1');
     const node = renderTurn(turn, {
       rendermime: {} as IRenderMimeRegistry,
@@ -816,9 +874,11 @@ const done = false;</code></pre>
   });
 
   it('renders the running streamed tail as synchronous pre-wrapped text', () => {
-    const turn = deriveTurn(createTurn('run-1'), [
-      { kind: 'text', id: 'text-stream', text: 'Streaming answer.' }
-    ]);
+    const turn = toggleTrace(
+      deriveTurn(createTurn('run-1'), [
+        { kind: 'text', id: 'text-stream', text: 'Streaming answer.' }
+      ])
+    );
     const node = renderTurn(turn, {
       rendermime: {} as IRenderMimeRegistry,
       handlers: handlers()
@@ -837,5 +897,242 @@ const done = false;</code></pre>
     expect(getComputedStyle(stream!).whiteSpace).toBe('pre-wrap');
     expect(stream!.textContent).toBe('Streaming answer.');
     expect(renderMarkdown).not.toHaveBeenCalled();
+  });
+});
+
+describe('outcome Markdown copy', () => {
+  const markdown = [
+    '# 标题',
+    '',
+    '- item one',
+    '- item two',
+    '',
+    '```ts',
+    'const ready = true;',
+    '```',
+    '',
+    '[link](https://example.com)',
+    '',
+    '| a | b |',
+    '| - | - |',
+    '| 1 | 2 |'
+  ].join('\n');
+
+  function resultTurn(text: string): ChatTurn {
+    return applyTurnEvent(createTurn('run-copy'), [], {
+      type: 'result',
+      turnId: 'run-copy',
+      text,
+      reason: 'completed'
+    });
+  }
+
+  function flush(): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, 0));
+  }
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    Object.assign(navigator, { clipboard: undefined });
+  });
+
+  it('copies the exact pre-render Markdown source instead of the DOM', async () => {
+    const writeText = jest.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const node = renderTurn(resultTurn(markdown), { handlers: handlers() });
+    document.body.append(node);
+
+    const button = node.querySelector<HTMLButtonElement>(
+      '.jp-AgentWorkspace-outcomeCopyButton'
+    );
+    expect(button).not.toBeNull();
+    expect(button!.type).toBe('button');
+    expect(button!.getAttribute('aria-label')).toBe('Copy');
+    expect(button!.textContent).toBe('Copy');
+    const card = node.querySelector('.jp-AgentWorkspace-outcome');
+    expect(
+      card?.firstElementChild?.classList.contains(
+        'jp-AgentWorkspace-outcomeActions'
+      )
+    ).toBe(true);
+    expect(
+      card?.lastElementChild?.classList.contains(
+        'jp-AgentWorkspace-outcomeBody'
+      )
+    ).toBe(true);
+
+    button!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await flush();
+
+    // renderMarkdown is mocked, so an empty DOM still copied the full source.
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(writeText).toHaveBeenCalledWith(markdown);
+    const status = node.querySelector<HTMLElement>(
+      '.jp-AgentWorkspace-outcomeCopyStatus'
+    );
+    expect(status?.textContent).toBe('Copied');
+    expect(status?.getAttribute('role')).toBe('status');
+    expect(
+      node
+        .querySelector('.jp-AgentWorkspace-outcomeActions')
+        ?.getAttribute('data-copy-state')
+    ).toBe('copied');
+    node.remove();
+  });
+
+  it('does not copy the DOM when the cell is collapsed', async () => {
+    const writeText = jest.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const turn = resultTurn(markdown);
+    expect(turn.presentation.trace).toBe('collapsed');
+    const node = renderTurn(turn, { handlers: handlers() });
+    document.body.append(node);
+    // Collapsed cells still render the full outcome body.
+    node
+      .querySelector<HTMLButtonElement>('.jp-AgentWorkspace-outcomeCopyButton')!
+      .dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await flush();
+    expect(writeText).toHaveBeenCalledWith(markdown);
+    node.remove();
+  });
+
+  it('offers no copy control when the outcome is tool output or empty', () => {
+    const toolOutcome = applyTurnEvent(
+      createTurn('run-tool'),
+      [toolBlock('tool-1')],
+      {
+        type: 'result',
+        turnId: 'run-tool',
+        text: '',
+        reason: 'completed'
+      }
+    );
+    expect(toolOutcome.outcomeKind).toBe('tool');
+    expect(
+      renderTurn(toolOutcome, { handlers: handlers() }).querySelector(
+        '.jp-AgentWorkspace-outcomeCopyButton'
+      )
+    ).toBeNull();
+
+    expect(
+      renderTurn(resultTurn('   '), { handlers: handlers() }).querySelector(
+        '.jp-AgentWorkspace-outcomeCopyButton'
+      )
+    ).toBeNull();
+  });
+
+  it('falls back to execCommand and still reports success', async () => {
+    Object.assign(navigator, { clipboard: undefined });
+    const exec = jest.fn().mockReturnValue(true);
+    Object.defineProperty(document, 'execCommand', {
+      configurable: true,
+      value: exec
+    });
+    const node = renderTurn(resultTurn(markdown), { handlers: handlers() });
+    document.body.append(node);
+
+    node
+      .querySelector<HTMLButtonElement>('.jp-AgentWorkspace-outcomeCopyButton')!
+      .dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await flush();
+
+    expect(exec).toHaveBeenCalledWith('copy');
+    expect(
+      node.querySelector<HTMLElement>('.jp-AgentWorkspace-outcomeCopyStatus')
+        ?.textContent
+    ).toBe('Copied');
+    // The temporary textarea must be removed from the document.
+    expect(document.querySelector('textarea')).toBeNull();
+    node.remove();
+  });
+
+  it('reports a failed fallback instead of pretending success', async () => {
+    Object.assign(navigator, { clipboard: undefined });
+    Object.defineProperty(document, 'execCommand', {
+      configurable: true,
+      value: jest.fn().mockReturnValue(false)
+    });
+    const node = renderTurn(resultTurn(markdown), { handlers: handlers() });
+    document.body.append(node);
+
+    node
+      .querySelector<HTMLButtonElement>('.jp-AgentWorkspace-outcomeCopyButton')!
+      .dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await flush();
+
+    const status = node.querySelector<HTMLElement>(
+      '.jp-AgentWorkspace-outcomeCopyStatus'
+    );
+    expect(status?.textContent).toBe('Copy failed');
+    expect(status?.dataset.copyState).toBe('failed');
+    node.remove();
+  });
+
+  it('copies again on a second click', async () => {
+    const writeText = jest.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const node = renderTurn(resultTurn(markdown), { handlers: handlers() });
+    document.body.append(node);
+    const button = node.querySelector<HTMLButtonElement>(
+      '.jp-AgentWorkspace-outcomeCopyButton'
+    )!;
+    button.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await flush();
+    button.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await flush();
+    expect(writeText).toHaveBeenCalledTimes(2);
+    expect(writeText).toHaveBeenNthCalledWith(2, markdown);
+    node.remove();
+  });
+});
+
+describe('BTW entry point', () => {
+  function handlersWithBtw() {
+    return {
+      onToggleTrace: jest.fn(),
+      onToggleActivity: jest.fn(),
+      onToggleEvidence: jest.fn(),
+      onRevealFailure: jest.fn(),
+      onRetry: jest.fn(),
+      onBtw: jest.fn()
+    };
+  }
+
+  it('places a BTW control after Copy on a finished answer', () => {
+    const turn = completedTurn([
+      { kind: 'text', id: 'text-1', text: 'Finished.' }
+    ]);
+    const onBtw = jest.fn();
+    const node = renderTurn(turn, {
+      handlers: { ...handlersWithBtw(), onBtw }
+    });
+    const actions = node.querySelector('.jp-AgentWorkspace-outcomeActions');
+    const buttons = Array.from(
+      actions?.querySelectorAll<HTMLButtonElement>('button') ?? []
+    );
+    expect(buttons.map(button => button.textContent)).toEqual(['Copy', 'BTW']);
+    buttons[1].click();
+    expect(onBtw).toHaveBeenCalledWith(turn.id);
+  });
+
+  it('does not offer BTW for a running turn', () => {
+    const turn = createTurn('run-running');
+    const node = renderTurn(turn, { handlers: handlersWithBtw() });
+    expect(
+      node.querySelector('.jp-AgentWorkspace-outcomeBtwButton')
+    ).toBeNull();
+  });
+
+  it('keeps Copy working without a BTW handler', () => {
+    const turn = completedTurn([
+      { kind: 'text', id: 'text-1', text: 'Finished.' }
+    ]);
+    const node = renderTurn(turn, { handlers: handlers() });
+    expect(
+      node.querySelector('.jp-AgentWorkspace-outcomeCopyButton')
+    ).not.toBeNull();
+    expect(
+      node.querySelector('.jp-AgentWorkspace-outcomeBtwButton')
+    ).toBeNull();
   });
 });

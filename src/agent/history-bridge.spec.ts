@@ -279,10 +279,9 @@ describe('buildHistoryBridge', () => {
       changes: [],
       metrics: {},
       presentation: {
-        trace: 'auto',
+        trace: 'collapsed',
         expandedActivityIds: [],
-        fullEvidenceActivityIds: [],
-        outcomeExpanded: false
+        fullEvidenceActivityIds: []
       },
       resultText: 'stable outcome',
       resultIsError: false,
@@ -294,7 +293,7 @@ describe('buildHistoryBridge', () => {
     cell.turn = {
       ...cell.turn,
       revision: 99,
-      presentation: { ...cell.turn.presentation, outcomeExpanded: true }
+      presentation: { ...cell.turn.presentation, trace: 'expanded' }
     };
 
     expect(JSON.stringify(buildHistoryBridge([cell, draft], draft.id))).toBe(

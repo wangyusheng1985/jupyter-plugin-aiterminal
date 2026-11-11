@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,13 @@ from jupyter_aiterminal.settings import (
     load_dsh_settings,
     parse_settings,
 )
+from jupyter_aiterminal.dsh_acp_config import (
+    build_acp_profile_patches,
+    render_acp_profile_patch,
+)
 from jupyter_aiterminal.dsh_config import (
+    DEFAULT_CONTEXT_WINDOW,
+    DEFAULT_MAX_OUTPUT_TOKENS,
     PROTOCOL_ANTHROPIC_MESSAGES,
     PROTOCOL_OPENAI_COMPLETIONS,
 )
@@ -167,3 +174,112 @@ def test_load_dsh_settings_non_object_is_a_config_error(tmp_path: Path):
     path = _write_settings(tmp_path, "[]\n")
     with pytest.raises(AgentConfigError, match="JSON object"):
         load_dsh_settings(path)
+
+
+# -- budget fields in the settings file ------------------------------------
+#
+# Regression: the settings file can carry ``contextWindow`` and
+# ``maxOutputTokens``. The loader must read them from the raw settings (not the
+# documented 8192/4096 defaults) and the ACP overlay must emit exactly those
+# values, because the runtime shrinks the per-request output budget to a single
+# token when the declared window is smaller than the conversation.
+
+INCIDENT_CONTEXT_WINDOW = 512000
+INCIDENT_MAX_OUTPUT_TOKENS = 8192
+
+
+def _budget_settings(tmp_path: Path, **budget: object) -> Path:
+    body = {
+        "apiProtocol": "openai-completions",
+        "baseUrl": "http://127.0.0.1:8090/v1",
+        "model": "deepseek-flash",
+        "token": SECRET,
+        **budget,
+    }
+    return _write_settings(tmp_path, json.dumps(body) + "\n")
+
+
+def test_load_dsh_settings_reads_budget_fields_from_the_file(tmp_path: Path):
+    path = _budget_settings(
+        tmp_path,
+        contextWindow=INCIDENT_CONTEXT_WINDOW,
+        maxOutputTokens=INCIDENT_MAX_OUTPUT_TOKENS,
+    )
+    config = load_dsh_settings(path)
+
+    assert config.context_window == INCIDENT_CONTEXT_WINDOW
+    assert config.max_output_tokens == INCIDENT_MAX_OUTPUT_TOKENS
+    assert config.budget is not None
+    assert config.budget.context_window == INCIDENT_CONTEXT_WINDOW
+    assert config.budget.max_output_tokens == INCIDENT_MAX_OUTPUT_TOKENS
+    assert config.budget.message_budget == (
+        INCIDENT_CONTEXT_WINDOW - INCIDENT_MAX_OUTPUT_TOKENS
+    )
+    assert config.budget.provenance["context_window"].source == "user"
+    assert config.budget.provenance["max_output_tokens"].source == "user"
+
+
+def test_load_dsh_settings_keeps_default_budget_for_legacy_settings(tmp_path: Path):
+    """Settings without budget fields keep the documented compatible defaults."""
+    config = load_dsh_settings(_budget_settings(tmp_path))
+
+    assert config.context_window == DEFAULT_CONTEXT_WINDOW
+    assert config.max_output_tokens == DEFAULT_MAX_OUTPUT_TOKENS
+    assert config.budget is not None
+    assert config.budget.provenance["context_window"].source == "default"
+    assert config.budget.provenance["max_output_tokens"].source == "default"
+
+
+@pytest.mark.parametrize(
+    "budget",
+    [
+        {"contextWindow": 0},
+        {"maxOutputTokens": -1},
+        {"contextWindow": True},
+        {"maxOutputTokens": INCIDENT_CONTEXT_WINDOW + 1, "contextWindow": INCIDENT_CONTEXT_WINDOW},
+        {"contextWindow": INCIDENT_MAX_OUTPUT_TOKENS, "maxOutputTokens": INCIDENT_MAX_OUTPUT_TOKENS},
+    ],
+)
+def test_load_dsh_settings_rejects_invalid_budget_fields(
+    tmp_path: Path, budget: dict[str, object]
+):
+    path = _budget_settings(tmp_path, **budget)
+    with pytest.raises(AgentConfigError) as exc_info:
+        load_dsh_settings(path)
+    assert SECRET not in str(exc_info.value)
+    assert SECRET not in repr(exc_info.value)
+
+
+def test_settings_budget_reaches_the_acp_profile_patch(tmp_path: Path):
+    path = _budget_settings(
+        tmp_path,
+        contextWindow=INCIDENT_CONTEXT_WINDOW,
+        maxOutputTokens=INCIDENT_MAX_OUTPUT_TOKENS,
+    )
+    config = load_dsh_settings(path)
+    workspace_root = tmp_path / "workspace"
+
+    rows = build_acp_profile_patches(config, workspace_root=workspace_root)
+    by_id = {row["id"]: row for row in rows}
+    model = by_id["llm-pi-ai"]["config"]["providers"]["jupyter-aiterminal"][
+        "models"
+    ][0]
+
+    assert model["contextWindow"] == INCIDENT_CONTEXT_WINDOW
+    assert model["maxTokens"] == INCIDENT_MAX_OUTPUT_TOKENS
+    assert by_id["compaction-basic"]["config"] == {
+        "auto": config.budget.compaction_enabled,
+        "thresholdRatio": config.budget.threshold_ratio,
+        "headroomTokens": config.budget.headroom,
+        "retainRatio": config.budget.retain_ratio,
+        "maxTokens": config.budget.summary_max_tokens,
+    }
+    # The compaction row must be derived from the declared window, not from the
+    # runtime's absolute 65536-token headroom, which cannot fit a smaller window.
+    assert config.budget.headroom == (
+        INCIDENT_CONTEXT_WINDOW - INCIDENT_MAX_OUTPUT_TOKENS
+    ) // 4
+    assert config.budget.headroom < config.budget.message_budget
+
+    rendered = render_acp_profile_patch(config, workspace_root=workspace_root)
+    assert SECRET not in rendered

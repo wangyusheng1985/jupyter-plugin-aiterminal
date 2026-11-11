@@ -14,6 +14,7 @@ from tornado import web, websocket
 from tornado.ioloop import IOLoop
 
 from .agent import AgentSession
+from .btw_handlers import setup_btw_handlers
 from .history_bridge import compose_bridged_prompt, validate_history_bridge
 from .session_registry import SessionRegistry
 from .shell import PersistentShell
@@ -430,6 +431,9 @@ def setup_handlers(web_app, cwd: str) -> None:
             )
         ],
     )
+    # BTW side-chat endpoints share the same server root so their storage and
+    # notebook resolution use exactly the main handlers' workspace boundary.
+    setup_btw_handlers(web_app, cwd)
 
 
 def _resolve_workspace_file(root: str, requested: str) -> str | None:

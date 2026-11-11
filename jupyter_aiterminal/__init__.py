@@ -13,6 +13,7 @@ def _jupyter_server_extension_points():
 
 
 def _load_jupyter_server_extension(server_app):
+    from .btw_service import BtwService
     from .dsh_runtime_host import SharedDshRuntime
     from .handlers import setup_handlers
     from .session_registry import SessionRegistry
@@ -27,10 +28,13 @@ def _load_jupyter_server_extension(server_app):
     async def _close_ai_runtime() -> None:
         registry = web_app.settings.get("aiterminal_sessions")
         runtime = web_app.settings.get("aiterminal_runtime")
+        btw = web_app.settings.get("aiterminal_btw")
         if isinstance(registry, SessionRegistry):
             await registry.close()
         if isinstance(runtime, SharedDshRuntime):
             await runtime.close()
+        if isinstance(btw, BtwService):
+            await btw.close()
 
     cleanup = getattr(server_app, "cleanup_functions", None)
     if isinstance(cleanup, list):

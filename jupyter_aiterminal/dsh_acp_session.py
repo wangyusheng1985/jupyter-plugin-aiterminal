@@ -41,6 +41,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
@@ -502,6 +503,7 @@ class DshAcpSession:
         policy_preflight: PolicyPreflight | None = None,
         transport: DshAcpTransport | None = None,
         owns_transport: bool | None = None,
+        runtime_home: Path | None = None,
     ) -> None:
         if not isinstance(config, DshProviderConfig):
             raise DshAcpSessionError("config must be a DshProviderConfig instance")
@@ -533,6 +535,7 @@ class DshAcpSession:
         # configured row landed. A supplied transport has no such evidence, so
         # this stays False and no effective report may claim the budget applied.
         self._config_preflight_proven = False
+        self._runtime_home = runtime_home
         self._supplied_transport = transport
         # A caller-supplied transport is a shared runtime. This session must
         # not terminate it when the browser detaches or the session closes.
@@ -1090,6 +1093,13 @@ class DshAcpSession:
         self._session_root = self._ensure_private_dir(session_root)
         self._home = self._ensure_private_dir(session_root / "home")
         self._dsh_home = self._ensure_private_dir(session_root / "dsh")
+        if self._runtime_home is not None:
+            runtime_home = self._runtime_home
+            if not runtime_home.resolve().is_relative_to(self._storage_root.resolve()):
+                raise DshAcpSessionError("runtime storage must remain inside the storage root")
+            self._ensure_private_dir(runtime_home.parent)
+            self._home = self._ensure_private_dir(runtime_home.parent / "home")
+            self._dsh_home = self._ensure_private_dir(runtime_home)
         self._workspace_dir = workspace
         self._patch_path = session_root / "patch.json"
         self._write_patch()
@@ -1142,16 +1152,32 @@ class DshAcpSession:
             "storageKey": self._session_root.name,
             "workspace": os.fspath(self._cwd),
         }
-        try:
-            path.write_text(
-                json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n",
-                encoding="utf-8",
+        if self._runtime_home is not None:
+            payload["runtimeHome"] = os.fspath(
+                self._runtime_home.relative_to(self._storage_root)
             )
-            os.chmod(path, 0o600)
+        temporary: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=index_dir,
+                                             prefix=".index-", delete=False) as stream:
+                temporary = stream.name
+                os.chmod(temporary, 0o600)
+                stream.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            directory_fd = os.open(index_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         except OSError as exc:
             raise DshAcpSessionError(
                 f"cannot write ACP session storage index {path}: {exc}"
             ) from exc
+        finally:
+            if temporary is not None:
+                Path(temporary).unlink(missing_ok=True)
 
     # -- emit ----------------------------------------------------------------
 

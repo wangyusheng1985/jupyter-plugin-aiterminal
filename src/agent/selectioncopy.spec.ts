@@ -4,7 +4,8 @@ import {
   resolveSelectedText,
   selectedTextFromInput,
   selectedTextFromWindow,
-  SelectionCopyButton
+  SelectionCopyButton,
+  writeClipboardText
 } from './selectioncopy';
 
 describe('selection copy', () => {
@@ -98,5 +99,65 @@ describe('selection copy', () => {
     });
     copyTextToClipboard('pwd');
     expect(exec).toHaveBeenCalledWith('copy');
+  });
+
+  describe('writeClipboardText', () => {
+    afterEach(() => {
+      Object.assign(navigator, { clipboard: undefined });
+    });
+
+    it('resolves true when the async clipboard accepts the text', async () => {
+      const writeText = jest.fn().mockResolvedValue(undefined);
+      Object.assign(navigator, { clipboard: { writeText } });
+      await expect(writeClipboardText('# title')).resolves.toBe(true);
+      expect(writeText).toHaveBeenCalledWith('# title');
+    });
+
+    it('falls back to execCommand when the clipboard rejects', async () => {
+      Object.assign(navigator, {
+        clipboard: {
+          writeText: jest.fn().mockRejectedValue(new Error('denied'))
+        }
+      });
+      const exec = jest.fn().mockReturnValue(true);
+      Object.defineProperty(document, 'execCommand', {
+        configurable: true,
+        value: exec
+      });
+      await expect(writeClipboardText('- one\n- two')).resolves.toBe(true);
+      expect(exec).toHaveBeenCalledWith('copy');
+      expect(document.querySelector('textarea')).toBeNull();
+    });
+
+    it('resolves false when no copy path succeeds', async () => {
+      Object.assign(navigator, { clipboard: undefined });
+      Object.defineProperty(document, 'execCommand', {
+        configurable: true,
+        value: jest.fn().mockReturnValue(false)
+      });
+      await expect(writeClipboardText('pwd')).resolves.toBe(false);
+    });
+
+    it('preserves the previous focus and selection around the fallback', async () => {
+      Object.assign(navigator, { clipboard: undefined });
+      Object.defineProperty(document, 'execCommand', {
+        configurable: true,
+        value: jest.fn().mockReturnValue(true)
+      });
+      const root = document.createElement('div');
+      const field = document.createElement('textarea');
+      field.value = 'keep me';
+      root.append(field);
+      document.body.append(root);
+      field.focus();
+      field.setSelectionRange(0, 4);
+
+      await expect(writeClipboardText('copied')).resolves.toBe(true);
+
+      expect(document.activeElement).toBe(field);
+      expect(field.selectionStart).toBe(0);
+      expect(field.selectionEnd).toBe(4);
+      root.remove();
+    });
   });
 });

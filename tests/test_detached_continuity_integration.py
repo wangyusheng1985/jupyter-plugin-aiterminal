@@ -895,8 +895,8 @@ def test_real_seam_detached_turn_persists_and_reopen_attaches_same_session(
             "trace",
             "expandedActivityIds",
             "fullEvidenceActivityIds",
-            "outcomeExpanded",
         }
+        assert turn_data["presentation"]["trace"] == "collapsed"
         assert any(
             "partial answer" in block.get("text", "") for block in cell["blocks"]
         )

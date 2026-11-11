@@ -234,6 +234,8 @@ class SharedDshRuntime:
     """Process owner for every ACP session in one Jupyter server."""
 
     def __init__(self, transport: DshAcpTransport | None = None) -> None:
+        self._storage_runtimes: dict[str, SharedDshRuntime] = {}
+        self._storage_key: str | None = None
         self._transport = transport
         self._start_lock = asyncio.Lock()
         # Dedicated outer bootstrap lock: serializes inspection of the shared
@@ -264,6 +266,19 @@ class SharedDshRuntime:
         self._generation = 0
         if transport is not None:
             transport._on_notification = self._route_notification
+
+    def for_storage(self, home: str) -> SharedDshRuntime:
+        """Share new sessions, but isolate legacy stores without moving live logs."""
+        if self._storage_key is None:
+            self._storage_key = home
+        if self._storage_key == home:
+            return self
+        runtime = self._storage_runtimes.get(home)
+        if runtime is None:
+            runtime = SharedDshRuntime()
+            runtime._storage_key = home
+            self._storage_runtimes[home] = runtime
+        return runtime
 
     @property
     def process_id(self) -> int | None:
@@ -380,13 +395,18 @@ class SharedDshRuntime:
         fast path still acquires the lock before checking, so a race can never
         slip through between the check and the spawn.
 
-        This method starts, closes, and restarts nothing itself; it only
-        carries the caller's transaction. It uses its own lock rather than
+        A dead child is released before yielding so the caller can bootstrap
+        a replacement against the same durable store. It uses its own lock rather than
         ``start``'s ``_start_lock``, so starting an already adopted transport
         cannot deadlock with it. The lock is released on normal exit, on
         exception, and on cancellation.
         """
         async with self._bootstrap_lock:
+            proc = getattr(self._transport, "_proc", None)
+            if proc is not None and getattr(proc, "returncode", None) is not None:
+                await self._transport.close()
+                self._transport = None
+                self._started = False
             yield TransportStartup(self._transport)
 
     async def start(self) -> None:
@@ -668,5 +688,8 @@ class SharedDshRuntime:
 
     async def close(self) -> None:
         """Stop the shared child. Individual session close uses ACP instead."""
-        await self._transport.close()
+        for runtime in self._storage_runtimes.values():
+            await runtime.close()
+        if self._transport is not None:
+            await self._transport.close()
         self._started = False

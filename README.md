@@ -119,6 +119,48 @@ Honest limits:
 - If a saved session cannot be resumed, the extension reports the saved context as unavailable and does not silently replace it with a fresh session. Starting a new context is an explicit user action.
 - Workspaces created by older Pi/Claude-era builds still open and keep their visible cells and history. Their old agent session ids are not resumable through DSH, so they start without a linked runtime context. A bounded read-only history bridge is the intended migration path, but that migration is not released or fully verified in this branch.
 
+## BTW side chat
+
+Every finished answer card has a **BTW** button next to **Copy**. BTW opens a
+separate discussion panel on the right:
+
+- Opening the panel only restores or reserves a thread. No model call happens
+  until the first message is sent; clicking BTW again on the same card resumes
+  the same thread. Closing the panel only hides it, and **Stop** cancels only
+  that side chat.
+- The first message freezes a context snapshot of the notebook up to the source
+  answer: earlier user questions, committed assistant answers, and the source
+  answer with its terminal status. Later cells, hidden reasoning, tool records,
+  evidence panels, and credentials are excluded. The snapshot is trimmed by
+  whole question/answer pairs with a visible omission notice, and a source pair
+  that is too large is refused with an explicit error.
+- BTW runs on its **own** DSH runtime process with every tool plugin disabled
+  (filesystem, shell, jobs, web, skills, todos, goals, subagents, workflows, MCP
+  resources, plan mode, structured questions, slash commands, attachments). The
+  tool-free posture is verified at startup from a completed `--dump-config`; a
+  runtime that ignores a row is refused instead of falling back to a prompt-only
+  guard. The main agent runtime's tools are never reachable from BTW.
+- Each BTW answer has **Copy** and **Send to main session**. Sending back opens
+  an editable preview; nothing is inserted until you confirm. Confirmed text is
+  queued on the server, delivered into a **new main input cell** (never into
+  history, never auto-executed) once the main session is idle, and can be
+  cancelled while queued. Queue entries are deduplicated by request id, and a
+  delivery that cannot be proven is marked `unknown` and needs explicit
+  confirmation instead of an automatic retry.
+
+BTW threads persist per notebook in server-private storage
+(`<Jupyter data>/aiterminal/btw-store`, mode `0700`), keyed by the authenticated
+user and the notebook path resolved under the server root. Paths with `..`,
+absolute paths, and symlinked components are rejected. A thread records the
+notebook path, source cell id, snapshot version, DSH session id, message
+statuses, and queue statuses, so a page reload or server restart restores the
+same thread. A thread whose notebook moved or was copied is not guessed: the
+restore fails explicitly rather than silently starting a new thread.
+
+BTW uses the same provider settings, declared context window, and compaction
+budget as the main agent. See `docs/btw-runtime.md` for the tool-free evidence
+and the runtime row list.
+
 ## Use
 
 1. Create an AI Terminal workspace with either entry point:
@@ -132,7 +174,8 @@ Honest limits:
 4. Run with `Shift+Enter` (run and advance) or `Ctrl/Cmd+Enter` (run in place).
 5. Review results:
    - Execution records can be expanded/collapsed without jumping your viewport.
-   - Select text in a cell to display a floating copy button; standard shortcuts (`Cmd/Ctrl+C`, `Cmd/Ctrl+V`) work as expected. In command mode, `dd` deletes the cell.
+     - Select text in a cell to display a floating copy button; standard shortcuts (`Cmd/Ctrl+C`, `Cmd/Ctrl+V`) work as expected. In command mode, `dd` deletes the cell.
+   - Use **BTW** next to **Copy** on a finished answer to discuss it in a tool-free side chat without interrupting the main task.
 
 Command cells share one bash session per tab, so `cd` persists. AI cells use the server-side DSH runtime with full workspace awareness.
 
