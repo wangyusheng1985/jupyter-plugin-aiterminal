@@ -1088,7 +1088,8 @@ describe('AgentSession configuration channel', () => {
 
     emit(socket, {
       type: 'configuration-error',
-      message: 'failed for token sk-live-123 with baseUrl https://user:pass@host'
+      message:
+        'failed for token sk-live-123 with baseUrl https://user:pass@host'
     });
 
     expect(session.configurationError).toContain(
@@ -1121,9 +1122,7 @@ describe('AgentSession configuration channel', () => {
 
     expect(session.requestConfiguration()).toBe(true);
 
-    expect(socket.sent).toEqual([
-      JSON.stringify({ type: 'configuration' })
-    ]);
+    expect(socket.sent).toEqual([JSON.stringify({ type: 'configuration' })]);
   });
 
   it('returns false and never queues or opens a socket when unavailable', () => {

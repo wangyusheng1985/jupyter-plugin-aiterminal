@@ -14,6 +14,12 @@ import {
 
 export interface TurnRenderHandlers {
   onToggleTrace: (turnId: string) => void;
+  /**
+   * Open the BTW side chat for this answer. Optional so existing renderer
+   * callers keep working; only terminal answers with copyable text pass it a
+   * button.
+   */
+  onBtw?: (turnId: string) => void;
   onToggleActivity: (turnId: string, activityId: string) => void;
   onToggleEvidence: (turnId: string, activityId: string) => void;
   onRevealFailure: (turnId: string, activityId: string) => void;
@@ -115,7 +121,7 @@ function renderOutcome(
   renderMarkdownSource(body, turn.outcome, options.rendermime ?? null);
   const copyText = copyableOutcomeText(turn);
   if (copyText !== null) {
-    section.append(renderOutcomeCopyControl(turn, copyText));
+    section.append(renderOutcomeCopyControl(turn, copyText, options));
   }
   section.append(body);
   return section;
@@ -129,7 +135,11 @@ const COPY_FEEDBACK_MS = 2000;
  * copied. Feedback stays in an `aria-live` status and is cleared after a short
  * delay; a second click copies again.
  */
-function renderOutcomeCopyControl(turn: ChatTurn, text: string): HTMLElement {
+function renderOutcomeCopyControl(
+  turn: ChatTurn,
+  text: string,
+  options: TurnRenderOptions
+): HTMLElement {
   const row = document.createElement('div');
   row.className = 'jp-AgentWorkspace-outcomeActions';
   row.dataset.copyState = 'idle';
@@ -185,6 +195,31 @@ function renderOutcomeCopyControl(turn: ChatTurn, text: string): HTMLElement {
   });
 
   row.append(button, status);
+  const openBtw = options.handlers.onBtw;
+  if (
+    openBtw &&
+    turn.status !== 'running' &&
+    (turn.outcomeKind === 'result' || turn.outcomeKind === 'assistant')
+  ) {
+    const btw = document.createElement('button');
+    btw.type = 'button';
+    btw.className =
+      'jp-AgentWorkspace-turnControl jp-AgentWorkspace-outcomeBtwButton';
+    btw.dataset.turnControl = '';
+    btw.dataset.copyAction = 'btw';
+    btw.setAttribute('aria-label', 'BTW side chat for this answer'); // eslint-disable-line jupyter/no-untranslated-string
+    btw.textContent = 'BTW';
+    btw.addEventListener('mousedown', event => {
+      event.preventDefault();
+      event.stopPropagation();
+    });
+    btw.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      openBtw(turn.id);
+    });
+    row.append(btw);
+  }
   return row;
 }
 

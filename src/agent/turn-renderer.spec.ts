@@ -1085,3 +1085,54 @@ describe('outcome Markdown copy', () => {
     node.remove();
   });
 });
+
+describe('BTW entry point', () => {
+  function handlersWithBtw() {
+    return {
+      onToggleTrace: jest.fn(),
+      onToggleActivity: jest.fn(),
+      onToggleEvidence: jest.fn(),
+      onRevealFailure: jest.fn(),
+      onRetry: jest.fn(),
+      onBtw: jest.fn()
+    };
+  }
+
+  it('places a BTW control after Copy on a finished answer', () => {
+    const turn = completedTurn([
+      { kind: 'text', id: 'text-1', text: 'Finished.' }
+    ]);
+    const onBtw = jest.fn();
+    const node = renderTurn(turn, {
+      handlers: { ...handlersWithBtw(), onBtw }
+    });
+    const actions = node.querySelector('.jp-AgentWorkspace-outcomeActions');
+    const buttons = Array.from(
+      actions?.querySelectorAll<HTMLButtonElement>('button') ?? []
+    );
+    expect(buttons.map(button => button.textContent)).toEqual(['Copy', 'BTW']);
+    buttons[1].click();
+    expect(onBtw).toHaveBeenCalledWith(turn.id);
+  });
+
+  it('does not offer BTW for a running turn', () => {
+    const turn = createTurn('run-running');
+    const node = renderTurn(turn, { handlers: handlersWithBtw() });
+    expect(
+      node.querySelector('.jp-AgentWorkspace-outcomeBtwButton')
+    ).toBeNull();
+  });
+
+  it('keeps Copy working without a BTW handler', () => {
+    const turn = completedTurn([
+      { kind: 'text', id: 'text-1', text: 'Finished.' }
+    ]);
+    const node = renderTurn(turn, { handlers: handlers() });
+    expect(
+      node.querySelector('.jp-AgentWorkspace-outcomeCopyButton')
+    ).not.toBeNull();
+    expect(
+      node.querySelector('.jp-AgentWorkspace-outcomeBtwButton')
+    ).toBeNull();
+  });
+});

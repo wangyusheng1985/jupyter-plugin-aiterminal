@@ -217,7 +217,10 @@ describe('parseConfigurationReport', () => {
       },
       provenance: {
         context_window: { source: 'user' },
-        retain: { source: 'derived', derivedFrom: ['message_budget', 'retain_ratio'] }
+        retain: {
+          source: 'derived',
+          derivedFrom: ['message_budget', 'retain_ratio']
+        }
       }
     },
     desired: {

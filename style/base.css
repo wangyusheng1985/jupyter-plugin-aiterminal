@@ -1993,3 +1993,274 @@
   width: 16px;
   height: 16px;
 }
+
+/* BTW side chat: a right-side panel inside the workspace. It is hidden until
+   the user opens it from an answer card, stays usable in a narrow window, and
+   keeps every important error visible instead of hiding it behind a tooltip. */
+.jp-AgentWorkspace-split {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.jp-BtwPanel {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 340px;
+  max-width: 50%;
+  min-width: 240px;
+  gap: 8px;
+  padding: 8px;
+  border-left: 1px solid var(--jp-border-color2, #d0d7de);
+  background: var(--jp-layout-color1, #ffffff);
+  color: var(--jp-ui-font-color1, #111);
+  font-family: var(--jp-ui-font-family, sans-serif);
+  font-size: var(--jp-ui-font-size1, 13px);
+  overflow: auto;
+}
+
+@media (max-width: 720px) {
+  .jp-BtwPanel {
+    flex: 1 1 auto;
+    max-width: none;
+    min-width: 0;
+    border-left: none;
+    border-top: 1px solid var(--jp-border-color2, #d0d7de);
+  }
+}
+
+.jp-BtwPanel[hidden] {
+  display: none;
+}
+
+.jp-BtwPanel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  position: sticky;
+  top: 0;
+  background: inherit;
+  z-index: 1;
+}
+
+.jp-BtwPanel-title {
+  margin: 0;
+  font-size: var(--jp-ui-font-size2, 15px);
+  font-weight: 600;
+}
+
+.jp-BtwPanel-close {
+  min-width: 32px;
+  min-height: 32px;
+  border: 1px solid var(--jp-border-color2, #d0d7de);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.jp-BtwPanel-close:focus-visible,
+.jp-BtwPanel-button:focus-visible {
+  outline: 2px solid var(--jp-brand-color1, #1976d2);
+  outline-offset: 2px;
+}
+
+.jp-BtwPanel-meta {
+  color: var(--jp-ui-font-color2, #5b6570);
+}
+
+.jp-BtwPanel-error {
+  padding: 6px 8px;
+  border: 1px solid var(--jp-error-color1, #d32f2f);
+  border-radius: 4px;
+  color: var(--jp-error-color1, #d32f2f);
+  background: var(--jp-layout-color0, #ffffff);
+}
+
+.jp-BtwPanel-error[hidden] {
+  display: none;
+}
+
+.jp-BtwPanel-messages {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.jp-BtwPanel-message {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--jp-layout-color2, #f0f0f0);
+}
+
+.jp-BtwPanel-message.is-user {
+  background: var(--jp-layout-color3, #e3e3e3);
+}
+
+.jp-BtwPanel-message.is-failed {
+  border: 1px solid var(--jp-error-color1, #d32f2f);
+}
+
+.jp-BtwPanel-messageBody {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.jp-BtwPanel-messageActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.jp-BtwPanel-messageStatus {
+  color: var(--jp-ui-font-color2, #5b6570);
+}
+
+.jp-BtwPanel-button {
+  min-height: 32px;
+  padding: 4px 10px;
+  border: 1px solid var(--jp-border-color2, #d0d7de);
+  border-radius: 4px;
+  background: var(--jp-layout-color1, #ffffff);
+  color: var(--jp-ui-font-color1, #111);
+  cursor: pointer;
+  font: inherit;
+}
+
+.jp-BtwPanel-button.is-primary {
+  border-color: var(--jp-brand-color1, #1976d2);
+  color: var(--jp-content-link-color, #1976d2);
+  font-weight: 600;
+}
+
+.jp-BtwPanel-button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.jp-BtwPanel-queue {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.jp-BtwPanel-queue[hidden] {
+  display: none;
+}
+
+.jp-BtwPanel-queueHeading {
+  margin: 0;
+  font-size: var(--jp-ui-font-size1, 13px);
+  font-weight: 600;
+}
+
+.jp-BtwPanel-queueList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.jp-BtwPanel-queueItem {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding: 4px 6px;
+  border: 1px solid var(--jp-border-color2, #d0d7de);
+  border-radius: 4px;
+}
+
+.jp-BtwPanel-queueItem[data-status='unknown'],
+.jp-BtwPanel-queueItem[data-status='failed'] {
+  border-color: var(--jp-error-color1, #d32f2f);
+}
+
+.jp-BtwPanel-queueNote {
+  color: var(--jp-ui-font-color2, #5b6570);
+}
+
+.jp-BtwPanel-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--jp-brand-color1, #1976d2);
+  border-radius: 6px;
+}
+
+.jp-BtwPanel-preview[hidden] {
+  display: none;
+}
+
+.jp-BtwPanel-previewLabel {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-weight: 600;
+}
+
+.jp-BtwPanel-previewInput,
+.jp-BtwPanel-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border: 1px solid var(--jp-border-color2, #d0d7de);
+  border-radius: 4px;
+  background: var(--jp-layout-color0, #ffffff);
+  color: inherit;
+  font: inherit;
+  resize: vertical;
+}
+
+.jp-BtwPanel-previewActions,
+.jp-BtwPanel-composerActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.jp-BtwPanel-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  position: sticky;
+  bottom: 0;
+  padding-top: 6px;
+  background: inherit;
+}
+
+.jp-AgentWorkspace-outcomeBtwButton {
+  min-height: 32px;
+  min-width: 56px;
+  padding: 4px 12px;
+  border: 1px solid var(--jp-border-color1, #b0b8c1);
+  border-radius: 4px;
+  background: var(--jp-layout-color1, #f5f5f5);
+  color: var(--jp-ui-font-color1, #111);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+}
+
+.jp-AgentWorkspace-outcomeBtwButton:hover {
+  background: var(--jp-layout-color2, #eeeeee);
+}
+
+.jp-AgentWorkspace-outcomeBtwButton:focus-visible {
+  outline: 2px solid var(--jp-brand-color1, #1976d2);
+  outline-offset: 2px;
+}
