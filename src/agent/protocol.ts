@@ -24,12 +24,25 @@ export interface AgentExecInterruptMessage {
   type: 'exec_interrupt';
 }
 
+/** Client request to re-read selectable models and slash commands. */
+export interface AgentMetadataRequestMessage {
+  type: 'metadata';
+}
+
+/** Client request to switch the session's model (opaque runtime value). */
+export interface AgentSetModelMessage {
+  type: 'set_model';
+  value: string;
+}
+
 export type AgentClientMessage =
   | AgentUserMessage
   | AgentInterruptMessage
   | AgentExecMessage
   | AgentExecInterruptMessage
-  | AgentConfigurationRequestMessage;
+  | AgentConfigurationRequestMessage
+  | AgentMetadataRequestMessage
+  | AgentSetModelMessage;
 
 export interface AgentReadyEvent {
   type: 'ready';
@@ -37,11 +50,16 @@ export interface AgentReadyEvent {
   contextState?: 'new' | 'resumed';
   model: string;
   cwd: string;
+  /** Turn the server is still executing, so a reattached page can claim it. */
+  activeTurnId?: string;
+  activeCellId?: string;
+  running?: boolean;
 }
 
 export interface AgentAcceptedEvent {
   type: 'accepted';
   turnId?: string;
+  cellId?: string;
   sessionId: string;
 }
 
@@ -64,6 +82,34 @@ export interface AgentThinkingEvent {
   turnId?: string;
   id: string;
   state?: 'started' | 'finished';
+  /** Streaming reasoning text (cumulative); absent on legacy events. */
+  text?: string;
+  messageId?: string;
+}
+
+/** Context-window usage reported by the runtime for the current session. */
+export interface AgentUsageEvent {
+  type: 'usage';
+  used: number;
+  size: number;
+}
+
+/** Selectable model ids (display names included) reported by the runtime. */
+export interface AgentModelOption {
+  id: string;
+  name: string;
+}
+
+export interface AgentModelsEvent {
+  type: 'models';
+  models: AgentModelOption[];
+  current: string | null;
+}
+
+/** Slash commands the runtime currently advertises for this session. */
+export interface AgentCommandsEvent {
+  type: 'commands';
+  commands: string[];
 }
 
 export interface AgentToolStartEvent {
@@ -113,6 +159,7 @@ export type TerminalReason =
 export interface AgentResultEvent {
   type: 'result';
   turnId?: string;
+  cellId?: string;
   text: string;
   isError?: boolean;
   /** How the run ended; absent on legacy/partial results. */
@@ -276,7 +323,10 @@ export type AgentServerEvent =
   | AgentExecDoneEvent
   | AgentExecErrorEvent
   | AgentConfigurationEvent
-  | AgentConfigurationErrorEvent;
+  | AgentConfigurationErrorEvent
+  | AgentUsageEvent
+  | AgentModelsEvent
+  | AgentCommandsEvent;
 
 export type ChatBlock =
   | { kind: 'user'; id: string; text: string }
@@ -290,6 +340,9 @@ export type ChatBlock =
       kind: 'thinking';
       id: string;
       status: 'started' | 'finished';
+      /** Cumulative streaming reasoning text; absent for legacy markers. */
+      text?: string;
+      messageId?: string;
     }
   | {
       kind: 'tool';
@@ -348,10 +401,16 @@ export function applyServerEvent(
       const existing = blocks.find(
         block => block.kind === 'thinking' && block.id === id
       );
+      const status =
+        event.state ?? (event.text === undefined ? 'finished' : 'started');
       if (existing) {
         return blocks.map(block =>
           block.kind === 'thinking' && block.id === id
-            ? { ...block, status: event.state ?? 'finished' }
+            ? {
+                ...block,
+                status,
+                ...(event.text === undefined ? {} : { text: event.text })
+              }
             : block
         );
       }
@@ -360,7 +419,11 @@ export function applyServerEvent(
         {
           kind: 'thinking',
           id,
-          status: event.state ?? 'finished'
+          status,
+          ...(event.text === undefined ? {} : { text: event.text }),
+          ...(event.messageId === undefined
+            ? {}
+            : { messageId: event.messageId })
         }
       ];
     }
@@ -692,9 +755,62 @@ export interface DshCapabilitiesEvent {
   capabilities: DshCapabilityManifest;
 }
 
+export interface DshThoughtSnapshotEvent extends DshOptionalRunScope {
+  type: 'dsh/v1/thought.snapshot';
+  messageId: string;
+  text: string;
+}
+
+export interface DshThoughtDeltaEvent extends DshRunScope {
+  type: 'dsh/v1/thought.delta';
+  messageId: string;
+  delta: string;
+}
+
+/** Context-window usage for one run; `size` is the declared context window. */
+export interface DshUsageEvent extends DshRunScope {
+  type: 'dsh/v1/usage';
+  used: number;
+  size: number;
+}
+
+export interface DshConfigOptionValue {
+  value: string;
+  name: string;
+}
+
+/** One selectable session option (the runtime exposes the model this way). */
+export interface DshConfigOption {
+  id: string;
+  name: string;
+  category?: string;
+  currentValue: string;
+  options: DshConfigOptionValue[];
+}
+
+export interface DshConfigEvent extends DshSessionScope {
+  type: 'dsh/v1/config';
+  configOptions: DshConfigOption[];
+}
+
+export interface DshCommandInfo {
+  name: string;
+  description?: string;
+}
+
+export interface DshCommandsEvent extends DshSessionScope {
+  type: 'dsh/v1/commands';
+  commands: DshCommandInfo[];
+}
+
 export type DshProductEvent =
   | DshTextSnapshotEvent
   | DshTextDeltaEvent
+  | DshThoughtSnapshotEvent
+  | DshThoughtDeltaEvent
+  | DshUsageEvent
+  | DshConfigEvent
+  | DshCommandsEvent
   | DshActivityEvent
   | DshArtifactEvent
   | DshInteractionRequestedEvent
@@ -1309,6 +1425,110 @@ function parseDshPayload(
         messageId: requireString(payload, 'messageId'),
         delta: requireString(payload, 'delta')
       };
+    case 'thought.snapshot':
+      return {
+        type: 'dsh/v1/thought.snapshot',
+        sessionId: requireString(payload, 'sessionId'),
+        runtimeId: requireString(payload, 'runtimeId'),
+        ...optionalRun(payload),
+        messageId: requireString(payload, 'messageId'),
+        text: requireString(payload, 'text')
+      };
+    case 'thought.delta':
+      return {
+        type: 'dsh/v1/thought.delta',
+        sessionId: requireString(payload, 'sessionId'),
+        runtimeId: requireString(payload, 'runtimeId'),
+        runId: requireString(payload, 'runId'),
+        messageId: requireString(payload, 'messageId'),
+        delta: requireString(payload, 'delta')
+      };
+    case 'usage': {
+      const used = payload.used;
+      const size = payload.size;
+      if (
+        typeof used !== 'number' ||
+        !Number.isFinite(used) ||
+        used < 0 ||
+        typeof size !== 'number' ||
+        !Number.isFinite(size) ||
+        size <= 0
+      ) {
+        throw new DshPayloadError('usage');
+      }
+      return {
+        type: 'dsh/v1/usage',
+        sessionId: requireString(payload, 'sessionId'),
+        runtimeId: requireString(payload, 'runtimeId'),
+        runId: requireString(payload, 'runId'),
+        used,
+        size
+      };
+    }
+    case 'config': {
+      const raw = payload.configOptions;
+      if (!Array.isArray(raw)) {
+        throw new DshPayloadError('configOptions');
+      }
+      const configOptions: DshConfigOption[] = [];
+      raw.forEach((entry, index) => {
+        if (!isRecord(entry)) {
+          throw new DshPayloadError(`configOptions[${index}]`);
+        }
+        const rawOptions = entry.options;
+        if (!Array.isArray(rawOptions)) {
+          throw new DshPayloadError(`configOptions[${index}].options`);
+        }
+        const options: DshConfigOptionValue[] = [];
+        rawOptions.forEach((item, itemIndex) => {
+          if (!isRecord(item)) {
+            throw new DshPayloadError(
+              `configOptions[${index}].options[${itemIndex}]`
+            );
+          }
+          options.push({
+            value: requireString(item, 'value'),
+            name: requireString(item, 'name')
+          });
+        });
+        const category = optionalString(entry, 'category');
+        configOptions.push({
+          id: requireString(entry, 'id'),
+          name: requireString(entry, 'name'),
+          ...(category === undefined ? {} : { category }),
+          currentValue: requireString(entry, 'currentValue'),
+          options
+        });
+      });
+      return {
+        type: 'dsh/v1/config',
+        sessionId: requireString(payload, 'sessionId'),
+        runtimeId: requireString(payload, 'runtimeId'),
+        configOptions
+      };
+    }
+    case 'commands': {
+      const raw = payload.commands;
+      if (!Array.isArray(raw)) {
+        throw new DshPayloadError('commands');
+      }
+      const commands: DshCommandInfo[] = raw.map((entry, index) => {
+        if (!isRecord(entry)) {
+          throw new DshPayloadError(`commands[${index}]`);
+        }
+        const description = optionalString(entry, 'description');
+        return {
+          name: requireString(entry, 'name'),
+          ...(description === undefined ? {} : { description })
+        };
+      });
+      return {
+        type: 'dsh/v1/commands',
+        sessionId: requireString(payload, 'sessionId'),
+        runtimeId: requireString(payload, 'runtimeId'),
+        commands
+      };
+    }
     case 'activity':
       return {
         type: 'dsh/v1/activity',
@@ -1462,6 +1682,11 @@ export function parseDshProductEvent(raw: unknown): DshEventParseResult {
         reason:
           kind === 'text.snapshot' ||
           kind === 'text.delta' ||
+          kind === 'thought.snapshot' ||
+          kind === 'thought.delta' ||
+          kind === 'usage' ||
+          kind === 'config' ||
+          kind === 'commands' ||
           kind === 'activity' ||
           kind === 'artifact' ||
           kind === 'interaction.requested' ||

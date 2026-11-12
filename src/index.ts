@@ -121,14 +121,18 @@ export function activate(
   docManager.registry.addModelFactory(
     new AgentWorkspaceModelFactory() as never
   );
-  const factory = new AgentWorkspaceWidgetFactory(rendermime, {
-    name: AGENT_FACTORY,
-    label: trans.__('Agent Workspace'),
-    modelName: AGENT_MODEL_NAME,
-    fileTypes: ['agent-workspace'],
-    defaultFor: ['agent-workspace'],
-    translator
-  });
+  const factory = new AgentWorkspaceWidgetFactory(
+    rendermime,
+    {
+      name: AGENT_FACTORY,
+      label: trans.__('Agent Workspace'),
+      modelName: AGENT_MODEL_NAME,
+      fileTypes: ['agent-workspace'],
+      defaultFor: ['agent-workspace'],
+      translator
+    },
+    id => app.shell.activateById(id)
+  );
   docManager.registry.addWidgetFactory(factory as never);
   factory.widgetCreated.connect((_sender, widget) => {
     clearWorkspaceClosed(widget.context.path);

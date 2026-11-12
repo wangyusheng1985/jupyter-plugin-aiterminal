@@ -539,3 +539,41 @@ def test_budget_errors_name_fields_and_values_without_credentials():
     assert "0.5" in message
     assert SECRET not in message
     assert BASE_SETTINGS["baseUrl"] not in message
+
+
+def test_models_default_to_the_single_default_model():
+    config = parse_dsh_provider_config(_settings())
+    assert config.models == ("example-model",)
+    provider = _provider(build_provider_insert_patch(config))
+    assert [entry["id"] for entry in provider["models"]] == ["example-model"]
+
+
+def test_configured_models_are_selectable_and_deduplicated():
+    config = parse_dsh_provider_config(
+        _settings(models=["other-model", "example-model", "third-model", "other-model"])
+    )
+    assert config.models == ("example-model", "other-model", "third-model")
+    provider = _provider(build_provider_insert_patch(config))
+    assert [entry["id"] for entry in provider["models"]] == [
+        "example-model",
+        "other-model",
+        "third-model",
+    ]
+    # Every selectable model shares the one authoritative budget.
+    assert {entry["contextWindow"] for entry in provider["models"]} == {
+        provider["models"][0]["contextWindow"]
+    }
+    assert {entry["maxTokens"] for entry in provider["models"]} == {
+        provider["models"][0]["maxTokens"]
+    }
+
+
+@pytest.mark.parametrize("models", [[""], ["  "], [1], [[]], [None]])
+def test_invalid_models_are_rejected(models):
+    with pytest.raises(AgentConfigError):
+        parse_dsh_provider_config(_settings(models=models))
+
+
+def test_non_list_models_are_rejected():
+    with pytest.raises(AgentConfigError):
+        parse_dsh_provider_config(_settings(models="other-model"))

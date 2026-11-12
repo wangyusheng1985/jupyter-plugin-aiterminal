@@ -1,7 +1,7 @@
 import type { ChatBlock } from './protocol';
 import {
   createTurn,
-  deriveTurn,
+  hydrateTurn,
   restoreTurn,
   setTurnStatus,
   toPersistedTurn,
@@ -179,17 +179,42 @@ function snapshotFromCell(cell: WorkspaceCell): CellSnapshot {
 function cellFromSnapshot(cell: CellSnapshot): WorkspaceCell {
   const input = normalizeInput(cell.source, cell.kind);
   const blocks = Array.isArray(cell.blocks) ? cell.blocks : [];
-  const status = persistStatus(cell.status);
+  const storedStatus = persistStatus(cell.status);
+  // A persisted running cell is not proof that the server is still working:
+  // the page may have been closed before the terminal event. Show it as
+  // pending until a reattach handshake confirms or settles the turn.
+  let status: CellStatus =
+    storedStatus === 'running' ? 'pending' : storedStatus;
   const restoredTurn = restoreTurn(cell.turn);
+  let turn: ChatTurn | null;
+  if (restoredTurn) {
+    turn = hydrateTurn(restoredTurn, blocks);
+    if (status === 'pending') {
+      if (turn.status === 'running') {
+        // Displaying a persisted running turn as pending is a load-time
+        // projection, not a content change: keep its timestamp stable so the
+        // document is not dirtied merely by opening it.
+        turn = hydrateTurn({ ...turn, status: 'pending' }, blocks);
+      } else {
+        // A terminal turn on a cell persisted as running is inconsistent;
+        // trust the turn and do not offer an adoption path for it.
+        status = turn.status === 'error' ? 'interrupted' : 'done';
+      }
+    }
+  } else {
+    turn = legacyTurn(cell.id, input.kind, storedStatus, blocks);
+    if (status === 'pending') {
+      // Without a persisted turn id there is nothing the server can claim.
+      status = 'interrupted';
+    }
+  }
   return {
     id: cell.id,
     kind: input.kind,
     source: input.source,
     output: cell.output,
     blocks,
-    turn: restoredTurn
-      ? deriveTurn(restoredTurn, blocks)
-      : legacyTurn(cell.id, input.kind, status, blocks),
+    turn,
     status,
     executionCount:
       typeof cell.executionCount === 'number' ? cell.executionCount : null,
@@ -414,8 +439,11 @@ function persistStatus(status: CellStatus | undefined): CellStatus {
   if (status === 'done' || status === 'interrupted' || status === 'idle') {
     return status;
   }
-  if (status === 'running') {
-    return 'interrupted';
+  // Running is durable enough to survive a refresh: the reattach flow needs
+  // it to find the cell that owns the still-active turn. Pending is the
+  // in-memory presentation of that state on load.
+  if (status === 'running' || status === 'pending') {
+    return 'running';
   }
   if (status === 'queued') {
     return 'idle';

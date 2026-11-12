@@ -15,6 +15,7 @@
     "preserveWatchOutput": true,
     "rootDir": "src",
     "sourceMap": true,
+    "skipLibCheck": true,
     "strict": true,
     "strictNullChecks": true,
     "target": "ES2018",

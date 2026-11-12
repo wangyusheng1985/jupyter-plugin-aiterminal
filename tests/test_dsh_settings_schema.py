@@ -12,6 +12,8 @@ SCHEMA_PATH = Path(__file__).resolve().parents[1] / "schema" / "plugin.json"
 ANTHROPIC_MESSAGES = "anthropic-messages"
 OPENAI_COMPLETIONS = "openai-completions"
 CONFIG_FIELDS = ("baseUrl", "model", "token")
+# Optional multi-model selector: an array of model ids.
+MODEL_LIST_FIELDS = ("models",)
 # Advanced budget fields: optional positive integers.
 POSITIVE_INTEGER_FIELDS = ("contextWindow", "maxOutputTokens", "compactionSummaryMaxTokens")
 # Compaction headroom may legitimately be zero.
@@ -53,7 +55,12 @@ def test_schema_is_a_json_object_with_disabled_extra_settings():
 
     assert schema["type"] == "object"
     assert schema["additionalProperties"] is False
-    assert set(_properties()) == {"apiProtocol", *CONFIG_FIELDS, *ADVANCED_FIELDS}
+    assert set(_properties()) == {
+        "apiProtocol",
+        *CONFIG_FIELDS,
+        *MODEL_LIST_FIELDS,
+        *ADVANCED_FIELDS,
+    }
 
 
 def test_schema_has_no_root_required_so_new_and_partial_settings_load():

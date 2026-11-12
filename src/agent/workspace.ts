@@ -1,3 +1,4 @@
+import { Notification } from '@jupyterlab/apputils';
 import type { DocumentRegistry } from '@jupyterlab/docregistry';
 import type { IRenderMimeRegistry } from '@jupyterlab/rendermime';
 import type { Message } from '@lumino/messaging';
@@ -38,6 +39,7 @@ import { SelectionCopyButton } from './selectioncopy';
 import { formatToolInput } from './tool';
 import type { AgentToolbarHost } from './toolbar';
 import type {
+  AgentModelOption,
   BudgetFieldName,
   BudgetProvenanceEntry,
   BudgetSnapshot,
@@ -69,7 +71,6 @@ import {
   workspaceUiStateKey,
   workspaceOverview,
   type FollowState,
-  type WorkspaceOverview,
   type WorkspaceUiState
 } from './workspace-interaction';
 
@@ -166,6 +167,7 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   private readonly saveCoordinator: WorkspaceSaveCoordinator;
   private unsubscribeDsh: (() => void) | null = null;
   private dshOwnedSession: string | null = null;
+  private documentActivator: (() => void) | null = null;
   private readonly sendBackWaiters = new Map<
     string,
     (accepted: boolean) => void
@@ -261,13 +263,13 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
       onContinueFromHistory: () => this.resolveContextChoice('bridge'),
       onStartEmptyContext: () => this.resolveContextChoice('empty'),
       onDismissContextChoice: () => this.cancelContextChoice(true),
-      onRevealFailure: cellId => this.navigateToCell(cellId),
-      onRevealInterrupted: cellId => this.navigateToCell(cellId),
       onOpenHistory: () => this.navigatorView.openHistory(),
       onRefreshConfiguration: () => this.requestConfigurationRefresh(),
       onRetrySave: () => {
         void this.saveCoordinator.retry().catch(() => undefined);
-      }
+      },
+      onSelectModel: value => this.selectModel(value),
+      onCompact: () => this.runCompact()
     });
     this.btwPanel = new BtwPanel({
       notebook: () => this.notebookPath(),
@@ -404,6 +406,14 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
   }
 
   /**
+   * Install the callback that raises this document's JupyterLab tab. The
+   * widget factory owns the widget id, so the content cannot activate itself.
+   */
+  setDocumentActivator(activate: (() => void) | null): void {
+    this.documentActivator = activate;
+  }
+
+  /**
    * The current load-protection state, or null when the document loaded cleanly.
    * A non-null value means the workspace is read-only for the open document.
    */
@@ -496,7 +506,10 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     if (this.notebook.empty) {
       return;
     }
-    if (this.notebook.current.status === 'running') {
+    if (
+      this.notebook.current.status === 'running' ||
+      this.notebook.current.status === 'pending'
+    ) {
       this.status.setMessage('Cannot delete a running cell.');
       return;
     }
@@ -1204,15 +1217,60 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     output: string,
     status: 'done' | 'interrupted'
   ): void {
-    if (!this.notebook.finishRun(requestId, output, status)) return;
+    const request = this.notebook.activeRun;
+    if (
+      !request ||
+      request.id !== requestId ||
+      !this.notebook.finishRun(requestId, output, status)
+    ) {
+      return;
+    }
+    const cell = this.notebook.cells.find(
+      candidate => candidate.id === request.cellId
+    );
     this.aiInterruptRequested = false;
     this.followState = syncFollowRequest(this.followState, null);
     this.refresh();
     this.persistNow();
+    if (cell) this.notifyCellCompletion(cell);
     this.drainQueue();
   }
 
+  /**
+   * Announce a finished cell through JupyterLab's notification center. The
+   * action raises this document's tab and selects the exact Cell, so a
+   * notification from a background workspace is still actionable.
+   */
+  private notifyCellCompletion(cell: WorkspaceCell): void {
+    const outcome = cellCompletionOutcome(cell);
+    const position = cell.executionCount ?? '?';
+    const kind = cell.kind === 'ai' ? 'Agent cell' : 'Command cell';
+    const fileName = this.notebookPath()?.split('/').pop() ?? '';
+    const message = `${fileName ? `${fileName} · ` : ''}${kind} [${position}] ${
+      outcome.label
+    }`;
+    const cellId = cell.id;
+    Notification.emit(message, outcome.type, {
+      autoClose: 5000,
+      actions: [
+        {
+          label: 'Open cell',
+          caption: 'Show this cell in its workspace tab',
+          callback: () => this.revealCellFromNotification(cellId)
+        }
+      ]
+    });
+  }
+
+  private revealCellFromNotification(cellId: string): void {
+    if (this.isDisposed) return;
+    this.documentActivator?.();
+    this.navigateToCell(cellId);
+  }
+
   private onSessionChange(): void {
+    this.adoptServerTurn();
+    this.settleUnclaimedPendingCells();
     // Deliver a queued send-back as soon as the main session is idle again;
     // the panel only claims when its stored queue actually holds an entry.
     if (!this.session.running) {
@@ -1261,21 +1319,39 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
       if (index >= 0) {
         const cell = this.notebook.cells[index];
         if (request.kind === 'ai') {
+          // A transport close is not a user interrupt and does not prove the
+          // server stopped. Keep the last known turn and evidence untouched
+          // until the reconnect handshake or a terminal event settles it.
+          if (!this.session.connected) {
+            this.refresh();
+            this.status.setMessage(
+              'Disconnected from the Agent server; the server may still be executing this turn.'
+            );
+            return;
+          }
           const previousTurn = cell.turn;
-          cell.blocks = this.session.blocks;
-          cell.turn = preserveTurnPresentation(
+          // Replayed attach events can begin with an accepted event and an
+          // empty block list. Do not erase evidence already on disk.
+          if (this.session.blocks.length || !cell.blocks.length) {
+            cell.blocks = this.session.blocks;
+          }
+          const incomingTurn =
             this.session.turn ??
-              deriveTurn(createTurn(request.id), this.session.blocks),
-            previousTurn
-          );
+            deriveTurn(createTurn(request.id), this.session.blocks);
+          if (
+            !cell.turn ||
+            incomingTurn.timeline.length > 0 ||
+            incomingTurn.revision > 0 ||
+            incomingTurn.status !== 'running'
+          ) {
+            cell.turn = preserveTurnPresentation(incomingTurn, previousTurn);
+          }
           if (!this.session.running) {
             if (this.pendingContextAcceptance?.id === request.id) {
               this.finishContextAcceptance(request);
             }
             cell.status =
-              this.session.error ||
-              this.aiInterruptRequested ||
-              !this.session.connected
+              this.session.error || this.aiInterruptRequested
                 ? 'interrupted'
                 : 'done';
             cell.turn = preserveTurnPresentation(
@@ -1303,6 +1379,71 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
       queueMicrotask(() => this.notebookView.revealOutputTail(request.cellId));
     }
     if (this.notebook.activeRun) {
+      this.persistSoon();
+    }
+  }
+
+  /**
+   * Claim a turn that the server reports as still executing after a refresh or
+   * socket reconnect. The document is the only identity available before the
+   * first replayed event, so match the server's cell/turn pair against it.
+   */
+  private adoptServerTurn(): void {
+    if (this.notebook.activeRun || !this.session.serverStateKnown) return;
+    const activeTurnId = this.session.serverActiveTurnId;
+    // A turn that finished while the page was away has no active id, but its
+    // replayed terminal events still carry the identity needed to settle it.
+    const turnId = activeTurnId ?? this.session.turn?.id ?? null;
+    if (!turnId) return;
+    const cellId = this.session.serverActiveCellId ?? this.session.activeCellId;
+    let index = cellId
+      ? this.notebook.cells.findIndex(cell => cell.id === cellId)
+      : -1;
+    if (index < 0) {
+      index = this.notebook.cells.findIndex(cell => cell.turn?.id === turnId);
+    }
+    if (index < 0) return;
+    const cell = this.notebook.cells[index];
+    if (cell.kind !== 'ai') return;
+    const persistedTurnId = cell.turn?.id ?? null;
+    const adoptable =
+      Boolean(activeTurnId) ||
+      cell.status === 'pending' ||
+      cell.status === 'running';
+    if (!adoptable) return;
+    if (persistedTurnId && persistedTurnId !== turnId) {
+      // Never hijack a different persisted turn on the same cell.
+      return;
+    }
+    if (this.notebook.adoptRun(cell.id, turnId)) {
+      if (!this.session.activeCellId) this.session.activeCellId = cell.id;
+      this.persistSoon();
+    }
+  }
+
+  /**
+   * A ready handshake with no active server turn is proof that a restored
+   * pending cell is no longer executing. Settle it without touching blocks.
+   */
+  private settleUnclaimedPendingCells(): void {
+    if (
+      !this.session.serverStateKnown ||
+      !this.session.connected ||
+      this.session.running ||
+      this.session.serverActiveTurnId
+    ) {
+      return;
+    }
+    let changed = false;
+    this.notebook.cells.forEach(cell => {
+      if (cell.status !== 'pending') return;
+      cell.status = 'interrupted';
+      if (cell.turn && cell.turn.status === 'pending') {
+        cell.turn = setTurnStatus(cell.turn, 'interrupted', cell.blocks);
+      }
+      changed = true;
+    });
+    if (changed) {
       this.persistSoon();
     }
   }
@@ -1532,7 +1673,13 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
       state,
       workspaceOverview(this.notebook.cells),
       this.session.configurationReport,
-      this.session.configurationError
+      this.session.configurationError,
+      {
+        usage: this.session.usage,
+        models: this.session.models,
+        currentModel: this.session.currentModel,
+        commands: this.session.commands
+      }
     );
     if (this.documentLoadErrorState) {
       // A load protection notice must stay visible across refreshes, unlike a
@@ -1566,6 +1713,12 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
     if (this.dshOwnedSession === sessionId) return;
     this.dshOwnedSession = sessionId;
     if (this.documentLoadErrorState) return;
+    // A reopened document already carries this exact reference. Re-writing it
+    // would dirty an otherwise clean file and race a concurrent writer, which
+    // surfaces as Jupyter's "changed on disk" conflict. Persist only when the
+    // engine-issued id actually changed.
+    const existing = getResumableDshSessionReference(this.notebook);
+    if (existing?.sessionId === sessionId) return;
     // Persist only the engine-issued session id, never the runtime or any live
     // state, so reopening the document can resume this exact session.
     setAgentSessionReference(this.notebook, { engine: 'dsh', sessionId });
@@ -1590,6 +1743,42 @@ export class AgentWorkspaceContent extends Panel implements AgentToolbarHost {
         'The Agent server is not connected, so configuration cannot be refreshed. Refreshing never opens a connection.'
       );
     }
+  }
+
+  /**
+   * Switch the session's model through the runtime's ACP config option. The
+   * runtime applies a selection from its next model step, so this is allowed
+   * while a turn is running instead of silently dropping the click. It never
+   * restarts the runtime: a rejected switch surfaces as an error event.
+   */
+  private selectModel(value: string): void {
+    if (!value) return;
+    if (this.session.setModel(value) === false) {
+      this.status.setMessage(
+        'The Agent server is not connected, so the model was not changed.'
+      );
+    }
+  }
+
+  /**
+   * Manual compaction: submit the runtime's own `/compact` slash command in a
+   * fresh cell so its output uses the normal streaming turn UI.
+   */
+  private runCompact(): void {
+    if (this.documentLoadErrorState) {
+      this.reportDocumentLoadError();
+      return;
+    }
+    if (this.session.running || this.notebook.busy()) {
+      this.status.setMessage(
+        'Wait for the running turn to finish before compacting.'
+      );
+      return;
+    }
+    this.addCellFromFooter();
+    this.notebook.setSource('/compact');
+    this.refresh();
+    this.runCell(false);
   }
 
   private startNewContext(): void {
@@ -2125,7 +2314,8 @@ export class CellView {
       Boolean(cell.output) ||
       cell.blocks.length > 0 ||
       cell.status === 'queued' ||
-      cell.status === 'running';
+      cell.status === 'running' ||
+      cell.status === 'pending';
     if (!hasOutput) {
       this.outputRow?.remove();
       this.outputRow = null;
@@ -2215,31 +2405,74 @@ export class CellView {
   }
 }
 
+function cellCompletionOutcome(cell: WorkspaceCell): {
+  type: 'success' | 'warning' | 'error';
+  label: string;
+} {
+  const turn = cell.turn;
+  if (turn?.status === 'error' || turn?.resultIsError) {
+    return { type: 'error', label: 'failed' };
+  }
+  if (cell.status === 'interrupted' || turn?.status === 'interrupted') {
+    return { type: 'warning', label: 'interrupted' };
+  }
+  return { type: 'success', label: 'completed' };
+}
+
+export interface StatusBarSessionMeta {
+  usage: { used: number; size: number } | null;
+  models: AgentModelOption[];
+  currentModel: string | null;
+  commands: string[];
+}
+
+export const EMPTY_STATUS_META: StatusBarSessionMeta = {
+  usage: null,
+  models: [],
+  currentModel: null,
+  commands: []
+};
+
+/** Compact token counts for the dense status bar (1.2k, 8.0k, 1.3m). */
+function formatTokenCount(value: number): string {
+  if (!Number.isFinite(value) || value < 0) return '0';
+  if (value < 1000) return String(Math.round(value));
+  if (value < 1_000_000) {
+    const thousands = value / 1000;
+    return `${thousands < 10 ? thousands.toFixed(1) : Math.round(thousands)}k`;
+  }
+  const millions = value / 1_000_000;
+  return `${millions < 10 ? millions.toFixed(1) : Math.round(millions)}m`;
+}
+
 export interface StatusBarHandlers {
   onStartNewContext: () => void;
   onContinueFromHistory: () => void;
   onStartEmptyContext: () => void;
   onDismissContextChoice: () => void;
-  onRevealFailure: (cellId: string) => void;
-  onRevealInterrupted: (cellId: string) => void;
   onOpenHistory: () => void;
   onRefreshConfiguration: () => void;
   onRetrySave: () => void;
+  onSelectModel?: (value: string) => void;
+  onCompact?: () => void;
 }
 
 export class StatusBar extends Widget {
   private readonly connection: HTMLSpanElement;
+  /**
+   * Kept for internal state/tests but never shown: the bottom context dropdown
+   * was removed in favor of the right-side session navigation.
+   */
   private readonly contextButton: HTMLButtonElement;
   private readonly cwd: HTMLSpanElement;
   private readonly overviewButton: HTMLButtonElement;
-  private readonly failureButton: HTMLButtonElement;
-  private readonly interruptedButton: HTMLButtonElement;
   private readonly execution: HTMLSpanElement;
   private readonly saveGroup: HTMLDivElement;
   private readonly saveStatus: HTMLSpanElement;
   private readonly retrySaveButton: HTMLButtonElement;
-  private readonly contextPopover: HTMLDivElement;
   private readonly contextDescription: HTMLDivElement;
+  /** Hidden popover host; the history-choice prompt still renders inside it. */
+  private readonly contextPopover: HTMLDivElement;
   private readonly resetContextButton: HTMLButtonElement;
   private readonly configurationDetails: HTMLDetailsElement;
   private readonly configurationContent: HTMLDivElement;
@@ -2250,8 +2483,11 @@ export class StatusBar extends Widget {
   private readonly continueHistoryButton: HTMLButtonElement;
   private readonly emptyContextButton: HTMLButtonElement;
   private historyChoiceBusy = false;
-  private overview: WorkspaceOverview = workspaceOverview([]);
   private lastSyncKey = '';
+  private readonly modelGroup: HTMLLabelElement;
+  private readonly modelSelect: HTMLSelectElement;
+  private readonly usage: HTMLSpanElement;
+  private readonly compactButton: HTMLButtonElement;
 
   constructor(
     private readonly handlers: StatusBarHandlers = {
@@ -2259,11 +2495,11 @@ export class StatusBar extends Widget {
       onContinueFromHistory: () => undefined,
       onStartEmptyContext: () => undefined,
       onDismissContextChoice: () => undefined,
-      onRevealFailure: () => undefined,
-      onRevealInterrupted: () => undefined,
       onOpenHistory: () => undefined,
       onRefreshConfiguration: () => undefined,
-      onRetrySave: () => undefined
+      onRetrySave: () => undefined,
+      onSelectModel: () => undefined,
+      onCompact: () => undefined
     }
   ) {
     super();
@@ -2278,6 +2514,9 @@ export class StatusBar extends Widget {
     this.contextButton.className = 'jp-AgentWorkspace-statusContext';
     this.contextButton.setAttribute('aria-haspopup', 'true');
     this.contextButton.setAttribute('aria-expanded', 'false');
+    // The visible trigger is removed; the element stays hidden so the
+    // workspace's automatic history-choice prompt can still render.
+    this.contextButton.hidden = true;
     this.contextButton.addEventListener('click', () => {
       if (!this.contextPopover.hidden && !this.historyChoice.hidden) {
         if (this.historyChoiceBusy) return;
@@ -2294,17 +2533,6 @@ export class StatusBar extends Widget {
     this.overviewButton.addEventListener('click', () => {
       this.handlers.onOpenHistory();
     });
-    this.failureButton = this.createOverviewIssueButton('failed', () => {
-      const cellId = this.overview.firstFailureCellId;
-      if (cellId) this.handlers.onRevealFailure(cellId);
-    });
-    this.interruptedButton = this.createOverviewIssueButton(
-      'interrupted',
-      () => {
-        const cellId = this.overview.firstInterruptedCellId;
-        if (cellId) this.handlers.onRevealInterrupted(cellId);
-      }
-    );
     this.execution = document.createElement('span');
     this.execution.className = 'jp-AgentWorkspace-statusExecution';
     this.execution.setAttribute('role', 'status');
@@ -2404,6 +2632,7 @@ export class StatusBar extends Widget {
     });
     choiceActions.append(this.continueHistoryButton, this.emptyContextButton);
     this.historyChoice.append(this.historyChoiceDescription, choiceActions);
+    this.historyChoice.hidden = true;
     this.contextPopover.append(
       this.contextDescription,
       this.resetContextButton,
@@ -2419,17 +2648,47 @@ export class StatusBar extends Widget {
         return;
       }
       this.setContextOpen(false);
-      this.contextButton.focus({ preventScroll: true });
     });
+    this.modelGroup = document.createElement('label');
+    this.modelGroup.className = 'jp-AgentWorkspace-statusModel';
+    const modelLabel = document.createElement('span');
+    modelLabel.className = 'jp-AgentWorkspace-statusModelLabel';
+    modelLabel.textContent = 'Model';
+    this.modelSelect = document.createElement('select');
+    this.modelSelect.className = 'jp-AgentWorkspace-statusModelSelect';
+    this.modelSelect.setAttribute('aria-label', 'Model'); // eslint-disable-line jupyter/no-untranslated-string
+    this.modelSelect.addEventListener('change', () => {
+      const value = this.modelSelect.value;
+      if (!value) return;
+      this.handlers.onSelectModel?.(value);
+    });
+    this.modelGroup.append(modelLabel, this.modelSelect);
+
+    this.usage = document.createElement('span');
+    this.usage.className = 'jp-AgentWorkspace-statusUsage';
+    this.usage.setAttribute('role', 'status');
+    this.usage.hidden = true;
+
+    this.compactButton = document.createElement('button');
+    this.compactButton.type = 'button';
+    this.compactButton.className = 'jp-AgentWorkspace-statusCompact';
+    this.compactButton.textContent = 'Compact';
+    this.compactButton.title = 'Compact the current context now'; // eslint-disable-line jupyter/no-untranslated-string
+    this.compactButton.hidden = true;
+    this.compactButton.addEventListener('click', () => {
+      if (this.compactButton.disabled) return;
+      this.handlers.onCompact?.();
+    });
+
     this.node.append(
       this.connection,
       this.contextButton,
       this.cwd,
-      this.overviewButton,
-      this.interruptedButton,
-      this.failureButton,
       this.saveGroup,
       this.execution,
+      this.usage,
+      this.compactButton,
+      this.modelGroup,
       this.contextPopover
     );
   }
@@ -2438,18 +2697,20 @@ export class StatusBar extends Widget {
     state: WorkspaceUiState,
     overview = workspaceOverview([]),
     configuration: ConfigurationReport | null = null,
-    configurationError: string | null = null
+    configurationError: string | null = null,
+    meta: StatusBarSessionMeta = EMPTY_STATUS_META
   ): void {
     this.syncConfiguration(configuration, configurationError);
+    this.syncSessionMeta(state, meta);
     const key = `${workspaceUiStateKey(state)}|${JSON.stringify(overview)}`;
     if (key === this.lastSyncKey) return;
     this.lastSyncKey = key;
-    this.overview = overview;
     this.connection.textContent = state.connectionLabel;
     this.connection.classList.toggle('is-error', Boolean(state.error));
     this.connection.classList.toggle('is-connected', state.connected);
     this.cwd.textContent = state.cwd ?? 'Local tools';
     this.cwd.title = state.cwd ?? '';
+    // Kept for the hidden trigger's state and the history-choice description.
     this.contextButton.textContent = state.contextLabel;
     this.contextButton.classList.toggle(
       'is-unavailable',
@@ -2458,10 +2719,6 @@ export class StatusBar extends Widget {
     this.contextDescription.textContent = contextDescription(state);
     this.resetContextButton.disabled = state.activeRun !== null;
     this.overviewButton.textContent = overview.summaryLabel;
-    this.interruptedButton.hidden = overview.interruptedCount === 0;
-    this.interruptedButton.textContent = `${overview.interruptedCount} interrupted`;
-    this.failureButton.hidden = overview.failureCount === 0;
-    this.failureButton.textContent = `${overview.failureCount} failed`;
     this.saveStatus.textContent = state.saveLabel;
     this.saveGroup.classList.toggle('is-error', state.savePhase === 'error');
     this.saveGroup.classList.toggle(
@@ -2471,6 +2728,73 @@ export class StatusBar extends Widget {
     this.retrySaveButton.hidden = !state.saveRetryAvailable;
     this.retrySaveButton.disabled = !state.saveRetryAvailable;
     this.execution.textContent = state.executionLabel;
+  }
+
+  /**
+   * Session-scoped controls (model, context usage, manual compaction). These
+   * are rendered even while the workspace is idle and never change turn state.
+   */
+  private syncSessionMeta(
+    state: WorkspaceUiState,
+    meta: StatusBarSessionMeta
+  ): void {
+    this.syncModel(meta);
+    this.syncUsage(meta.usage);
+    // The runtime does not advertise slash commands consistently across DSH
+    // versions, but manual compaction is still a product action. Keep the
+    // control available whenever this page owns a connected context.
+    const compactAvailable =
+      state.connected &&
+      state.contextState !== 'unavailable' &&
+      state.contextState !== 'connecting';
+    this.compactButton.hidden = !compactAvailable;
+    this.compactButton.disabled = !compactAvailable || state.activeRun !== null;
+  }
+
+  private syncModel(meta: StatusBarSessionMeta): void {
+    const models = meta.models;
+    const key = `${models.map(model => `${model.id}\u0000${model.name}`).join('\u0001')}|${
+      meta.currentModel ?? ''
+    }`;
+    this.modelGroup.hidden = models.length === 0;
+    if (models.length === 0) return;
+    if (this.modelSelect.dataset.key !== key) {
+      this.modelSelect.dataset.key = key;
+      this.modelSelect.replaceChildren(
+        ...models.map(model => {
+          const option = document.createElement('option');
+          option.value = model.id;
+          option.textContent = model.name;
+          return option;
+        })
+      );
+    }
+    const current = meta.currentModel ?? models[0]?.id ?? '';
+    if (current && this.modelSelect.value !== current) {
+      this.modelSelect.value = current;
+    }
+    this.modelSelect.disabled = models.length <= 1;
+    this.modelSelect.title = current
+      ? `Current model: ${models.find(model => model.id === current)?.name ?? current}`
+      : 'Select a model';
+  }
+
+  private syncUsage(usage: { used: number; size: number } | null): void {
+    if (!usage || usage.size <= 0) {
+      this.usage.hidden = true;
+      this.usage.textContent = '';
+      this.usage.title = '';
+      return;
+    }
+    const used = Math.max(0, Math.min(usage.used, usage.size));
+    const percent = Math.min(100, Math.round((used / usage.size) * 100));
+    this.usage.hidden = false;
+    this.usage.textContent = `${formatTokenCount(used)} / ${formatTokenCount(
+      usage.size
+    )} · ${percent}%`;
+    this.usage.title = `Context used ${used} of ${usage.size} tokens (${percent}%)`;
+    this.usage.classList.toggle('is-warning', percent >= 80);
+    this.usage.classList.toggle('is-critical', percent >= 95);
   }
 
   setMessage(message: string): void {
@@ -2546,18 +2870,6 @@ export class StatusBar extends Widget {
         : 'Continue from visible history';
     this.emptyContextButton.textContent =
       busy && mode === 'empty' ? 'Starting…' : 'Start empty context';
-  }
-
-  private createOverviewIssueButton(
-    label: string,
-    onClick: () => void
-  ): HTMLButtonElement {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = `jp-AgentWorkspace-statusIssue is-${label}`;
-    button.hidden = true;
-    button.addEventListener('click', onClick);
-    return button;
   }
 
   private setContextOpen(open: boolean): void {
@@ -2894,7 +3206,9 @@ export function renderCellOutputPreservingScroll(
 
 function setPrompt(prompt: HTMLElement, cell: WorkspaceCell): void {
   const count =
-    cell.status === 'queued' || cell.status === 'running'
+    cell.status === 'queued' ||
+    cell.status === 'running' ||
+    cell.status === 'pending'
       ? '*'
       : cell.executionCount !== null
         ? String(cell.executionCount)
@@ -2925,13 +3239,21 @@ function outputKey(cell: WorkspaceCell): string {
 export function turnForCell(cell: WorkspaceCell): ChatTurn | null {
   if (cell.kind !== 'ai') return null;
   if (cell.turn) return cell.turn;
-  if (!cell.blocks.length && cell.status !== 'running') return null;
+  if (
+    !cell.blocks.length &&
+    cell.status !== 'running' &&
+    cell.status !== 'pending'
+  ) {
+    return null;
+  }
   const status =
     cell.status === 'running'
       ? 'running'
-      : cell.status === 'interrupted'
-        ? 'interrupted'
-        : 'done';
+      : cell.status === 'pending'
+        ? 'pending'
+        : cell.status === 'interrupted'
+          ? 'interrupted'
+          : 'done';
   return setTurnStatus(createTurn(`legacy-${cell.id}`), status, cell.blocks);
 }
 

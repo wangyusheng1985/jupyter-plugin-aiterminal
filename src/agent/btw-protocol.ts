@@ -101,7 +101,7 @@ function endpoint(route: string, settings: ServerConnection.ISettings): string {
 }
 
 async function toError(response: Response): Promise<BtwRequestError> {
-  let message = 'BTW request failed.';
+  let message = `BTW request failed (HTTP ${response.status}).`;
   try {
     const payload = (await response.json()) as { message?: unknown };
     if (typeof payload.message === 'string' && payload.message) {
@@ -152,7 +152,7 @@ export function btwRestoreThread(
 ): Promise<{ thread: BtwThread | null }> {
   const query = URLExt.objectToQueryString({ notebook, cellId });
   return requestJson<{ thread: BtwThread | null }>(
-    `${BTW_ROUTES.thread}?${query}`,
+    `${BTW_ROUTES.thread}${query}`,
     { method: 'GET' },
     settings
   );
@@ -215,7 +215,7 @@ export function btwListQueue(
 ): Promise<{ entries: Array<BtwQueueEntry & { threadId: string }> }> {
   const query = URLExt.objectToQueryString({ notebook });
   return requestJson<{ entries: Array<BtwQueueEntry & { threadId: string }> }>(
-    `${BTW_ROUTES.queue}?${query}`,
+    `${BTW_ROUTES.queue}${query}`,
     { method: 'GET' },
     settings
   );

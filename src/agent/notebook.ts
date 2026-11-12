@@ -3,7 +3,8 @@ import type { HistoryBridgeCapsule } from './history-bridge';
 import type { ChatTurn } from './turn';
 
 export type CellKind = WorkspaceMode;
-export type CellStatus = 'idle' | 'queued' | 'running' | 'done' | 'interrupted';
+export type CellStatus =
+  'idle' | 'queued' | 'running' | 'pending' | 'done' | 'interrupted';
 export type EditorMode = 'command' | 'edit';
 
 export interface RunRequest {
@@ -227,7 +228,11 @@ export class WorkspaceNotebook {
       return false;
     }
     const cell = this.current;
-    if (this.activeRequest?.cellId === cell.id) {
+    if (
+      this.activeRequest?.cellId === cell.id ||
+      cell.status === 'running' ||
+      cell.status === 'pending'
+    ) {
       return false;
     }
     this.cancelQueuedRuns(cell.id);
@@ -305,6 +310,33 @@ export class WorkspaceNotebook {
     this.runQueue.push(request);
     if (this.activeRequest?.cellId !== cell.id) {
       cell.status = 'queued';
+    }
+    return request;
+  }
+
+  adoptRun(cellId: string, turnId: string): RunRequest | null {
+    if (this.activeRequest) {
+      return this.activeRequest.cellId === cellId &&
+        this.activeRequest.id === turnId
+        ? this.activeRequest
+        : null;
+    }
+    const cell = this.cells.find(candidate => candidate.id === cellId);
+    if (!cell || cell.kind !== 'ai' || !turnId) return null;
+    const request: RunRequest = {
+      id: turnId,
+      cellId,
+      kind: 'ai',
+      source: cell.source,
+      executionSource: cell.source.trim(),
+      advance: false,
+      agentContextGeneration: cell.agentContextGeneration,
+      contextCommitted: false
+    };
+    this.activeRequest = request;
+    cell.status = 'running';
+    if (cell.executionCount === null) {
+      cell.executionCount = ++this.executionCounter;
     }
     return request;
   }

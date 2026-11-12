@@ -185,8 +185,10 @@ def build_acp_session_params(
 
 
 def _provider_row(config: DshProviderConfig, budget: DerivedBudget) -> dict[str, Any]:
-    # C (context window) and O (maximum output tokens) come only from the one
-    # derived budget; this overlay never recomputes or clamps them.
+    # C (context window) and O (maximum output tokens) come from the one
+    # derived budget; this overlay never recomputes or clamps them. Every
+    # configured model id is selectable through the runtime's model option.
+    configured = getattr(config, "models", ()) or (config.model,)
     return {
         "id": DSH_PLUGIN_ID,
         "config": {
@@ -197,11 +199,12 @@ def _provider_row(config: DshProviderConfig, budget: DerivedBudget) -> dict[str,
                     "apiKeyEnv": DSH_API_KEY_ENV,
                     "models": [
                         {
-                            "id": config.model,
-                            "name": config.model,
+                            "id": model_id,
+                            "name": model_id,
                             "contextWindow": budget.context_window,
                             "maxTokens": budget.max_output_tokens,
                         }
+                        for model_id in configured
                     ],
                     "defaultMaxTokens": budget.max_output_tokens,
                     "retryPolicy": {

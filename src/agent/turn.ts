@@ -1,7 +1,8 @@
 import type { AgentServerEvent, ChatBlock, TerminalReason } from './protocol';
 import { presentTool, type ToolPresentation } from './tool-presenter';
 
-export type TurnStatus = 'running' | 'done' | 'interrupted' | 'error';
+export type TurnStatus =
+  'running' | 'pending' | 'done' | 'interrupted' | 'error';
 export type TraceDisclosure = 'expanded' | 'collapsed';
 export type OutcomeKind = 'result' | 'assistant' | 'tool' | 'none';
 
@@ -32,6 +33,8 @@ export interface ThinkingActivity {
   id: string;
   blockId: string;
   status: 'started' | 'finished';
+  /** Cumulative streamed reasoning text; absent for legacy markers. */
+  text?: string;
 }
 
 export interface ToolActivity {
@@ -89,16 +92,20 @@ export interface ChatTurn {
   /** Stable runtime outcome; absent for legacy turns and partial results. */
   terminalReason?: TerminalReason;
   revision: number;
+  /** Wall-clock stamp updated when turn content changes (for merge ties). */
+  updatedAt: string;
 }
 
 export interface PersistedTurn {
   id: string;
-  status: Exclude<TurnStatus, 'running'>;
+  status: Exclude<TurnStatus, 'pending'>;
   resultText: string;
   resultIsError: boolean;
   terminalReason?: TerminalReason;
   metrics: TurnMetrics;
   presentation: TurnPresentationState;
+  /** Last writer's wall-clock stamp; used by the detached writer to merge. */
+  updatedAt?: string;
 }
 
 export function createTurn(id: string): ChatTurn {
@@ -118,7 +125,8 @@ export function createTurn(id: string): ChatTurn {
     },
     resultText: '',
     resultIsError: false,
-    revision: 0
+    revision: 0,
+    updatedAt: new Date().toISOString()
   };
 }
 
@@ -164,7 +172,21 @@ export function applyTurnEvent(
   return deriveTurn(next, blocks);
 }
 
-export function deriveTurn(turn: ChatTurn, blocks: ChatBlock[]): ChatTurn {
+export interface DeriveTurnOptions {
+  /**
+   * Whether this derivation represents a content change. Hydrating a document
+   * from disk must pass ``false`` so merely opening it does not mint a new
+   * ``updatedAt``/revision and dirty the file for a save.
+   */
+  touch?: boolean;
+}
+
+export function deriveTurn(
+  turn: ChatTurn,
+  blocks: ChatBlock[],
+  options: DeriveTurnOptions = {}
+): ChatTurn {
+  const touch = options.touch !== false;
   const timeline = timelineFromBlocks(blocks);
   const outcome = resolveOutcome(turn, timeline);
   const consumedActivityIds = outcome.consumedActivityId
@@ -180,8 +202,14 @@ export function deriveTurn(turn: ChatTurn, blocks: ChatBlock[]): ChatTurn {
     timeline: visibleTimeline,
     diagnostics: deriveDiagnostics(visibleTimeline),
     changes: deriveChanges(visibleTimeline),
-    revision: turn.revision + 1
+    revision: touch ? turn.revision + 1 : turn.revision,
+    ...(touch ? { updatedAt: new Date().toISOString() } : {})
   };
+}
+
+/** Rebuild derived turn fields without treating a disk load as an edit. */
+export function hydrateTurn(turn: ChatTurn, blocks: ChatBlock[]): ChatTurn {
+  return deriveTurn(turn, blocks, { touch: false });
 }
 
 export function setTurnStatus(
@@ -189,7 +217,10 @@ export function setTurnStatus(
   status: TurnStatus,
   blocks: ChatBlock[]
 ): ChatTurn {
-  return deriveTurn({ ...turn, status }, blocks);
+  return deriveTurn(
+    { ...turn, status, updatedAt: new Date().toISOString() },
+    blocks
+  );
 }
 
 export function preserveTurnPresentation(
@@ -212,14 +243,18 @@ export function preserveTurnPresentation(
 export function toPersistedTurn(turn: ChatTurn): PersistedTurn {
   return {
     id: turn.id,
-    status: turn.status === 'running' ? 'interrupted' : turn.status,
+    status: turn.status === 'pending' ? 'running' : turn.status,
     resultText: turn.resultText,
     resultIsError: turn.resultIsError,
     ...(turn.terminalReason === undefined
       ? {}
       : { terminalReason: turn.terminalReason }),
     metrics: turn.metrics,
-    presentation: turn.presentation
+    presentation: turn.presentation,
+    // Legacy documents have no timestamp. Preserve that absence instead of
+    // writing "now" just because the file was opened; a real turn change sets
+    // the field through deriveTurn/setTurnStatus.
+    ...(turn.updatedAt ? { updatedAt: turn.updatedAt } : {})
   };
 }
 
@@ -242,7 +277,10 @@ export function restoreTurn(
         ? value.metrics
         : {})
     },
-    presentation: normalizePresentation(value.presentation)
+    presentation: normalizePresentation(value.presentation),
+    // Keep an absent legacy stamp absent. A fabricated timestamp would make a
+    // clean round-trip differ from disk and trigger an unnecessary save.
+    updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : ''
   };
 }
 
@@ -395,7 +433,8 @@ export function timelineFromBlocks(blocks: ChatBlock[]): TurnActivity[] {
           kind: 'thinking',
           id: `activity-${block.id}`,
           blockId: block.id,
-          status: block.status
+          status: block.status,
+          ...(block.text === undefined ? {} : { text: block.text })
         });
         break;
       case 'tool':
@@ -493,7 +532,7 @@ function resolveOutcome(
       ...(consumedActivityId ? { consumedActivityId } : {})
     };
   }
-  if (turn.status === 'running') {
+  if (turn.status === 'running' || turn.status === 'pending') {
     return { text: '', kind: 'none' };
   }
   const lastText = lastActivity(timeline, 'text');

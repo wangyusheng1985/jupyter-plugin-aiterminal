@@ -285,15 +285,16 @@ describe('buildHistoryBridge', () => {
       },
       resultText: 'stable outcome',
       resultIsError: false,
-      revision: 1
+      revision: 1,
+      updatedAt: '2026-01-01T00:00:00.000Z'
     };
     const draft = createWorkspaceCell('ai', 'continue');
     const first = JSON.stringify(buildHistoryBridge([cell, draft], draft.id));
 
     cell.turn = {
-      ...cell.turn,
+      ...cell.turn!,
       revision: 99,
-      presentation: { ...cell.turn.presentation, trace: 'expanded' }
+      presentation: { ...cell.turn!.presentation, trace: 'expanded' }
     };
 
     expect(JSON.stringify(buildHistoryBridge([cell, draft], draft.id))).toBe(

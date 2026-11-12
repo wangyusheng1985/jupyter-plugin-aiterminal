@@ -42,6 +42,14 @@ export function renderTurn(
   root.dataset.turnId = turn.id;
   root.dataset.turnRevision = String(turn.revision);
 
+  if (turn.status === 'pending') {
+    const notice = document.createElement('div');
+    notice.className = 'jp-AgentWorkspace-pendingNotice';
+    notice.setAttribute('role', 'status');
+    notice.textContent =
+      'This turn was running when the page reloaded. Waiting for the Agent server to confirm it…';
+    root.append(notice);
+  }
   if (turn.outcome) {
     root.append(renderOutcome(turn, options));
   }
@@ -414,7 +422,15 @@ function renderActivityDetails(
       }
       break;
     case 'thinking':
-      body.textContent = 'Reasoning activity';
+      if (activity.text) {
+        const stream = document.createElement('div');
+        stream.className = 'jp-AgentWorkspace-thinkingText';
+        stream.style.whiteSpace = 'pre-wrap';
+        stream.textContent = activity.text;
+        body.append(stream);
+      } else {
+        body.textContent = 'Reasoning activity';
+      }
       break;
     case 'install':
     case 'denied':

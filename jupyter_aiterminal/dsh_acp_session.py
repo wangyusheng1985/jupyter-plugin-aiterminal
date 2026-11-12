@@ -444,6 +444,78 @@ def _positive(name: str, value: Any) -> float:
     return float(value)
 
 
+def _safe_config_options(raw: Any) -> list[dict[str, Any]]:
+    """Keep only the presentation fields the frontend needs.
+
+    ``session/new`` carries the runtime's selectable session options,
+    including the model selector. Raw option payloads are not trusted: only
+    id/name/category/currentValue and the leaf value/name pairs survive.
+    """
+    if not isinstance(raw, list):
+        return []
+    options: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, Mapping):
+            continue
+        config_id = entry.get("id")
+        if not isinstance(config_id, str) or not config_id:
+            continue
+        if entry.get("type") not in (None, "select"):
+            continue
+        current = entry.get("currentValue")
+        if not isinstance(current, str):
+            continue
+        values: list[dict[str, str]] = []
+        raw_values = entry.get("options")
+        if isinstance(raw_values, list):
+            for item in raw_values:
+                if not isinstance(item, Mapping):
+                    continue
+                group = item.get("options")
+                leaves = group if isinstance(group, list) else [item]
+                for leaf in leaves:
+                    if not isinstance(leaf, Mapping):
+                        continue
+                    value = leaf.get("value")
+                    name = leaf.get("name")
+                    if not isinstance(value, str) or not value:
+                        continue
+                    if not isinstance(name, str) or not name:
+                        continue
+                    values.append({"value": value, "name": name})
+        option: dict[str, Any] = {
+            "id": config_id,
+            "name": entry.get("name") if isinstance(entry.get("name"), str) else config_id,
+            "currentValue": current,
+            "options": values,
+        }
+        category = entry.get("category")
+        if isinstance(category, str) and category:
+            option["category"] = category
+        options.append(option)
+    return options
+
+
+def _safe_commands(raw: Any) -> list[dict[str, str]]:
+    if not isinstance(raw, list):
+        return []
+    commands: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, Mapping):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name or name in seen:
+            continue
+        seen.add(name)
+        command = {"name": name}
+        description = entry.get("description")
+        if isinstance(description, str) and description:
+            command["description"] = description[:400]
+        commands.append(command)
+    return commands
+
+
 def _tool_call_id(tool_call: Any) -> str | None:
     if not isinstance(tool_call, Mapping):
         return None
@@ -566,6 +638,8 @@ class DshAcpSession:
         self._dsh_home: Path | None = None
         self._patch_path: Path | None = None
         self._created_session_root = False
+        self._config_options: list[dict[str, Any]] = []
+        self._available_commands: list[dict[str, str]] = []
 
     # -- construction helpers ------------------------------------------------
 
@@ -600,6 +674,36 @@ class DshAcpSession:
     @property
     def cwd(self) -> Path:
         return self._cwd
+
+    @property
+    def config_options(self) -> list[dict[str, Any]]:
+        """Sanitized session options advertised by ``session/new``."""
+        return [dict(option) for option in self._config_options]
+
+    @property
+    def available_commands(self) -> list[dict[str, str]]:
+        """Slash commands the runtime last advertised for this session."""
+        return [dict(command) for command in self._available_commands]
+
+    async def set_config_option(self, config_id: str, value: str) -> Any:
+        """Send ACP ``session/set_config_option`` for a selectable option."""
+        if not self._started or self._closed:
+            raise DshAcpSessionError("ACP session is not running")
+        if self._session_id is None:
+            raise DshAcpSessionError("ACP session has no sessionId")
+        option_id = _non_empty_text("config_id", config_id)
+        option_value = _non_empty_text("value", value)
+        result = await self._transport.request(
+            "session/set_config_option",
+            {
+                "sessionId": self._session_id,
+                "configId": option_id,
+                "value": option_value,
+            },
+        )
+        if isinstance(result, Mapping) and "configOptions" in result:
+            self._config_options = _safe_config_options(result.get("configOptions"))
+        return result
 
     @property
     def storage_root(self) -> Path:
@@ -818,6 +922,9 @@ class DshAcpSession:
         if not isinstance(session_id, str) or not session_id.strip():
             raise DshAcpSessionError("session/new did not return a sessionId")
         self._session_id = session_id
+        self._config_options = _safe_config_options(
+            result.get("configOptions") if isinstance(result, dict) else None
+        )
         if self._supplied_transport is not None:
             self._transport.remove_listener(self._pending_listener_key)
             self._transport.add_listener(
@@ -833,13 +940,16 @@ class DshAcpSession:
         params = build_acp_session_params(self._cwd)
         params["sessionId"] = session_id
         try:
-            await self._transport.request("session/resume", params)
+            result = await self._transport.request("session/resume", params)
         except DshAcpError as exc:
             # Never fall back to session/new when the requested session cannot
             # be resumed; that would silently replace durable identity.
             raise DshAcpSessionError(
                 f"failed to resume ACP session {session_id!r}: {exc}"
             ) from exc
+        self._config_options = _safe_config_options(
+            result.get("configOptions") if isinstance(result, dict) else None
+        )
         if self._supplied_transport is not None:
             self._transport.remove_listener(self._pending_listener_key)
             self._transport.add_listener(
@@ -1035,7 +1145,30 @@ class DshAcpSession:
 
     # -- notification adapter interface -------------------------------------
 
+    def _capture_session_metadata(self, message: Mapping[str, Any]) -> None:
+        """Track session options and commands even outside a prompt run."""
+        if message.get("method") != "session/update":
+            return
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return
+        if params.get("sessionId") != self._session_id:
+            return
+        update = params.get("update")
+        if not isinstance(update, Mapping):
+            return
+        kind = update.get("sessionUpdate")
+        if kind == "available_commands_update":
+            self._available_commands = _safe_commands(
+                update.get("availableCommands")
+            )
+        elif kind == "config_option_update":
+            self._config_options = _safe_config_options(
+                update.get("configOptions")
+            )
+
     async def _handle_notification(self, message: dict[str, Any]) -> None:
+        self._capture_session_metadata(message)
         callback = self._on_notification
         if callback is None:
             return

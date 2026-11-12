@@ -23,7 +23,7 @@ Closing, refreshing, or otherwise disconnecting the browser SHALL detach the wor
 
 ### Requirement: Detached progress is saved in the workspace document
 
-While no browser is attached, the server SHALL persist the session's turn progress and terminal result into the `.agentnb` that owns the session. The saved document SHALL be sufficient to show the turn after reopening without replaying a live event stream.
+While no browser is attached, the server SHALL persist the session's turn progress and terminal result into the `.agentnb` that owns the session. While a browser is attached, that browser owns the file and persists the terminal events it receives; the server MUST NOT rewrite the document behind the browser's contents hash. The saved document SHALL be sufficient to show the turn after reopening without replaying a live event stream. A terminal write MUST NOT replace a newer turn or a newer frontend snapshot on the same cell.
 
 #### Scenario: A turn finishes after the browser closes
 
@@ -35,7 +35,17 @@ While no browser is attached, the server SHALL persist the session's turn progre
 
 - **WHEN** the workspace is reopened while its detached prompt is still running
 - **THEN** the document shows the saved progress
-- **AND** later events from the same turn continue to update that document
+- **AND** the reattach handshake reports the active turn id and owning cell id
+- **AND** replayed and later events for that turn carry both identities
+- **AND** the page claims that turn instead of treating the cell as interrupted
+
+#### Scenario: The turn finishes after reattach
+
+- **WHEN** a reattached page is open while the same turn reaches a terminal state
+- **THEN** the browser persists the terminal result from the events it receives
+- **AND** the server does not rewrite the document while that browser is attached
+- **AND** the browser save does not overwrite a different newer turn id
+- **AND** a frontend snapshot with a strictly newer `updatedAt` remains authoritative
 
 ### Requirement: Reopening shows the same session result
 

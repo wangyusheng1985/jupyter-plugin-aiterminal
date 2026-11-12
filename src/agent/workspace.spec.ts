@@ -1,3 +1,4 @@
+import { Notification } from '@jupyterlab/apputils';
 import type { DocumentRegistry } from '@jupyterlab/docregistry';
 import { ServerConnection } from '@jupyterlab/services';
 
@@ -6,6 +7,7 @@ import {
   CellView,
   StatusBar,
   type CellHandlers,
+  type StatusBarHandlers,
   renderBlock,
   renderCellOutput,
   renderCellOutputPreservingScroll,
@@ -32,6 +34,10 @@ import {
   workspaceUiState,
   type WorkspaceUiState
 } from './workspace-interaction';
+
+jest.mock('@jupyterlab/apputils', () => ({
+  Notification: { emit: jest.fn() }
+}));
 
 jest.mock('@jupyterlab/cells', () => ({
   OutputPlaceholder: class {
@@ -221,6 +227,31 @@ describe('renderCellOutput', () => {
       body.querySelector('.jp-AgentWorkspace-runningIndicator')
     ).toBeNull();
     expect(body.textContent).toBe('previous output');
+  });
+
+  it('renders a restored running turn as pending instead of running', () => {
+    const body = document.createElement('div');
+    const blocks = [{ kind: 'text' as const, id: 't1', text: 'partial' }];
+    renderCellOutput(
+      body,
+      cell({
+        kind: 'ai',
+        status: 'pending',
+        executionCount: 2,
+        blocks,
+        turn: setTurnStatus(createTurn('run-restored'), 'pending', blocks)
+      })
+    );
+    expect(
+      body.querySelector('.jp-AgentWorkspace-pendingNotice')
+    ).not.toBeNull();
+    expect(
+      body.querySelector('.jp-AgentWorkspace-runningIndicator')
+    ).toBeNull();
+    expect(body.textContent).toContain('Waiting for the Agent server');
+    expect(body.querySelector('.jp-AgentWorkspace-turn')?.className).toContain(
+      'is-pending'
+    );
   });
 
   it('preserves output scroll position when rerendering', () => {
@@ -920,6 +951,150 @@ describe('AgentWorkspaceContent queue scheduling', () => {
     content.dispose();
   });
 
+  it('does not turn a running cell into interrupted when the socket closes', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as WorkspaceInternals;
+    content.notebook.setSource('first');
+    internals.runCell(false);
+
+    const cell = content.notebook.cells[0];
+    const blocks = [
+      { kind: 'text' as const, id: 'text-1', text: 'still working' }
+    ];
+    cell.blocks = blocks;
+    cell.turn = setTurnStatus(createTurn('run-live'), 'running', blocks);
+
+    // A transport close clears `running` but is not a user interrupt and is
+    // not proof that the server stopped executing the turn.
+    content.session.connected = false;
+    content.session.running = false;
+    content.session.error = 'Agent Workspace could not reach the server.';
+    internals.onSessionChange();
+
+    expect(cell.status).toBe('running');
+    expect(cell.blocks).toEqual(blocks);
+    expect(cell.turn?.status).toBe('running');
+    expect(content.notebook.activeRun).not.toBeNull();
+    expect(
+      content.node.querySelector('.jp-AgentWorkspace-statusExecution')
+        ?.textContent
+    ).toContain('may still be executing');
+    content.dispose();
+  });
+
+  it('claims the server turn after a refresh without Start new context', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as WorkspaceInternals;
+    const blocks = [
+      { kind: 'text' as const, id: 'saved', text: 'saved progress' }
+    ];
+    const cell = content.notebook.cells[0];
+    cell.status = 'pending';
+    cell.blocks = blocks;
+    cell.turn = setTurnStatus(createTurn('turn-live'), 'pending', blocks);
+    cell.executionCount = 4;
+
+    content.session.connected = true;
+    content.session.serverStateKnown = true;
+    content.session.serverActiveTurnId = 'turn-live';
+    content.session.serverActiveCellId = cell.id;
+    content.session.running = true;
+    content.session.activeTurnId = 'turn-live';
+    content.session.activeCellId = cell.id;
+    content.session.turn = createTurn('turn-live');
+
+    internals.onSessionChange();
+
+    expect(content.notebook.activeRun).toMatchObject({
+      id: 'turn-live',
+      cellId: cell.id
+    });
+    expect(cell.status).toBe('running');
+    // The replay starts with an accepted event and no blocks; the saved
+    // evidence must survive until the first replayed content arrives.
+    expect(cell.blocks).toEqual(blocks);
+
+    content.session.blocks = [
+      { kind: 'text', id: 'live', text: 'continued after attach' }
+    ];
+    content.session.turn = setTurnStatus(
+      createTurn('turn-live'),
+      'running',
+      content.session.blocks
+    );
+    internals.onSessionChange();
+    expect(cell.blocks).toEqual(content.session.blocks);
+
+    content.session.running = false;
+    content.session.serverActiveTurnId = null;
+    content.session.serverActiveCellId = null;
+    content.session.turn = setTurnStatus(
+      content.session.turn,
+      'done',
+      content.session.blocks
+    );
+    internals.onSessionChange();
+    expect(cell.status).toBe('done');
+    expect(cell.turn?.id).toBe('turn-live');
+    expect(cell.turn?.status).toBe('done');
+    content.dispose();
+  });
+
+  it('claims a completed turn replayed after the page was away', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as WorkspaceInternals;
+    const cell = content.notebook.cells[0];
+    cell.status = 'pending';
+    cell.blocks = [{ kind: 'text', id: 'saved', text: 'partial' }];
+    cell.turn = setTurnStatus(createTurn('turn-live'), 'pending', cell.blocks);
+
+    content.session.connected = true;
+    content.session.serverStateKnown = true;
+    content.session.running = false;
+    content.session.serverActiveTurnId = null;
+    content.session.serverActiveCellId = null;
+    content.session.activeCellId = cell.id;
+    content.session.blocks = [
+      { kind: 'text', id: 'final', text: 'final answer' }
+    ];
+    content.session.turn = setTurnStatus(
+      createTurn('turn-live'),
+      'done',
+      content.session.blocks
+    );
+
+    internals.onSessionChange();
+
+    expect(cell.status).toBe('done');
+    expect(cell.turn?.id).toBe('turn-live');
+    expect(cell.turn?.status).toBe('done');
+    expect(cell.blocks).toEqual(content.session.blocks);
+    expect(content.notebook.activeRun).toBeNull();
+    content.dispose();
+  });
+
+  it('settles an unclaimed pending cell once the handshake has no active turn', () => {
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as WorkspaceInternals;
+    const cell = content.notebook.cells[0];
+    cell.status = 'pending';
+    cell.blocks = [{ kind: 'text', id: 'saved', text: 'old progress' }];
+    cell.turn = setTurnStatus(createTurn('turn-gone'), 'pending', cell.blocks);
+
+    content.session.connected = true;
+    content.session.serverStateKnown = true;
+    content.session.running = false;
+    content.session.serverActiveTurnId = null;
+    internals.onSessionChange();
+
+    expect(cell.status).toBe('interrupted');
+    expect(cell.turn?.status).toBe('interrupted');
+    expect(cell.blocks).toEqual([
+      { kind: 'text', id: 'saved', text: 'old progress' }
+    ]);
+    content.dispose();
+  });
+
   it('keeps a user-expanded execution record expanded across session updates', () => {
     const content = new AgentWorkspaceContent(null);
     const internals = content as unknown as WorkspaceInternals;
@@ -948,6 +1123,41 @@ describe('AgentWorkspaceContent queue scheduling', () => {
     internals.onSessionChange();
     expect(cell.status).toBe('done');
     expect(cell.turn?.presentation.trace).toBe('expanded');
+
+    content.dispose();
+  });
+
+  it('notifies on cell completion and the action activates the owning tab and cell', () => {
+    const emit = jest.mocked(Notification.emit);
+    emit.mockClear();
+    const content = new AgentWorkspaceContent(null);
+    const internals = content as unknown as WorkspaceInternals;
+    const activate = jest.fn();
+    content.setDocumentActivator(activate);
+
+    content.notebook.setSource('first');
+    internals.runCell(false);
+    const turnId = content.notebook.activeRun!.id;
+    // Leave the completing cell and switch to another cell; the notification
+    // action must bring the user back to the cell it belongs to.
+    content.notebook.appendCell();
+
+    content.session.running = false;
+    content.session.connected = true;
+    content.session.error = null;
+    content.session.turn = setTurnStatus(createTurn(turnId), 'done', []);
+    internals.onSessionChange();
+
+    expect(emit).toHaveBeenCalledTimes(1);
+    const [message, type, options] = emit.mock.calls[0];
+    expect(message).toContain('Agent cell [1] completed');
+    expect(type).toBe('success');
+    const actions = (options as { actions?: Array<{ callback: () => void }> })
+      .actions;
+    expect(actions).toHaveLength(1);
+    actions![0].callback();
+    expect(activate).toHaveBeenCalledTimes(1);
+    expect(content.notebook.active).toBe(0);
 
     content.dispose();
   });
@@ -1906,8 +2116,6 @@ describe('AgentWorkspaceContent page interaction', () => {
     const onContinueFromHistory = jest.fn();
     const onStartEmptyContext = jest.fn();
     const onDismissContextChoice = jest.fn();
-    const onRevealFailure = jest.fn();
-    const onRevealInterrupted = jest.fn();
     const onOpenHistory = jest.fn();
     const onRefreshConfiguration = jest.fn();
     const onRetrySave = jest.fn();
@@ -1916,8 +2124,6 @@ describe('AgentWorkspaceContent page interaction', () => {
       onContinueFromHistory,
       onStartEmptyContext,
       onDismissContextChoice,
-      onRevealFailure,
-      onRevealInterrupted,
       onOpenHistory,
       onRefreshConfiguration,
       onRetrySave
@@ -1932,7 +2138,7 @@ describe('AgentWorkspaceContent page interaction', () => {
       failureCount: 2,
       firstFailureCellId: 'cell-1',
       firstInterruptedCellId: 'cell-2',
-      summaryLabel: '2 turns · 1 interrupted · 2 failed'
+      summaryLabel: '2 turns'
     };
     status.sync(
       {
@@ -2019,22 +2225,12 @@ describe('AgentWorkspaceContent page interaction', () => {
         ?.textContent
     ).toBe('Saved');
     expect(document.activeElement).toBe(context);
-    status.node
-      .querySelector<HTMLButtonElement>('.jp-AgentWorkspace-statusOverview')
-      ?.click();
-    expect(onOpenHistory).toHaveBeenCalledTimes(1);
-    status.node
-      .querySelector<HTMLButtonElement>(
-        '.jp-AgentWorkspace-statusIssue.is-failed'
-      )
-      ?.click();
-    expect(onRevealFailure).toHaveBeenCalledWith('cell-1');
-    status.node
-      .querySelector<HTMLButtonElement>(
-        '.jp-AgentWorkspace-statusIssue.is-interrupted'
-      )
-      ?.click();
-    expect(onRevealInterrupted).toHaveBeenCalledWith('cell-2');
+    expect(
+      status.node.querySelector('.jp-AgentWorkspace-statusOverview')
+    ).toBeNull();
+    expect(
+      status.node.querySelector('.jp-AgentWorkspace-statusIssue')
+    ).toBeNull();
     context?.click();
     expect(
       status.node.querySelector<HTMLElement>(
@@ -2613,6 +2809,7 @@ describe('AgentWorkspaceContent page interaction', () => {
         '.jp-AgentWorkspace-contextChoice.is-primary'
       )
       ?.click();
+    failed.session.connected = true;
     failed.session.error = 'query rejected';
     failed.session.running = false;
     failedInternals.onSessionChange();
@@ -2710,6 +2907,7 @@ describe('AgentWorkspaceContent page interaction', () => {
       { generation: 1, cellIds: [historical.id] }
     ]);
 
+    content.session.connected = true;
     content.session.error = 'query rejected';
     content.session.running = false;
     internals.onSessionChange();
@@ -3211,6 +3409,7 @@ describe('AgentWorkspaceContent page interaction', () => {
       .mockImplementation(() => {});
     content.notebook.setSource('stream an answer');
     internals.runCell(false);
+    content.session.connected = true;
     const runningId = content.notebook.activeRun?.cellId as string;
 
     content.session.blocks = [
@@ -4119,6 +4318,39 @@ describe('DSH session binding persistence', () => {
     resumed.dispose();
   });
 
+  it('does not rewrite a document whose DSH reference is unchanged', async () => {
+    const initial = new WorkspaceNotebook();
+    initial.current.source = 'question';
+    setAgentSessionReference(initial, {
+      engine: 'dsh',
+      sessionId: 'session-1'
+    });
+    const original = serializeNotebook(initial);
+    const harness = makeContext(original);
+    const content = attach(harness);
+    await Promise.resolve();
+
+    const socket = FakeDshSocket.instances[0];
+    socket.open();
+    emitEvent(socket, {
+      type: 'dsh/v1/connection',
+      runtimeId: 'runtime-1',
+      phase: 'connected'
+    });
+    emitEvent(socket, {
+      type: 'dsh/v1/session',
+      sessionId: 'session-1',
+      runtimeId: 'runtime-1',
+      phase: 'resumed'
+    });
+    await (content as unknown as BindingInternals).saveCoordinator.flush();
+
+    // Merely reopening the document must not dirty it or change the bytes on
+    // disk; otherwise Jupyter reports a file conflict on the next save.
+    expect(harness.text()).toBe(original);
+    content.dispose();
+  });
+
   it('clears the saved DSH binding when a new context starts', async () => {
     const initial = new WorkspaceNotebook();
     initial.current.source = 'question';
@@ -4774,16 +5006,12 @@ describe('effective configuration report', () => {
     });
   }
 
-  function handlers(
-    onRefreshConfiguration = jest.fn()
-  ): ConstructorParameters<typeof StatusBar>[0] {
+  function handlers(onRefreshConfiguration = jest.fn()): StatusBarHandlers {
     return {
       onStartNewContext: jest.fn(),
       onContinueFromHistory: jest.fn(),
       onStartEmptyContext: jest.fn(),
       onDismissContextChoice: jest.fn(),
-      onRevealFailure: jest.fn(),
-      onRevealInterrupted: jest.fn(),
       onOpenHistory: jest.fn(),
       onRefreshConfiguration,
       onRetrySave: jest.fn()
@@ -4832,6 +5060,81 @@ describe('effective configuration report', () => {
 
   afterEach(() => {
     jest.restoreAllMocks();
+  });
+
+  it('renders model, usage, and compact controls from session metadata', () => {
+    const onSelectModel = jest.fn();
+    const onCompact = jest.fn();
+    const status = new StatusBar({
+      ...handlers(),
+      onSelectModel,
+      onCompact
+    });
+    status.sync(readyState(), workspaceOverview([]), null, null, {
+      models: [
+        { id: 'model-a', name: 'Model A' },
+        { id: 'model-b', name: 'Model B' }
+      ],
+      currentModel: 'model-a',
+      usage: { used: 64_000, size: 128_000 },
+      commands: ['compact']
+    });
+
+    const contextButton = status.node.querySelector<HTMLButtonElement>(
+      '.jp-AgentWorkspace-statusContext'
+    );
+    expect(contextButton?.hidden).toBe(true);
+
+    const modelGroup = status.node.querySelector<HTMLElement>(
+      '.jp-AgentWorkspace-statusModel'
+    );
+    expect(modelGroup?.hidden).toBe(false);
+    const select = status.node.querySelector<HTMLSelectElement>(
+      '.jp-AgentWorkspace-statusModelSelect'
+    );
+    expect(
+      Array.from(select?.options ?? []).map(option => option.value)
+    ).toEqual(['model-a', 'model-b']);
+    expect(select?.value).toBe('model-a');
+    expect(select?.disabled).toBe(false);
+
+    select!.value = 'model-b';
+    select!.dispatchEvent(new Event('change'));
+    expect(onSelectModel).toHaveBeenCalledWith('model-b');
+
+    expect(
+      status.node.querySelector<HTMLElement>('.jp-AgentWorkspace-statusUsage')
+        ?.textContent
+    ).toBe('64k / 128k · 50%');
+
+    const compact = status.node.querySelector<HTMLButtonElement>(
+      '.jp-AgentWorkspace-statusCompact'
+    );
+    expect(compact?.hidden).toBe(false);
+    expect(compact?.disabled).toBe(false);
+    compact?.click();
+    expect(onCompact).toHaveBeenCalledTimes(1);
+    status.dispose();
+  });
+
+  it('keeps manual compaction available without runtime advertising', () => {
+    const status = new StatusBar(handlers());
+    status.sync(readyState(), workspaceOverview([]));
+
+    expect(
+      status.node.querySelector<HTMLElement>('.jp-AgentWorkspace-statusModel')
+        ?.hidden
+    ).toBe(true);
+    expect(
+      status.node.querySelector<HTMLElement>('.jp-AgentWorkspace-statusUsage')
+        ?.hidden
+    ).toBe(true);
+    const compact = status.node.querySelector<HTMLButtonElement>(
+      '.jp-AgentWorkspace-statusCompact'
+    );
+    expect(compact?.hidden).toBe(false);
+    expect(compact?.disabled).toBe(false);
+    status.dispose();
   });
 
   it('renders active/desired values with user, default, and derived provenance', () => {

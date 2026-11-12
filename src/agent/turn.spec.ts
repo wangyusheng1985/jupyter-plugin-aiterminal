@@ -2,6 +2,7 @@ import type { ChatBlock } from './protocol';
 import {
   applyTurnEvent,
   createTurn,
+  hydrateTurn,
   isTraceExpanded,
   preserveTurnPresentation,
   revealFailedActivity,
@@ -130,9 +131,50 @@ describe('ChatTurn', () => {
     expect(restored).not.toBeNull();
     expect(restored).toMatchObject({
       id: 'run-1',
-      status: 'interrupted',
+      status: 'running',
       presentation: { trace: 'expanded' }
     });
+  });
+
+  it('hydrates a persisted turn without minting a new timestamp or revision', () => {
+    const persisted = {
+      id: 'run-1',
+      status: 'done' as const,
+      resultText: 'done',
+      resultIsError: false,
+      metrics: {},
+      presentation: {
+        trace: 'collapsed' as const,
+        expandedActivityIds: [],
+        fullEvidenceActivityIds: []
+      },
+      updatedAt: '2026-01-02T03:04:05.000Z'
+    };
+    const restored = restoreTurn(persisted);
+    expect(restored).not.toBeNull();
+    const hydrated = hydrateTurn(restored!, []);
+    expect(hydrated.updatedAt).toBe(persisted.updatedAt);
+    expect(hydrated.revision).toBe(restored!.revision);
+    expect(toPersistedTurn(hydrated)).toEqual(persisted);
+  });
+
+  it('keeps an absent legacy timestamp absent through a clean round-trip', () => {
+    const restored = restoreTurn({
+      id: 'legacy-1',
+      status: 'done',
+      resultText: 'old result',
+      resultIsError: false,
+      metrics: {},
+      presentation: {
+        trace: 'collapsed',
+        expandedActivityIds: [],
+        fullEvidenceActivityIds: []
+      }
+    });
+    expect(restored?.updatedAt).toBe('');
+    expect(toPersistedTurn(hydrateTurn(restored!, []))).not.toHaveProperty(
+      'updatedAt'
+    );
   });
 
   it('restores legacy auto and outcome disclosure as a collapsed record', () => {

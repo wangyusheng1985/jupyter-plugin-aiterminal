@@ -19,9 +19,18 @@
     },
     "model": {
       "type": "string",
-      "title": "Model",
-      "description": "Model id sent to the configured provider for the selected protocol.",
+      "title": "Default Model",
+      "description": "Default model id sent to the configured provider for the selected protocol. It is always the first selectable model in the status bar.",
       "default": ""
+    },
+    "models": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "title": "Additional Models",
+      "description": "Optional extra model ids exposed in the status-bar model selector. The default model and these entries share the configured context window and output budget. Leave empty for a single model.",
+      "default": []
     },
     "token": {
       "type": "string",

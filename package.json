@@ -63,7 +63,8 @@
     "@jupyterlab/settingregistry": "^4.5.0",
     "@jupyterlab/translation": "~4.5.0",
     "@jupyterlab/ui-components": "~4.5.0",
-    "@lumino/widgets": "^2.7.1"
+    "@lumino/widgets": "^2.7.1",
+    "mermaid": "^11.15.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",

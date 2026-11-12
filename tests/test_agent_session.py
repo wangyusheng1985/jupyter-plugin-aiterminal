@@ -89,6 +89,14 @@ class _FakeAcpSession:
         self.new_runtime_id = "runtime-0123456789"
         # Optional gate so a test can hold start() in-flight.
         self.start_gate: asyncio.Event | None = None
+        # Session-scoped metadata advertised by the real ACP session.
+        self.config_options: list[dict] = []
+        self.available_commands: list[dict] = []
+        self.config_calls: list[tuple[str, str]] = []
+
+    async def set_config_option(self, config_id, value):
+        self.config_calls.append((config_id, value))
+        return {"configOptions": self.config_options}
 
     async def start(self):
         self.start_calls += 1
@@ -293,6 +301,9 @@ def test_start_attaches_acp_session_and_reports_returned_identity(
         "contextState": "new",
         "model": "dsh-model",
         "cwd": str(tmp_path),
+        "running": False,
+        "activeTurnId": None,
+        "activeCellId": None,
     }
     assert "dsh/v1/session" in {
         event.get("type") for event in events
@@ -1603,3 +1614,179 @@ def test_host_bootstrap_lock_released_after_first_start_failure(
     assert len(runtime.adopted) == 1
     assert runtime._transport is created[1]._transport
     assert created[1]._owns_transport is False
+
+
+def test_start_emits_model_and_command_metadata(tmp_path, monkeypatch):
+    created = []
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+
+    def factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+        session.config_options = [
+            {
+                "id": "model",
+                "name": "Model",
+                "category": "model",
+                "currentValue": '["provider","model-a"]',
+                "options": [
+                    {"value": '["provider","model-a"]', "name": "Model A"},
+                    {"value": '["provider","model-b"]', "name": "Model B"},
+                ],
+            }
+        ]
+        session.available_commands = [
+            {"name": "compact", "description": "Compact the context"}
+        ]
+        created.append(session)
+        return session
+
+    _configure_fake_acp(monkeypatch, factory)
+
+    async def run():
+        events = []
+        session = AgentSession(str(tmp_path), _emit_to(events))
+        await session.start()
+        await asyncio.sleep(0)
+        return session, events
+
+    session, events = asyncio.run(run())
+
+    models = [event for event in events if event.get("type") == "models"]
+    assert models, events
+    assert models[-1]["current"] == '["provider","model-a"]'
+    assert models[-1]["models"] == [
+        {"id": '["provider","model-a"]', "name": "Model A"},
+        {"id": '["provider","model-b"]', "name": "Model B"},
+    ]
+    commands = [event for event in events if event.get("type") == "commands"]
+    assert commands and commands[-1]["commands"] == ["compact"]
+
+
+def test_set_model_uses_the_model_config_option(tmp_path, monkeypatch):
+    created = []
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+
+    def factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+        created.append(session)
+        return session
+
+    _configure_fake_acp(monkeypatch, factory)
+
+    async def run():
+        session = AgentSession(str(tmp_path), _emit_to([]))
+        await session.start()
+        await session.set_model('["provider","model-b"]')
+        return session
+
+    session = asyncio.run(run())
+    assert created[0].config_calls == [("model", '["provider","model-b"]')]
+    assert session._acp is not None
+
+
+def test_set_model_after_failed_turn_is_applied_when_session_resumes(
+    tmp_path, monkeypatch
+):
+    created = []
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+
+    def factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+        session.config_options = [
+            {
+                "id": "model",
+                "name": "Model",
+                "category": "model",
+                "currentValue": '["provider","model-a"]',
+                "options": [
+                    {"value": '["provider","model-a"]', "name": "Model A"},
+                    {"value": '["provider","model-b"]', "name": "Model B"},
+                ],
+            }
+        ]
+        if not created:
+            # The transport raises a plain RuntimeError for a JSON-RPC error
+            # response (the 502 upstream stream interruption seen in a cell).
+            session.prompt_error = RuntimeError(
+                "ACP request id=17 failed: upstream stream interrupted"
+            )
+        created.append(session)
+        return session
+
+    _configure_fake_acp(monkeypatch, factory)
+
+    async def run():
+        events = []
+        session = AgentSession(str(tmp_path), _emit_to(events))
+        await session.query("first", "turn-1")
+        await asyncio.sleep(0)
+        assert session._acp is None
+        after_failure = len(events)
+        await session.set_model('["provider","model-b"]')
+        await session.query("second", "turn-2")
+        await asyncio.sleep(0)
+        return session, events, after_failure
+
+    session, events, after_failure = asyncio.run(run())
+    after = events[after_failure:]
+
+    # A discarded ACP session must not turn the switch into a dead end: the
+    # selection is accepted and echoed to the selector immediately.
+    assert not any(
+        event.get("type") == "error"
+        and "not connected" in str(event.get("message", ""))
+        for event in after
+    ), after
+    models = [event for event in after if event.get("type") == "models"]
+    assert models and models[0]["current"] == '["provider","model-b"]'
+
+    # The next prompt resumes the durable session and applies the selection
+    # before sending it, so the answer cannot silently use the old model.
+    assert len(created) == 2
+    assert created[1].resume_session_id == created[0].new_session_id
+    assert created[1].config_calls == [("model", '["provider","model-b"]')]
+    assert created[1].prompts == [("second", "turn-2")]
+    assert session._selected_model == '["provider","model-b"]'
+
+
+def test_query_reapplies_the_selected_model_when_the_runtime_drifted(
+    tmp_path, monkeypatch
+):
+    created = []
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "data"))
+
+    def factory(**kwargs):
+        session = _FakeAcpSession(**kwargs)
+        session.config_options = [
+            {
+                "id": "model",
+                "name": "Model",
+                "currentValue": '["provider","model-a"]',
+                "options": [
+                    {"value": '["provider","model-a"]', "name": "Model A"},
+                    {"value": '["provider","model-b"]', "name": "Model B"},
+                ],
+            }
+        ]
+        created.append(session)
+        return session
+
+    _configure_fake_acp(monkeypatch, factory)
+
+    async def run():
+        session = AgentSession(str(tmp_path), _emit_to([]))
+        await session.start()
+        await session.set_model('["provider","model-b"]')
+        # The fake does not mutate its advertised state; this models a runtime
+        # that resumed or replaced itself and reports the old selection.
+        assert session._acp is not None
+        session._acp.config_options[0]["currentValue"] = '["provider","model-a"]'
+        await session.query("continue", turn_id="turn-1", cell_id="cell-1")
+        return session
+
+    session = asyncio.run(run())
+    assert created[0].config_calls == [
+        ("model", '["provider","model-b"]'),
+        ("model", '["provider","model-b"]'),
+    ]
+    assert created[0].prompts == [("continue", "turn-1")]

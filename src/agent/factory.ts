@@ -54,7 +54,8 @@ export class AgentWorkspaceWidgetFactory extends ABCWidgetFactory<
     private readonly rendermime: IRenderMimeRegistry,
     options: DocumentRegistry.IWidgetFactoryOptions<
       DocumentWidget<AgentWorkspaceContent>
-    >
+    >,
+    private readonly activateDocument?: (id: string) => void
   ) {
     super(options);
   }
@@ -73,7 +74,11 @@ export class AgentWorkspaceWidgetFactory extends ABCWidgetFactory<
     );
     const widget = new DocumentWidget({ content, context });
     const disposeToolbar = installAgentToolbar(widget.toolbar, content);
-    widget.disposed.connect(() => disposeToolbar());
+    widget.disposed.connect(() => {
+      disposeToolbar();
+      content.setDocumentActivator(null);
+    });
+    content.setDocumentActivator(() => this.activateDocument?.(widget.id));
     content.attachContext(context);
     widget.id = `agent-workspace:${context.path}`;
     widget.title.icon = terminalIcon;

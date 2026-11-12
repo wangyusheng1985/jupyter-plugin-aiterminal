@@ -85,6 +85,34 @@ describe('applyServerEvent', () => {
     expect(JSON.stringify(blocks)).not.toContain('reasoning');
   });
 
+  it('streams cumulative reasoning text into the thinking block', () => {
+    let blocks = applyServerEvent([], {
+      type: 'thinking',
+      turnId: 'run-1',
+      id: 'm1:thought',
+      messageId: 'm1:thought',
+      state: 'started',
+      text: 'Looking at'
+    });
+    blocks = applyServerEvent(blocks, {
+      type: 'thinking',
+      turnId: 'run-1',
+      id: 'm1:thought',
+      messageId: 'm1:thought',
+      state: 'started',
+      text: 'Looking at the files'
+    });
+    expect(blocks).toEqual([
+      {
+        kind: 'thinking',
+        id: 'thinking-m1:thought',
+        status: 'started',
+        text: 'Looking at the files',
+        messageId: 'm1:thought'
+      }
+    ]);
+  });
+
   it('records config errors without dropping earlier cards', () => {
     const blocks = applyServerEvent(
       [{ kind: 'user', id: 'u1', text: 'list files' }],
@@ -472,6 +500,82 @@ describe('parseDshProductEvent', () => {
       runtimeId: 'runtime-3',
       phase: 'disconnected'
     });
+  });
+
+  it('parses usage, model config, and command metadata events', () => {
+    const usage = parseDshProductEvent({
+      type: 'dsh/v1/usage',
+      sessionId: 'session-1',
+      runtimeId: 'runtime-3',
+      runId: 'run-7',
+      used: 1200,
+      size: 8000
+    });
+    expect(usage.ok && usage.event).toEqual({
+      type: 'dsh/v1/usage',
+      sessionId: 'session-1',
+      runtimeId: 'runtime-3',
+      runId: 'run-7',
+      used: 1200,
+      size: 8000
+    });
+
+    const config = parseDshProductEvent({
+      type: 'dsh/v1/config',
+      sessionId: 'session-1',
+      runtimeId: 'runtime-3',
+      configOptions: [
+        {
+          id: 'model',
+          name: 'Model',
+          currentValue: 'model-a',
+          options: [
+            { value: 'model-a', name: 'Model A' },
+            { value: 'model-b', name: 'Model B' }
+          ]
+        }
+      ]
+    });
+    expect(config.ok && config.event).toEqual({
+      type: 'dsh/v1/config',
+      sessionId: 'session-1',
+      runtimeId: 'runtime-3',
+      configOptions: [
+        {
+          id: 'model',
+          name: 'Model',
+          currentValue: 'model-a',
+          options: [
+            { value: 'model-a', name: 'Model A' },
+            { value: 'model-b', name: 'Model B' }
+          ]
+        }
+      ]
+    });
+
+    const commands = parseDshProductEvent({
+      type: 'dsh/v1/commands',
+      sessionId: 'session-1',
+      runtimeId: 'runtime-3',
+      commands: [{ name: 'compact' }]
+    });
+    expect(commands.ok && commands.event).toEqual({
+      type: 'dsh/v1/commands',
+      sessionId: 'session-1',
+      runtimeId: 'runtime-3',
+      commands: [{ name: 'compact' }]
+    });
+
+    expect(
+      parseDshProductEvent({
+        type: 'dsh/v1/usage',
+        sessionId: 'session-1',
+        runtimeId: 'runtime-3',
+        runId: 'run-7',
+        used: -1,
+        size: 8000
+      })
+    ).toEqual({ ok: false, reason: 'invalid_payload' });
   });
 
   it('rejects events missing a required id', () => {

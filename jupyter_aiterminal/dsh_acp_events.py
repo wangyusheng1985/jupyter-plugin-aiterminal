@@ -115,6 +115,23 @@ def _content_text(value: Any) -> str | None:
     return joined or None
 
 
+def _non_negative_number(value: Any) -> float | None:
+    """Accept a finite non-negative int/float; reject bools and strings."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value < 0 or value != value or value in (float("inf"), float("-inf")):
+        return None
+    return value
+
+
+def _bounded_text(value: Any, limit: int = 400) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if len(value) <= limit:
+        return value
+    return value[:limit] + _TRUNCATION_SUFFIX
+
+
 class DshAcpEventProjector:
     """Stateful, side-effect-free projector for one ACP session run."""
 
@@ -134,6 +151,9 @@ class DshAcpEventProjector:
         self._synthetic_message_ordinal = 0
         self._tool_names: dict[str, str] = {}
         self._finished_activities: set[str] = set()
+        self._thought_ids: set[str] = set()
+        self._synthetic_thought_id: str | None = None
+        self._synthetic_thought_ordinal = 0
         self._run_started = False
         self._run_finished = False
 
@@ -142,6 +162,12 @@ class DshAcpEventProjector:
             "sessionId": self._session_id,
             "runtimeId": self._runtime_id,
             "runId": self._run_id,
+        }
+
+    def _session_scope(self) -> dict[str, str]:
+        return {
+            "sessionId": self._session_id,
+            "runtimeId": self._runtime_id,
         }
 
     def begin(self) -> list[dict[str, Any]]:
@@ -189,7 +215,7 @@ class DshAcpEventProjector:
         self, method: Any, params: Any
     ) -> list[dict[str, Any]]:
         """Project one ACP notification; malformed or unknown input yields ``[]``."""
-        if method != _SESSION_UPDATE_METHOD or self._run_finished:
+        if method != _SESSION_UPDATE_METHOD:
             return []
         if not isinstance(params, Mapping):
             return []
@@ -199,13 +225,118 @@ class DshAcpEventProjector:
         if not isinstance(update, Mapping):
             return []
         kind = update.get("sessionUpdate")
+        # Session-scoped metadata is legal outside a run and must not be
+        # dropped just because the last run already settled.
+        if kind == "config_option_update":
+            return self._project_config(update)
+        if kind == "available_commands_update":
+            return self._project_commands(update)
+        if self._run_finished:
+            return []
         if kind == "agent_message_chunk":
             return self._project_message_chunk(update)
+        if kind == "agent_thought_chunk":
+            return self._project_thought_chunk(update)
+        if kind == "usage_update":
+            return self._project_usage(update)
         if kind == "tool_call":
             return self._project_tool_call(update)
         if kind == "tool_call_update":
             return self._project_tool_call_update(update)
         return []
+
+    def _project_usage(self, update: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Forward ACP context usage. ``size`` is the declared context window."""
+        used = _non_negative_number(update.get("used"))
+        size = _non_negative_number(update.get("size"))
+        if used is None or size is None or size <= 0:
+            return []
+        return [
+            {
+                "type": "dsh/v1/usage",
+                **self._scope(),
+                "used": used,
+                "size": size,
+            }
+        ]
+
+    def _project_commands(self, update: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Expose the runtime's slash commands without any private payload."""
+        raw = update.get("availableCommands")
+        if not isinstance(raw, list):
+            return []
+        commands: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for entry in raw:
+            if not isinstance(entry, Mapping):
+                continue
+            name = entry.get("name")
+            if not _non_empty_string(name) or name in seen:
+                continue
+            seen.add(name)
+            command = {"name": name}
+            description = _bounded_text(entry.get("description"))
+            if description is not None:
+                command["description"] = description
+            commands.append(command)
+        if not commands:
+            return []
+        return [
+            {"type": "dsh/v1/commands", **self._session_scope(), "commands": commands}
+        ]
+
+    def _project_config(self, update: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Project selectable session options (currently the model selector)."""
+        raw = update.get("configOptions")
+        if not isinstance(raw, list):
+            return []
+        options: list[dict[str, Any]] = []
+        for entry in raw:
+            if not isinstance(entry, Mapping):
+                continue
+            config_id = entry.get("id")
+            if not _non_empty_string(config_id):
+                continue
+            option_type = entry.get("type")
+            if option_type is not None and option_type != "select":
+                continue
+            current = entry.get("currentValue")
+            if not isinstance(current, str):
+                continue
+            values: list[dict[str, str]] = []
+            raw_options = entry.get("options")
+            if isinstance(raw_options, list):
+                for item in raw_options:
+                    if not isinstance(item, Mapping):
+                        continue
+                    # Grouped select: flatten to the leaf options.
+                    group = item.get("options")
+                    leaves = group if isinstance(group, list) else [item]
+                    for leaf in leaves:
+                        if not isinstance(leaf, Mapping):
+                            continue
+                        value = leaf.get("value")
+                        name = leaf.get("name")
+                        if not _non_empty_string(value) or not _non_empty_string(
+                            name
+                        ):
+                            continue
+                        values.append({"value": value, "name": name})
+            option: dict[str, Any] = {
+                "id": config_id,
+                "name": _bounded_text(entry.get("name"), 120) or config_id,
+                "currentValue": current,
+                "options": values,
+            }
+            category = entry.get("category")
+            if isinstance(category, str) and category:
+                option["category"] = category
+            options.append(option)
+        if not options:
+            return []
+        return [
+            {"type": "dsh/v1/config", **self._session_scope(), "configOptions": options}
+        ]
 
     def _message_ref(self, update: Mapping[str, Any]) -> str:
         """Resolve the message reference, synthesizing a stable one if absent.
@@ -242,6 +373,34 @@ class DshAcpEventProjector:
         # ACP chunks are committed increments with no sequence number: forward
         # each one so repeated words are never mistaken for a duplicate.
         return [{"type": "dsh/v1/text.delta", **common, "delta": text}]
+
+    def _thought_ref(self, update: Mapping[str, Any]) -> str:
+        message_id = update.get("messageId")
+        if _non_empty_string(message_id):
+            return f"{message_id}:thought"
+        if self._synthetic_thought_id is None:
+            self._synthetic_thought_ordinal += 1
+            self._synthetic_thought_id = (
+                f"{self._run_id}:acp-thought#{self._synthetic_thought_ordinal}"
+            )
+        return self._synthetic_thought_id
+
+    def _project_thought_chunk(
+        self, update: Mapping[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Stream reasoning text. Chunks are committed in arrival order."""
+        content = update.get("content")
+        if not isinstance(content, Mapping) or content.get("type") != "text":
+            return []
+        text = content.get("text")
+        if not isinstance(text, str) or text == "":
+            return []
+        message_id = self._thought_ref(update)
+        common = {**self._scope(), "messageId": message_id}
+        if message_id not in self._thought_ids:
+            self._thought_ids.add(message_id)
+            return [{"type": "dsh/v1/thought.snapshot", **common, "text": text}]
+        return [{"type": "dsh/v1/thought.delta", **common, "delta": text}]
 
     def _project_tool_call(
         self, update: Mapping[str, Any]

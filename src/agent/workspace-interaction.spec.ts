@@ -322,7 +322,7 @@ describe('Workspace UI state', () => {
       firstFailureCellId: 'failed',
       firstInterruptedCellId: 'failed'
     });
-    expect(overview.summaryLabel).toBe('2 turns · 1 interrupted · 1 failed');
+    expect(overview.summaryLabel).toBe('2 turns');
 
     done.output = 'streamed output only';
     expect(workspaceOverview([done, failed])).toEqual(overview);

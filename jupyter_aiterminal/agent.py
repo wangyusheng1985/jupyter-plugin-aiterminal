@@ -199,8 +199,22 @@ class AgentSession:
         self.turn_events: list[dict[str, Any]] = []
         self.blocks: list[dict[str, Any]] = []
         self._last_turn_error = False
+        # Last model the user asked for. Re-applied before a prompt if the
+        # runtime's reported selection drifted (for example after a resume or
+        # a runtime generation change), so a switch can never be silently
+        # ignored by the next answer.
+        self._selected_model: str | None = None
+        # Last sanitized metadata advertised by a live session. A failed turn
+        # discards the ACP session but keeps the durable session id, so the
+        # selector must survive that gap: remember the model catalog and
+        # commands here so an offline switch can be recorded and reported, then
+        # re-applied when the next turn resumes the session.
+        self._model_options: list[dict[str, str]] = []
+        self._model_current: str | None = None
+        self._commands: list[str] = []
         self._projector: DshAcpEventProjector | None = None
         self._legacy_text: dict[str, str] = {}
+        self._legacy_thought: dict[str, str] = {}
         self._tool_names: dict[str, str] = {}
         # Pending approval scopes keyed by the ACP request id, so a future
         # handler can route a decision without reconstructing runtime identity.
@@ -388,9 +402,14 @@ class AgentSession:
                     "contextState": "resumed" if self._resume_requested else "new",
                     "model": self.model,
                     "cwd": self.cwd,
+                    "running": self._running,
+                    "activeTurnId": self._active_turn_id,
+                    "activeCellId": self.active_cell_id,
                 }
             )
             for event in self._configuration_events():
+                await self._emit_event(event)
+            for event in self._metadata_events():
                 await self._emit_event(event)
             return acp
 
@@ -407,6 +426,9 @@ class AgentSession:
                     "contextState": "resumed",
                     "model": self.model,
                     "cwd": self.cwd,
+                    "running": self._running,
+                    "activeTurnId": self._active_turn_id,
+                    "activeCellId": self.active_cell_id,
                 }
             )
             await emit(
@@ -439,8 +461,182 @@ class AgentSession:
             )
             for event in self._configuration_events():
                 await emit(event)
+            for event in self._metadata_events():
+                await emit(event)
         except Exception:
             pass
+
+    @staticmethod
+    def _read_model_options(
+        config_options: Any,
+    ) -> tuple[list[dict[str, str]], str | None] | None:
+        """Extract the sanitized model catalog from ACP config options.
+
+        Returns ``None`` when no model option is advertised, so callers can
+        distinguish "the runtime stopped exposing a model selector" from "the
+        selector is present but currently has no choices".
+        """
+        found = False
+        models: list[dict[str, str]] = []
+        current: str | None = None
+        for option in (
+            config_options if isinstance(config_options, list) else []
+        ):
+            if not isinstance(option, dict) or option.get("id") != "model":
+                continue
+            found = True
+            value = option.get("currentValue")
+            current = value if isinstance(value, str) else None
+            raw_options = option.get("options")
+            if not isinstance(raw_options, list):
+                continue
+            for entry in raw_options:
+                if not isinstance(entry, dict):
+                    continue
+                model_id = entry.get("value")
+                if not isinstance(model_id, str) or not model_id:
+                    continue
+                name = entry.get("name")
+                models.append(
+                    {
+                        "id": model_id,
+                        "name": name if isinstance(name, str) and name else model_id,
+                    }
+                )
+        return (models, current) if found else None
+
+    @staticmethod
+    def _read_commands(available: Any) -> list[str]:
+        return [
+            command["name"]
+            for command in (available if isinstance(available, list) else [])
+            if isinstance(command, dict)
+            and isinstance(command.get("name"), str)
+            and command.get("name")
+        ]
+
+    def _metadata_events(self) -> list[dict[str, Any]]:
+        """Session-scoped metadata: selectable models and slash commands.
+
+        The runtime exposes the model selector through the standard ACP
+        ``configOptions`` payload. Only sanitized id/name pairs travel to the
+        frontend; the opaque routing value is the ``value`` field.
+
+        A failed turn closes the live ACP session but preserves the durable
+        session. In that gap the last advertised catalog is served from the
+        cache so the selector stays usable; a model the user picked while
+        offline is reported as the current one and is applied on the next
+        resume.
+        """
+        acp = self._acp
+        if acp is not None:
+            parsed = self._read_model_options(
+                getattr(acp, "config_options", None)
+            )
+            if parsed is None:
+                self._model_options = []
+                self._model_current = None
+            else:
+                self._model_options, self._model_current = parsed
+            self._commands = self._read_commands(
+                getattr(acp, "available_commands", None)
+            )
+        models = list(self._model_options)
+        current = self._model_current
+        commands = list(self._commands)
+        if self._selected_model is not None:
+            # The last explicit selection is the user's intent even while the
+            # runtime still reports the previous default (for example after a
+            # resume) or while no runtime is attached.
+            current = self._selected_model
+        if acp is None and not models and not commands:
+            return []
+        return [
+            {"type": "models", "models": models, "current": current},
+            {"type": "commands", "commands": commands},
+        ]
+
+    async def request_metadata(self) -> None:
+        for event in self._metadata_events():
+            await self._emit_event(event)
+
+    async def set_model(self, value: str) -> None:
+        """Switch this session's model through ACP ``set_config_option``.
+
+        When a failed turn has discarded the live ACP session, the selection is
+        still recorded and published so it can be applied when the next prompt
+        resumes the durable session. Losing the runtime must not make the
+        selector permanently fall back to the old model.
+        """
+        if not value or not value.strip():
+            await self._emit_event(
+                {
+                    "type": "error",
+                    "code": "runtime",
+                    "message": (
+                        "The model selection was empty; the model was not "
+                        "changed."
+                    ),
+                }
+            )
+            return
+        acp = self._acp
+        if acp is None:
+            self._selected_model = value
+            await self.request_metadata()
+            return
+        try:
+            await acp.set_config_option("model", value)
+        except Exception:  # noqa: BLE001 - fixed message, never echo internals
+            await self._emit_event(
+                {
+                    "type": "error",
+                    "code": "runtime",
+                    "message": "The model could not be switched for this session.",
+                }
+            )
+            return
+        self._selected_model = value
+        await self.request_metadata()
+
+    @staticmethod
+    def _current_model(acp: DshAcpSession) -> str | None:
+        options = getattr(acp, "config_options", None)
+        for option in options if isinstance(options, list) else []:
+            if option.get("id") != "model":
+                continue
+            current = option.get("currentValue")
+            return current if isinstance(current, str) else None
+        return None
+
+    async def _apply_selected_model(self, acp: DshAcpSession) -> bool:
+        """Re-apply the user's last selection when the runtime drifted.
+
+        A resumed or restarted runtime may report a different current model
+        than the one the user selected in this browser session. Re-applying
+        before the prompt makes the next answer use the selected model instead
+        of silently falling back to the runtime default.
+        """
+        selected = self._selected_model
+        if not selected:
+            return True
+        if self._current_model(acp) == selected:
+            return True
+        try:
+            await acp.set_config_option("model", selected)
+        except Exception:  # noqa: BLE001 - fixed message, never echo internals
+            await self._emit_event(
+                {
+                    "type": "error",
+                    "code": "runtime",
+                    "message": (
+                        "The selected model could not be applied; the turn was "
+                        "not started."
+                    ),
+                }
+            )
+            return False
+        return True
 
     def _configuration_events(self) -> list[dict[str, Any]]:
         """Build the effective-configuration refresh for the shared runtime.
@@ -533,8 +729,19 @@ class AgentSession:
         task.add_done_callback(self._on_emit_task_done)
 
     async def _handle_notification(self, message: dict[str, Any]) -> None:
+        if not isinstance(message, dict):
+            return
+        # Metadata updates are legal outside a run and may arrive after the
+        # runtime applies a selection. Push the refreshed selector state to the
+        # frontend even when no projector/run is active.
+        params = message.get("params")
+        update = params.get("update") if isinstance(params, dict) else None
+        kind = update.get("sessionUpdate") if isinstance(update, dict) else None
+        if kind in {"config_option_update", "available_commands_update"}:
+            for event in self._metadata_events():
+                await self._emit_event(event)
         projector = self._projector
-        if projector is None or not isinstance(message, dict):
+        if projector is None:
             return
         for event in projector.project_notification(
             message.get("method"), message.get("params")
@@ -555,6 +762,64 @@ class AgentSession:
             await self._emit_event(event)
             await self._emit_event(
                 {"type": "text", "text": text, "messageId": message_id}
+            )
+            return
+        if event_type in {"dsh/v1/thought.snapshot", "dsh/v1/thought.delta"}:
+            message_id = str(event.get("messageId", ""))
+            if event_type.endswith("snapshot"):
+                text = str(event.get("text", ""))
+            else:
+                text = self._legacy_thought.get(message_id, "") + str(
+                    event.get("delta", "")
+                )
+            self._legacy_thought[message_id] = text
+            await self._emit_event(event)
+            await self._emit_event(
+                {
+                    "type": "thinking",
+                    "id": message_id,
+                    "state": "started",
+                    "text": text,
+                    "messageId": message_id,
+                }
+            )
+            return
+        if event_type == "dsh/v1/usage":
+            await self._emit_event(event)
+            await self._emit_event(
+                {
+                    "type": "usage",
+                    "used": event.get("used"),
+                    "size": event.get("size"),
+                }
+            )
+            return
+        if event_type == "dsh/v1/config":
+            await self._emit_event(event)
+            parsed = self._read_model_options(event.get("configOptions"))
+            if parsed is None:
+                self._model_options = []
+                self._model_current = None
+            else:
+                self._model_options, self._model_current = parsed
+            current = (
+                self._selected_model
+                if self._selected_model is not None
+                else self._model_current
+            )
+            await self._emit_event(
+                {
+                    "type": "models",
+                    "models": list(self._model_options),
+                    "current": current,
+                }
+            )
+            return
+        if event_type == "dsh/v1/commands":
+            await self._emit_event(event)
+            self._commands = self._read_commands(event.get("commands"))
+            await self._emit_event(
+                {"type": "commands", "commands": list(self._commands)}
             )
             return
         if event_type == "dsh/v1/activity":
@@ -620,6 +885,14 @@ class AgentSession:
             # session without restarting or replacing the shared runtime.
             for event in self._configuration_events():
                 await self._emit_event(event)
+        # Never let a prompt run on a stale model after the user selected one.
+        if not await self._apply_selected_model(acp):
+            return
+        # Commands can be advertised after `session/new`; refresh the selector
+        # metadata on every prompt so the Compact button becomes available even
+        # when the notification precedes the first turn.
+        for event in self._metadata_events():
+            await self._emit_event(event)
         session_id = acp.session_id
         runtime_id = acp.runtime_id
         if not session_id or not runtime_id:
@@ -642,6 +915,7 @@ class AgentSession:
         projector = DshAcpEventProjector(session_id, runtime_id, run_id)
         self._projector = projector
         self._legacy_text = {}
+        self._legacy_thought = {}
         self._tool_names = {}
         # Persisted with a detached turn so a reopened document can render the
         # real terminal reason instead of inferring one from status.
@@ -701,6 +975,12 @@ class AgentSession:
             await self._discard_session(acp)
         finally:
             self._running = False
+            # While a browser is attached it owns the file and saves the
+            # terminal events itself. Writing the same document here changes
+            # the file behind JupyterLab's contents hash, which makes the
+            # browser's next save prompt "changed on disk". Only a detached
+            # session writes; ``save_detached_turn`` still refuses to replace a
+            # newer/different turn id and merges terminal evidence.
             if self.workspace_file and self.is_detached():
                 try:
                     from .detached_document import save_detached_turn
@@ -719,6 +999,7 @@ class AgentSession:
             self.active_cell_id = None
             self._projector = None
             self._legacy_text = {}
+            self._legacy_thought = {}
             self._tool_names = {}
 
     async def interrupt(self) -> None:
@@ -815,6 +1096,8 @@ class AgentSession:
             and not event_type.startswith("dsh/")
         ):
             event = {**event, "turnId": self._active_turn_id}
+            if self.active_cell_id and "cellId" not in event:
+                event["cellId"] = self.active_cell_id
         if self._running:
             self.turn_events.append(event)
             self.blocks = _apply_server_event(self.blocks, event)

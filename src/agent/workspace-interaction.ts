@@ -48,6 +48,7 @@ export function isNavigableCell(cell: WorkspaceCell): boolean {
   return (
     cell.status === 'queued' ||
     cell.status === 'running' ||
+    cell.status === 'pending' ||
     cell.executionCount !== null
   );
 }
@@ -71,7 +72,9 @@ export function inputPreview(
 export function navigationLabel(entry: CellNavigationEntry): string {
   const position = entry.executionCount ?? entry.index + 1;
   const state =
-    entry.status === 'queued' || entry.status === 'running'
+    entry.status === 'queued' ||
+    entry.status === 'running' ||
+    entry.status === 'pending'
       ? `, ${entry.status}`
       : '';
   const failures = entry.failureCount ? `, ${entry.failureCount} failed` : '';
@@ -314,11 +317,6 @@ export function workspaceOverview(
     (total, cell) => total + (cell.turn?.diagnostics.length ?? 0),
     0
   );
-  const parts = [
-    `${submitted.length} ${submitted.length === 1 ? 'turn' : 'turns'}`
-  ];
-  if (interrupted.length) parts.push(`${interrupted.length} interrupted`);
-  if (failureCount) parts.push(`${failureCount} failed`);
   return {
     submittedCount: submitted.length,
     aiCount: submitted.filter(cell => cell.kind === 'ai').length,
@@ -329,7 +327,9 @@ export function workspaceOverview(
     failureCount,
     firstFailureCellId: failed[0]?.id ?? null,
     firstInterruptedCellId: interrupted[0]?.id ?? null,
-    summaryLabel: submitted.length ? parts.join(' · ') : 'No submitted turns'
+    summaryLabel: submitted.length
+      ? `${submitted.length} ${submitted.length === 1 ? 'turn' : 'turns'}`
+      : 'No submitted turns'
   };
 }
 

@@ -341,11 +341,136 @@ def test_unknown_method_and_update_kind_are_ignored() -> None:
     projector = _projector()
     assert projector.project_notification("session/prompt", {"sessionId": SESSION_ID}) == []
     assert projector.project_notification(
-        *_notification({"sessionUpdate": "usage_update", "used": 1, "size": 2})
+        *_notification({"sessionUpdate": "unknown_future_update"})
     ) == []
     assert projector.project_notification(
         *_notification({"sessionUpdate": "config_option_update", "configOptions": []})
     ) == []
+
+
+def test_usage_update_is_projected_with_run_scope() -> None:
+    projector = _projector()
+    events = projector.project_notification(
+        *_notification({"sessionUpdate": "usage_update", "used": 1200, "size": 8000})
+    )
+    assert events == [
+        {
+            "type": "dsh/v1/usage",
+            "sessionId": SESSION_ID,
+            "runtimeId": RUNTIME_ID,
+            "runId": RUN_ID,
+            "used": 1200,
+            "size": 8000,
+        }
+    ]
+
+
+def test_usage_update_rejects_missing_or_invalid_numbers() -> None:
+    projector = _projector()
+    for update in (
+        {"sessionUpdate": "usage_update", "used": -1, "size": 8000},
+        {"sessionUpdate": "usage_update", "used": 1, "size": 0},
+        {"sessionUpdate": "usage_update", "used": True, "size": 8000},
+        {"sessionUpdate": "usage_update", "used": "1", "size": 8000},
+        {"sessionUpdate": "usage_update", "used": 1},
+    ):
+        assert projector.project_notification(*_notification(update)) == []
+
+
+def test_thought_chunks_snapshot_then_delta() -> None:
+    projector = _projector()
+    first = projector.project_notification(
+        *_notification(
+            {
+                "sessionUpdate": "agent_thought_chunk",
+                "messageId": "thought-1",
+                "content": {"type": "text", "text": "think"},
+            }
+        )
+    )
+    assert first[0]["type"] == "dsh/v1/thought.snapshot"
+    assert first[0]["text"] == "think"
+    second = projector.project_notification(
+        *_notification(
+            {
+                "sessionUpdate": "agent_thought_chunk",
+                "messageId": "thought-1",
+                "content": {"type": "text", "text": "ing"},
+            }
+        )
+    )
+    assert second[0]["type"] == "dsh/v1/thought.delta"
+    assert second[0]["delta"] == "ing"
+
+
+def test_available_commands_are_projected_and_deduplicated() -> None:
+    projector = _projector()
+    events = projector.project_notification(
+        *_notification(
+            {
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [
+                    {"name": "compact", "description": "Compact the context"},
+                    {"name": "compact", "description": "duplicate"},
+                    {"name": "goal"},
+                ],
+            }
+        )
+    )
+    assert events == [
+        {
+            "type": "dsh/v1/commands",
+            "sessionId": SESSION_ID,
+            "runtimeId": RUNTIME_ID,
+            "commands": [
+                {"name": "compact", "description": "Compact the context"},
+                {"name": "goal"},
+            ],
+        }
+    ]
+
+
+def test_model_config_option_is_flattened() -> None:
+    projector = _projector()
+    events = projector.project_notification(
+        *_notification(
+            {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "name": "Model",
+                        "category": "model",
+                        "type": "select",
+                        "currentValue": '["provider","a"]',
+                        "options": [
+                            {
+                                "group": "provider",
+                                "name": "Provider",
+                                "options": [
+                                    {"value": '["provider","a"]', "name": "A"},
+                                    {"value": '["provider","b"]', "name": "B"},
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+    assert events[0]["type"] == "dsh/v1/config"
+    assert events[0]["configOptions"] == [
+        {
+            "id": "model",
+            "name": "Model",
+            "category": "model",
+            "currentValue": '["provider","a"]',
+            "options": [
+                {"value": '["provider","a"]', "name": "A"},
+                {"value": '["provider","b"]', "name": "B"},
+            ],
+        }
+    ]
 
 
 @pytest.mark.parametrize(

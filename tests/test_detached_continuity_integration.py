@@ -141,6 +141,64 @@ def test_detached_turn_persists_to_document_and_reopen_observes_result(
     assert registry.attached("session-detached-test") is True
 
 
+def test_attached_turn_leaves_the_document_to_the_browser(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An attached browser owns the file and avoids a stale contents hash."""
+    workspace_file = tmp_path / "test-reopened.agentnb"
+    _create_workspace_file(workspace_file)
+
+    registry = SessionRegistry()
+    emitted_events: list[dict] = []
+
+    async def fake_emit(event: dict) -> None:
+        emitted_events.append(event)
+
+    session = AgentSession(
+        cwd=str(tmp_path),
+        emit=fake_emit,
+        resume_session_id="session-reattached-test",
+        workspace_file=str(workspace_file),
+        is_detached=lambda: not registry.attached(session.session_id),
+    )
+    session.session_id = "session-reattached-test"
+    registry.remember(session)
+    registry.attach("session-reattached-test", fake_emit)
+
+    fake_acp = Mock()
+    fake_acp.session_id = "session-reattached-test"
+    fake_acp.runtime_id = "runtime-reattached"
+
+    async def prompt(prompt_text, run_id):
+        await session._emit_event(
+            {"type": "text", "text": "finished after a refresh"}
+        )
+        return {"stopReason": "end_turn"}
+
+    fake_acp.prompt = prompt
+    session._acp = fake_acp
+
+    asyncio.run(
+        session.query(
+            "hello reattached agent",
+            turn_id="turn-reattached",
+            cell_id="cell-prompt-1",
+        )
+    )
+
+    # The attached browser saves its own terminal turn. The server must not
+    # replace the file behind JupyterLab's contents hash, which is what makes
+    # the next browser save ask whether to overwrite or revert.
+    saved = load_workspace(workspace_file)
+    cell = saved["cells"][0]
+    assert cell["status"] == "running"
+    assert cell["turn"] is None
+    assert cell["blocks"] == []
+    result = next(ev for ev in emitted_events if ev.get("type") == "result")
+    assert result.get("turnId") == "turn-reattached"
+    assert result.get("cellId") == "cell-prompt-1"
+
+
 def test_real_handler_open_attach_and_detach_flow(tmp_path: Path, monkeypatch):
     """Directly test AgentWebSocketHandler open(), busy rejection, on_close() and reattach."""
     registry = SessionRegistry()
@@ -217,9 +275,27 @@ def test_real_handler_open_attach_and_detach_flow(tmp_path: Path, monkeypatch):
 
     # First connection closes (browser refresh / window close), but the
     # session now belongs to the second browser and stays attached.
-    # Simulate turn still running with some recorded events while detached
+    # Simulate a turn still running with recorded events. Every replayed event
+    # carries both identities so the new page can claim the cell.
     session._running = True
-    session.turn_events = [{"type": "tool_start", "id": "t1", "name": "Bash", "input": {}}]
+    session._active_turn_id = "turn-live"
+    session.active_cell_id = "cell-prompt-1"
+    session.turn_events = [
+        {
+            "type": "accepted",
+            "turnId": "turn-live",
+            "cellId": "cell-prompt-1",
+            "sessionId": "session-h1",
+        },
+        {
+            "type": "tool_start",
+            "turnId": "turn-live",
+            "cellId": "cell-prompt-1",
+            "id": "t1",
+            "name": "Bash",
+            "input": {},
+        },
+    ]
     handler.on_close()
     assert registry.attached("session-h1") is True
     assert session.is_detached() is False
@@ -246,9 +322,49 @@ def test_real_handler_open_attach_and_detach_flow(tmp_path: Path, monkeypatch):
     assert third_handler.session is session
     assert registry.attached("session-h1") is True
     assert session.is_detached() is False
-    assert any(ev.get("type") == "ready" and ev.get("contextState") == "resumed" for ev in third_emitted)
+    ready = next(ev for ev in third_emitted if ev.get("type") == "ready")
+    assert ready.get("contextState") == "resumed"
+    assert ready.get("running") is True
+    assert ready.get("activeTurnId") == "turn-live"
+    assert ready.get("activeCellId") == "cell-prompt-1"
     assert any(ev.get("type") == "dsh/v1/session" and ev.get("phase") == "resumed" for ev in third_emitted)
-    assert any(ev.get("type") == "tool_start" and ev.get("id") == "t1" for ev in third_emitted)
+    replay = next(ev for ev in third_emitted if ev.get("type") == "tool_start")
+    assert replay.get("id") == "t1"
+    assert replay.get("turnId") == "turn-live"
+    assert replay.get("cellId") == "cell-prompt-1"
+
+    # The turn finished while the page was away. Reattach still replays the
+    # terminal turn, without claiming it is active.
+    session._running = False
+    session._active_turn_id = None
+    session.active_cell_id = None
+    fourth_handler = object.__new__(AgentWebSocketHandler)
+    fourth_handler.cwd = str(tmp_path)
+    fourth_handler.application = Mock(settings={"aiterminal_sessions": registry})
+    fourth_handler.ws_connection = Mock()
+    fourth_handler.get_query_argument = lambda name, default="": {
+        "cwd": "",
+        "sessionId": "",
+        "dshSessionId": "session-h1",
+        "workspacePath": "handler_test.agentnb",
+    }.get(name, default)
+    fourth_emitted = []
+
+    async def fourth_emit(ev: dict) -> None:
+        fourth_emitted.append(ev)
+
+    fourth_handler.emit = fourth_emit
+    fourth_handler.open()
+    ready_after_finish = next(
+        ev for ev in fourth_emitted if ev.get("type") == "ready"
+    )
+    assert ready_after_finish.get("running") is False
+    assert ready_after_finish.get("activeTurnId") is None
+    replayed_finish = next(
+        ev for ev in fourth_emitted if ev.get("type") == "tool_start"
+    )
+    assert replayed_finish.get("turnId") == "turn-live"
+    assert replayed_finish.get("cellId") == "cell-prompt-1"
 
 
 # -- Real AgentSession + SharedDshRuntime + DshAcpSession seam ---------------

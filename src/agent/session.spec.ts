@@ -84,6 +84,60 @@ describe('AgentSession', () => {
     truncatedFieldCount: 0
   };
 
+  it('claims the active turn reported by the reattach handshake', () => {
+    const { session, socket } = sessionWithSocket('session-1', 'session-1');
+    socket.open();
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: 'ready',
+        sessionId: 'session-1',
+        contextState: 'resumed',
+        model: 'model-1',
+        cwd: '/workspace',
+        running: true,
+        activeTurnId: 'turn-live',
+        activeCellId: 'cell-8'
+      })
+    });
+
+    expect(session.serverStateKnown).toBe(true);
+    expect(session.serverActiveTurnId).toBe('turn-live');
+    expect(session.serverActiveCellId).toBe('cell-8');
+    expect(session.running).toBe(true);
+    expect(session.activeTurnId).toBe('turn-live');
+    expect(session.activeCellId).toBe('cell-8');
+    expect(session.turn?.id).toBe('turn-live');
+    session.dispose();
+  });
+
+  it('rebuilds an unannounced replayed turn from its event identity', () => {
+    const { session, socket } = sessionWithSocket('session-1', 'session-1');
+    socket.open();
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: 'text',
+        turnId: 'turn-replayed',
+        cellId: 'cell-9',
+        messageId: 'msg-1',
+        text: 'continued after refresh'
+      })
+    });
+
+    expect(session.running).toBe(true);
+    expect(session.activeTurnId).toBe('turn-replayed');
+    expect(session.activeCellId).toBe('cell-9');
+    expect(session.turn?.id).toBe('turn-replayed');
+    expect(session.blocks).toEqual([
+      {
+        kind: 'text',
+        id: 'text-msg-1',
+        messageId: 'msg-1',
+        text: 'continued after refresh'
+      }
+    ]);
+    session.dispose();
+  });
+
   it('encodes saved context in the socket URL without affecting cwd or token', () => {
     expect(
       agentSocketUrl(
@@ -522,6 +576,42 @@ describe('AgentSession DSH channel', () => {
       { kind: 'text', id: expect.stringContaining('text'), text: 'answer' }
     ]);
     expect(received).toHaveLength(count);
+  });
+
+  it('mirrors product config and command events into the selector state', () => {
+    const { session, socket } = sessionWithSocket();
+    socket.open();
+    handshake(socket);
+
+    emit(socket, {
+      type: 'dsh/v1/config',
+      sessionId,
+      runtimeId,
+      configOptions: [
+        {
+          id: 'model',
+          name: 'Model',
+          currentValue: '["provider","model-b"]',
+          options: [
+            { value: '["provider","model-a"]', name: 'Model A' },
+            { value: '["provider","model-b"]', name: 'Model B' }
+          ]
+        }
+      ]
+    });
+    emit(socket, {
+      type: 'dsh/v1/commands',
+      sessionId,
+      runtimeId,
+      commands: [{ name: 'compact' }]
+    });
+
+    expect(session.models).toEqual([
+      { id: '["provider","model-a"]', name: 'Model A' },
+      { id: '["provider","model-b"]', name: 'Model B' }
+    ]);
+    expect(session.currentModel).toBe('["provider","model-b"]');
+    expect(session.commands).toEqual(['compact']);
   });
 
   it('requires a session handshake and refuses cross-session events', () => {

@@ -2,6 +2,10 @@ import { AgentSession } from './session';
 import { createTurn, setTurnStatus } from './turn';
 import { AgentWorkspaceContent } from './workspace';
 
+jest.mock('@jupyterlab/apputils', () => ({
+  Notification: { emit: jest.fn() }
+}));
+
 jest.mock('@jupyterlab/cells', () => ({
   OutputPlaceholder: class {
     node = document.createElement('div');

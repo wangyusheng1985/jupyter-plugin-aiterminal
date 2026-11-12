@@ -10,6 +10,7 @@ import {
   type AgentClientMessage,
   type AgentConfigurationRequestMessage,
   type AgentExecDoneEvent,
+  type AgentModelOption,
   type AgentServerEvent,
   type AgentContextState,
   type ChatBlock,
@@ -107,6 +108,11 @@ export class AgentSession {
   activeTurnId: string | null = null;
   activeCellId: string | null = null;
   acceptedTurnId: string | null = null;
+  /** Turn identity the server reports as still executing on this attach. */
+  serverActiveTurnId: string | null = null;
+  serverActiveCellId: string | null = null;
+  /** True once a ready handshake described the server's live turn state. */
+  serverStateKnown = false;
   execCwd: string | null = null;
   execOutput = '';
   sessionId: string | null;
@@ -132,6 +138,13 @@ export class AgentSession {
   }> = [];
   private configuration: ConfigurationReport | null = null;
   private configurationErrorState: string | null = null;
+  /** Context-window usage reported by the runtime for this session. */
+  usage: { used: number; size: number } | null = null;
+  /** Selectable models advertised by the runtime (opaque `id` values). */
+  models: AgentModelOption[] = [];
+  currentModel: string | null = null;
+  /** Slash commands the runtime advertised for this session. */
+  commands: string[] = [];
 
   constructor(
     private readonly settings: ServerConnection.ISettings = ServerConnection.makeSettings(),
@@ -249,6 +262,9 @@ export class AgentSession {
     this.dshAttachedRuntime = null;
     this.dshPhase = null;
     this.dshCapabilities = null;
+    this.serverStateKnown = false;
+    this.serverActiveTurnId = null;
+    this.serverActiveCellId = null;
     const socket = new this.settings.WebSocket(
       agentSocketUrl(
         this.settings,
@@ -293,6 +309,31 @@ export class AgentSession {
         this.applyConfigurationEvent(raw);
         return;
       }
+      if (isTurnScopedEvent(payload) && payload.turnId) {
+        const replayTurnId = payload.turnId;
+        const replayCellId =
+          typeof (payload as { cellId?: unknown }).cellId === 'string'
+            ? (payload as { cellId: string }).cellId
+            : null;
+        if (!this.activeTurnId && !this.running) {
+          // A reattached socket can replay a turn that this page never saw
+          // start. Rebuild the session-side turn so the workspace can claim it.
+          this.activeTurnId = replayTurnId;
+          this.activeCellId = replayCellId ?? this.activeCellId;
+          this.turn = createTurn(replayTurnId);
+          this.blocks = [];
+          this.running = true;
+        } else if (
+          this.activeTurnId === replayTurnId &&
+          !this.running &&
+          payload.type !== 'result' &&
+          payload.type !== 'error'
+        ) {
+          // The socket dropped after the turn started; replay proves it is
+          // still live even though onclose cleared `running`.
+          this.running = true;
+        }
+      }
       if (
         this.activeTurnId &&
         isTurnScopedEvent(payload) &&
@@ -308,12 +349,16 @@ export class AgentSession {
       if (payload.type === 'error') {
         this.error = payload.message;
         this.running = false;
+        this.serverActiveTurnId = null;
+        this.serverActiveCellId = null;
         if (payload.code === 'resume') {
           this.contextState = 'unavailable';
         }
       }
       if (payload.type === 'result') {
         this.running = false;
+        this.serverActiveTurnId = null;
+        this.serverActiveCellId = null;
         if (payload.sessionId) this.sessionId = payload.sessionId;
         this.contextState = 'live';
       }
@@ -327,6 +372,46 @@ export class AgentSession {
         this.contextState =
           payload.contextState ?? (requestedResume ? 'resumed' : 'new');
         this.execCwd = payload.cwd;
+        // The handshake is also the attach snapshot: it tells this page which
+        // turn the server is still executing, independent of replayed events.
+        this.error = null;
+        this.serverStateKnown = true;
+        this.serverActiveTurnId =
+          typeof payload.activeTurnId === 'string'
+            ? payload.activeTurnId
+            : null;
+        this.serverActiveCellId =
+          typeof payload.activeCellId === 'string'
+            ? payload.activeCellId
+            : null;
+        if (this.serverActiveTurnId) {
+          this.activeTurnId = this.serverActiveTurnId;
+          if (this.serverActiveCellId) {
+            this.activeCellId = this.serverActiveCellId;
+          }
+          this.acceptedTurnId = null;
+          this.running = true;
+          if (this.turn?.id !== this.serverActiveTurnId) {
+            this.turn = createTurn(this.serverActiveTurnId);
+            this.blocks = [];
+          }
+        } else if (!this.running) {
+          this.activeTurnId = null;
+          this.activeCellId = null;
+        }
+      }
+      if (payload.type === 'usage') {
+        this.usage = {
+          used: Math.max(0, payload.used),
+          size: Math.max(0, payload.size)
+        };
+      }
+      if (payload.type === 'models') {
+        this.models = payload.models;
+        this.currentModel = payload.current;
+      }
+      if (payload.type === 'commands') {
+        this.commands = payload.commands;
       }
       this.handleExecEvent(payload);
       this.notify();
@@ -342,6 +427,9 @@ export class AgentSession {
       if (socket !== this.socket) return;
       this.connected = false;
       this.running = false;
+      this.serverStateKnown = false;
+      this.serverActiveTurnId = null;
+      this.serverActiveCellId = null;
       this.socket = null;
       this.rejectExec(new Error('Agent session closed.'));
       this.notify();
@@ -470,6 +558,25 @@ export class AgentSession {
     return true;
   }
 
+  /** Ask the runtime to re-emit selectable models and slash commands. */
+  requestMetadata(): boolean {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify({ type: 'metadata' }));
+    return true;
+  }
+
+  /**
+   * Switch the session's model. The value is an opaque runtime selector;
+   * the returned boolean only means the frame was handed to an open socket.
+   */
+  setModel(value: string): boolean {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify({ type: 'set_model', value }));
+    return true;
+  }
+
   private applyConfigurationEvent(raw: unknown): void {
     if (typeof raw !== 'object' || raw === null) return;
     const report = parseConfigurationReport(
@@ -542,6 +649,11 @@ export class AgentSession {
     const result = parseDshProductEvent(raw);
     if (!result.ok) return;
     if (!this.acceptDshEvent(result.event)) return;
+    // Session-scoped model and command metadata also arrives as product
+    // events, for example after the runtime applies a config change. Mirror it
+    // into the legacy status-bar state so the selector cannot stay on the
+    // previous model while the runtime has already switched.
+    this.applyDshSessionMetadata(result.event);
     this.dshSubscribers.forEach(listener => {
       try {
         listener(result.event);
@@ -549,6 +661,22 @@ export class AgentSession {
         // A failing subscriber must not block other subscribers or legacy state.
       }
     });
+  }
+
+  private applyDshSessionMetadata(event: DshProductEvent): void {
+    if (event.type === 'dsh/v1/config') {
+      const model = event.configOptions.find(option => option.id === 'model');
+      if (!model) return;
+      this.models = model.options.map(option => ({
+        id: option.value,
+        name: option.name
+      }));
+      this.currentModel = model.currentValue;
+      return;
+    }
+    if (event.type === 'dsh/v1/commands') {
+      this.commands = event.commands.map(command => command.name);
+    }
   }
 
   /**
@@ -716,6 +844,10 @@ type TurnScopedAgentEvent = Exclude<
   | { type: 'exec_done' }
   | { type: 'exec_error' }
   | { type: 'configuration' }
+  | { type: 'configuration-error' }
+  | { type: 'usage' }
+  | { type: 'models' }
+  | { type: 'commands' }
 >;
 
 function isTurnScopedEvent(
@@ -726,6 +858,10 @@ function isTurnScopedEvent(
     event.type === 'exec_output' ||
     event.type === 'exec_done' ||
     event.type === 'exec_error' ||
-    event.type === 'configuration'
+    event.type === 'configuration' ||
+    event.type === 'configuration-error' ||
+    event.type === 'usage' ||
+    event.type === 'models' ||
+    event.type === 'commands'
   );
 }

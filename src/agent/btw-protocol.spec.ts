@@ -1,3 +1,5 @@
+import { ServerConnection } from '@jupyterlab/services';
+
 import {
   BTW_BASE_PATH,
   BTW_MESSAGE_ROLES,
@@ -7,6 +9,8 @@ import {
   BTW_SNAPSHOT_FIELDS,
   answerNumberForCell,
   answerTextOf,
+  btwListQueue,
+  btwRestoreThread,
   isAnswerCard
 } from './btw-protocol';
 
@@ -47,6 +51,32 @@ describe('BTW protocol contract', () => {
       expect(route.startsWith('/')).toBe(false);
       expect(route).not.toContain('..');
     });
+  });
+
+  it('adds exactly one query separator to GET requests', async () => {
+    const makeRequest = jest
+      .spyOn(ServerConnection, 'makeRequest')
+      .mockResolvedValue({
+        ok: true,
+        json: async () => ({ thread: null, entries: [] })
+      } as Response);
+    const settings = {
+      baseUrl: 'http://server/'
+    } as ServerConnection.ISettings;
+
+    await btwRestoreThread('notes.agentnb', 'cell-1', settings);
+    await btwListQueue('notes.agentnb', settings);
+
+    expect(makeRequest.mock.calls[0][0]).toBe(
+      'http://server/aiterminal/btw/thread?notebook=notes.agentnb&cellId=cell-1'
+    );
+    expect(makeRequest.mock.calls[1][0]).toBe(
+      'http://server/aiterminal/btw/queue?notebook=notes.agentnb'
+    );
+    for (const [url] of makeRequest.mock.calls) {
+      expect(String(url)).not.toContain('??');
+    }
+    makeRequest.mockRestore();
   });
 });
 

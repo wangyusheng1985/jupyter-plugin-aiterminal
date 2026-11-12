@@ -234,6 +234,9 @@ class DshProviderConfig:
     # two context fields mirror this budget for existing callers and are
     # checked for agreement so there is no second authority.
     budget: DerivedBudget | None = None
+    # Selectable model ids for the same provider. ``model`` is always first and
+    # is the default; an empty tuple keeps the single-model behavior.
+    models: tuple[str, ...] = ()
 
     @property
     def api_key_env(self) -> str:
@@ -610,6 +613,19 @@ def _validate_config_snapshot(config: DshProviderConfig) -> DerivedBudget:
     if not isinstance(config.model, str) or not config.model.strip():
         raise AgentConfigError("DSH model must be a non-empty string.")
     _ensure_utf8_text("model", config.model)
+    if config.models:
+        if not isinstance(config.models, tuple):
+            raise AgentConfigError("DSH models must be a tuple of model ids.")
+        if config.model not in config.models:
+            raise AgentConfigError(
+                "DSH models must include the default model id."
+            )
+        for entry in config.models:
+            if not isinstance(entry, str) or not entry.strip():
+                raise AgentConfigError(
+                    "Each entry in DSH models must be a non-empty string."
+                )
+            _ensure_utf8_text("models", entry)
     if not isinstance(config.token, str) or not config.token.strip():
         raise AgentConfigError("DSH token must be a non-empty string.")
     _ensure_utf8_text("token", config.token)
@@ -655,6 +671,7 @@ def parse_dsh_provider_config(
         context_window=context_window,
         max_output_tokens=max_output_tokens,
     )
+    models = _parse_models(raw.get("models"), default=values["model"])
 
     return DshProviderConfig(
         api_protocol=protocol,
@@ -664,7 +681,44 @@ def parse_dsh_provider_config(
         max_output_tokens=budget.max_output_tokens,
         token=values["token"],
         budget=budget,
+        models=models,
     )
+
+
+def _parse_models(value: Any, *, default: str) -> tuple[str, ...]:
+    """Parse the optional multi-model list; ``model`` is always included first.
+
+    An absent or empty list keeps the historical single-model behavior. Every
+    entry must be a non-empty string; duplicates are dropped while preserving
+    order so the runtime never sees two selectable options with the same id.
+    """
+    entries: list[str] = [default]
+    if value is not None:
+        if not isinstance(value, (list, tuple)):
+            raise AgentConfigError("models must be an array of model ids.")
+        for item in value:
+            if not isinstance(item, str):
+                raise AgentConfigError("Each entry in models must be a string.")
+            text = item.strip()
+            if not text:
+                raise AgentConfigError("Each entry in models must be non-empty.")
+            _ensure_utf8_text("models", text)
+            if text != default:
+                entries.append(text)
+    seen: set[str] = set()
+    unique: list[str] = []
+    for entry in entries:
+        if entry in seen:
+            continue
+        seen.add(entry)
+        unique.append(entry)
+    return tuple(unique)
+
+
+def model_ids(config: DshProviderConfig) -> tuple[str, ...]:
+    """Configured selectable model ids, falling back to the single default."""
+    configured = getattr(config, "models", ())
+    return tuple(configured) if configured else (config.model,)
 
 
 def build_provider_insert_patch(config: DshProviderConfig) -> dict[str, Any]:
@@ -692,10 +746,11 @@ def build_provider_insert_patch(config: DshProviderConfig) -> dict[str, Any]:
                             "apiKeyEnv": DSH_API_KEY_ENV,
                             "models": [
                                 {
-                                    "id": config.model,
+                                    "id": model_id,
                                     "contextWindow": budget.context_window,
                                     "maxTokens": budget.max_output_tokens,
                                 }
+                                for model_id in model_ids(config)
                             ],
                             "retryPolicy": {
                                 "mode": "normal",

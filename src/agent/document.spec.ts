@@ -402,7 +402,7 @@ describe('Agent Workspace document', () => {
     expect(restored.active).toBe(notebook.active);
   });
 
-  it('does not persist a running status across reload', () => {
+  it('persists a running status and restores it as pending', () => {
     const snapshot = parseWorkspaceSnapshot(
       JSON.stringify({
         version: 1,
@@ -421,8 +421,21 @@ describe('Agent Workspace document', () => {
         ]
       })
     );
-    expect(snapshot.cells[0].status).toBe('interrupted');
+    expect(snapshot.cells[0].status).toBe('running');
     expect(snapshot.cells[0].output).toBe('PING');
+  });
+
+  it('keeps a persisted turn timestamp stable across repeated saves', () => {
+    const notebook = new WorkspaceNotebook();
+    notebook.cells[0].status = 'done';
+    notebook.cells[0].turn = setTurnStatus(
+      createTurn('turn-stable'),
+      'done',
+      []
+    );
+    const first = serializeNotebook(notebook);
+    const second = serializeNotebook(notebook);
+    expect(second).toBe(first);
   });
 
   it('does not restore queued requests as active work', () => {
@@ -674,7 +687,44 @@ describe('Agent Workspace document', () => {
     });
   });
 
-  it('restores a running turn as interrupted with partial evidence', () => {
+  it('does not stamp a timestamp while loading a legacy turn', () => {
+    const document = {
+      version: 5,
+      active: 0,
+      cells: [
+        {
+          id: 'cell-1',
+          kind: 'ai',
+          source: 'question',
+          output: '',
+          blocks: [],
+          turn: {
+            id: 'legacy-run',
+            status: 'done',
+            resultText: 'answer',
+            resultIsError: false,
+            metrics: {},
+            presentation: {
+              trace: 'collapsed',
+              expandedActivityIds: [],
+              fullEvidenceActivityIds: []
+            }
+          },
+          status: 'done',
+          executionCount: 1,
+          outputCollapsed: false,
+          agentContextGeneration: 0
+        }
+      ]
+    };
+    const notebook = new WorkspaceNotebook();
+    restoreNotebook(notebook, JSON.stringify(document));
+
+    const serialized = JSON.parse(serializeNotebook(notebook));
+    expect(serialized.cells[0].turn.updatedAt).toBeUndefined();
+  });
+
+  it('restores a running turn as pending with partial evidence', () => {
     const notebook = new WorkspaceNotebook();
     notebook.cells[0].status = 'running';
     notebook.cells[0].blocks = [
@@ -688,17 +738,19 @@ describe('Agent Workspace document', () => {
       }
     ];
     notebook.cells[0].turn = createTurn('run-running');
+    const persistedUpdatedAt = notebook.cells[0].turn.updatedAt;
 
     const restored = new WorkspaceNotebook();
     restoreNotebook(restored, serializeNotebook(notebook));
 
     expect(restored.cells[0]).toMatchObject({
-      status: 'interrupted'
+      status: 'pending'
     });
     expect(restored.cells[0].turn).toMatchObject({
       id: 'run-running',
-      status: 'interrupted'
+      status: 'pending'
     });
+    expect(restored.cells[0].turn?.updatedAt).toBe(persistedUpdatedAt);
     expect(restored.cells[0].turn?.timeline[0]).toMatchObject({
       kind: 'tool',
       status: 'running'
@@ -885,7 +937,7 @@ describe('Agent Workspace document', () => {
     ).toEqual({ engine: 'dsh', sessionId: 'a\u0080b' });
   });
 
-  it('does not persist runtime identity or running as authoritative activity', () => {
+  it('persists running for reattach without persisting runtime identity', () => {
     const notebook = new WorkspaceNotebook();
     setAgentSessionReference(notebook, {
       engine: 'dsh',
@@ -902,10 +954,10 @@ describe('Agent Workspace document', () => {
       sessionId: 'dsh-session-live'
     });
     expect(JSON.stringify(serialized)).not.toMatch(
-      /runtimeId|dshRuntimeId|connectionId|running/i
+      /runtimeId|dshRuntimeId|connectionId/i
     );
     expect((serialized.cells as Array<Record<string, unknown>>)[0].status).toBe(
-      'interrupted'
+      'running'
     );
 
     // A close/reopen keeps the session reference (it is not deleted) and does
@@ -916,6 +968,7 @@ describe('Agent Workspace document', () => {
       engine: 'dsh',
       sessionId: 'dsh-session-live'
     });
+    // Without a persisted turn id there is nothing to reattach to.
     expect(reopened.cells[0].status).toBe('interrupted');
   });
 

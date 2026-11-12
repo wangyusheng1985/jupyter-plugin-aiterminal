@@ -134,7 +134,10 @@ class AgentWebSocketHandler(JupyterHandler, websocket.WebSocketHandler):
 
             async def _reattach_flow(sess: AgentSession, emit: Any) -> None:
                 await sess.reemit_handshake(emit)
-                if sess.is_running and sess.turn_events:
+                # Replay the last turn even if it finished while the browser
+                # was away: the page may hold a running/pending cell that only
+                # the terminal events can settle without a document reload.
+                if sess.turn_events:
                     for ev in list(sess.turn_events):
                         try:
                             res = emit(ev)
@@ -226,6 +229,12 @@ class AgentWebSocketHandler(JupyterHandler, websocket.WebSocketHandler):
             IOLoop.current().spawn_callback(self._shutdown_workspace)
         elif kind == "configuration":
             IOLoop.current().spawn_callback(self.refresh_configuration)
+        elif kind == "metadata":
+            IOLoop.current().spawn_callback(self.refresh_metadata)
+        elif kind == "set_model":
+            IOLoop.current().spawn_callback(
+                self._set_model, str(payload.get("value", ""))
+            )
         elif kind == "interrupt":
             if self.session is None:
                 return
@@ -279,6 +288,28 @@ class AgentWebSocketHandler(JupyterHandler, websocket.WebSocketHandler):
             return
         for event in events:
             await self.emit(event)
+
+    async def refresh_metadata(self) -> None:
+        """Re-emit selectable models and slash commands for the session."""
+        session = self.session
+        if session is None:
+            return
+        for event in session._metadata_events():
+            await self.emit(event)
+
+    async def _set_model(self, value: str) -> None:
+        """Switch the attached session's model; never starts a runtime."""
+        session = self.session
+        if session is None:
+            await self.emit(
+                {
+                    "type": "error",
+                    "code": "runtime",
+                    "message": "AI session is not connected; the model was not changed.",
+                }
+            )
+            return
+        await session.set_model(value)
 
     def _schedule_interaction_resolution(self, payload: dict) -> None:
         """Validate a permission decision, then route it to the tracked request.
